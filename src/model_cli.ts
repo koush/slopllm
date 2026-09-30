@@ -25,6 +25,8 @@ export interface ModelCliArgs {
   useQwen35: boolean;
   useGlm51: boolean;
   useDflash2?: boolean;
+  /** Owned GLM drafter; --dflash2 still selects the standalone model. */
+  dflashModelDir?: string;
   glm51Small: boolean;
   useFp8: boolean;
   useNvfp4: boolean;
@@ -71,6 +73,11 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
     else if (a === "--glm51") { args.useGlm51 = true; glm51Explicit = true; }
     else if (a === "--glm51-small") { args.useGlm51 = true; args.glm51Small = true; glm51Explicit = true; }
     else if (a === "--dflash2") { args.useDflash2 = true; args.useGlm51 = false; }
+    else if (a === "--dflash") args.dflashModelDir ??= DFLASH2_REPO;
+    else if (a === "--dflash-model-dir") {
+      if (!argv[i + 1] || argv[i + 1].startsWith("--")) throw new Error("--dflash-model-dir requires a checkpoint path");
+      args.dflashModelDir = argv[++i];
+    }
     else if (a === "--fp8") { args.useFp8 = true; args.useGlm51 = false; }
     else if (a === "--nvfp4") args.useNvfp4 = true;
     else if (a === "--cp") args.cp = true;
@@ -88,6 +95,9 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
     args.useGlm51 = false;
   }
   if (!args.arenaExplicit && args.useGlm51 && !args.glm51Small) args.arena = 92;
+  if (args.dflashModelDir && (!args.useGlm51 || args.useDflash2 || args.useQwen35)) {
+    throw new Error("--dflash requires a GLM target model");
+  }
   if (args.gpus.length === 0 || args.gpus.some(gpu => !Number.isInteger(gpu) || gpu < 0)) {
     throw new Error(`Invalid GPU list: ${args.gpus.join(",")}`);
   }
@@ -133,7 +143,7 @@ export async function loadModel(ops: DeviceOps, args: ModelCliArgs, modelDir: st
   const model = await (args.useDflash2
     ? Dflash2Model.fromPretrained(ops, modelDir)
     : args.useGlm51
-      ? Glm51Model.fromPretrained(ops, modelDir, args.cp, args.mtp > 0)
+      ? Glm51Model.fromPretrained(ops, modelDir, args.cp, args.mtp > 0, args.dflashModelDir)
       : args.useQwen35
         ? Qwen35Model.fromPretrained(ops, modelDir)
         : Qwen3Model.fromPretrained(ops, modelDir));
@@ -160,7 +170,11 @@ export async function loadModel(ops: DeviceOps, args: ModelCliArgs, modelDir: st
 
 export function modelArenaLayoutSignatures(model: ChatModel, devices: readonly GlmOps[]): Map<number, string> {
   const hashes = devices.map(() => createHash("sha256"));
-  const tensors = [...model.tensors.entries()].sort(([a], [b]) => a.localeCompare(b));
+  const tensors = [...model.tensors.entries()];
+  if (model instanceof Glm51Model && model.dflashModel) {
+    for (const [name, tensor] of model.dflashModel.tensors) tensors.push([`dflash.${name}`, tensor]);
+  }
+  tensors.sort(([a], [b]) => a.localeCompare(b));
   for (const [name, tensor] of tensors) {
     for (let i = 0; i < devices.length; i++) {
       if (devices[i].arenaBase === undefined) throw new Error(`Device ${devices[i].device} does not have an arena`);

@@ -594,6 +594,9 @@ void glm_dflash2_conv(GlmCtx* ctx, void* out, const void* input,
 void glm_dflash2_select(GlmCtx* ctx, float* scores, int* tokens, const void* gates,
     const int* candidates, const float* logits, const void* predecessor,
     const void* successor, const int* anchors, int batch, int depth, int top_k, int rank, int vocab);
+void glm_dflash2_select_bf16(GlmCtx* ctx, float* scores, int* tokens, const void* gates,
+    const int* candidates, const void* logits, const void* predecessor,
+    const void* successor, const int* anchors, int batch, int depth, int top_k, int rank, int vocab);
 
 void glm_batch_prefill_ragged_plan(
     GlmCtx* ctx,

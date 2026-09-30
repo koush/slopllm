@@ -10,7 +10,7 @@ import { MetaOps } from "../src/meta_ops";
 import { PAGE_SIZE, PagedKVCache } from "../src/paged_kv";
 import type { SamplingWorkspace } from "../src/sampling";
 
-function setup() {
+function setup(dflashEnabled = false, depth = 7) {
   const ops = new MetaOps();
   const cache = new PagedKVCache(ops, 1, 8, 1, 16, 2);
   const host = new PagedKVCache(ops, 1, 8, 1, 16, 2, PAGE_SIZE, 0, 0, false, 0, [], true);
@@ -37,12 +37,45 @@ function setup() {
   } as unknown as ChatModel;
   const scheduler = new GenerationScheduler({
     requests, model, cache, hostCache: host, metrics, maxBatchSize: 2, chunkSize: 128, decodeLatencyMs: 0,
+    dflashEnabled, numDraftTokens: dflashEnabled ? depth : undefined,
     ws: { assertClear() {}, clearTracking() {} } as unknown as ExecutionWorkspace,
     captureManager: { execute(_request: unknown, fn: () => unknown) { return { result: fn() }; } } as unknown as CaptureManager,
-    samplingWorkspace: {} as SamplingWorkspace,
+    samplingWorkspace: { updateSampler() {} } as unknown as SamplingWorkspace,
   });
   return { scheduler, requests, model, cache, host, metrics };
 }
+
+for (const depth of [4, 7]) test(`DFlash-${depth} scheduler forwards depth, records acceptance, and closes before removal`, { timeout: 5000 }, async () => {
+  const { scheduler, requests, model, cache, host, metrics } = setup(true, depth);
+  let closed = false;
+  model.generateDflashDecode = async function* (_ws, _cache, _capture, _sampling, requestedDepth) {
+    assert.equal(requestedDepth, depth);
+    try {
+      cache.allocAppendPages(0, 3);
+      cache.reportTokens(0, [1, 2, 3], 4);
+      yield { tokens: [[2, 3, 4]], numAccepted: [2], numDraftTokens: depth, warmup: false };
+    } finally { closed = true; }
+  };
+  model.generateMtpDecode = async function* () { throw new Error("MTP must not run"); };
+  model.generateDecode = async function* () { throw new Error("Ordinary decode must not run"); };
+  const first = request("dflash", 4);
+  requests.submit(first);
+  const running = scheduler.run();
+  try {
+    const tokens: number[] = [];
+    for await (const token of first.tokens.queue) tokens.push(token);
+    await nextTurn();
+    assert.deepEqual(tokens, [1, 2, 3, 4]);
+    assert(closed);
+    assert.equal(metrics.specDecodeNumDraftsTotal, 1);
+    assert.equal(metrics.specDecodeNumDraftTokensTotal, depth);
+    assert.equal(metrics.specDecodeNumAcceptedTokensTotal, 2);
+  } finally {
+    scheduler.stop();
+    await running;
+    cache.free(); host.free();
+  }
+});
 
 function request(id: string, maxTokens = 1): GenerationRequest {
   const inputIds = Array.from({ length: PAGE_SIZE + 1 }, (_, i) => i + 100);

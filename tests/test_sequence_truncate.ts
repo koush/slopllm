@@ -3,6 +3,26 @@ import { it } from "node:test";
 import { MetaOps } from "../src/meta_ops";
 import { PAGE_SIZE, PagedKVCache } from "../src/paged_kv";
 
+it("sliding caches discard full prefix pages without freeing shared pages", () => {
+  using cache = new PagedKVCache(new MetaOps(), 1, 8, 1, 8, 2);
+  cache.reset(2);
+  const tokens = Array.from({ length: PAGE_SIZE * 2 + 3 }, (_, i) => i);
+  cache.allocAppendPages(0, tokens.length);
+  cache.reportTokens(0, tokens, 999);
+  cache.copySequence(1, 0);
+  const original = cache.sequences[0], sliding = cache.sequences[1];
+  const first = original.pages[0];
+  sliding.discardPrefixPages(1);
+  assert.equal(first.refs, 1);
+  assert(!cache.availablePages.includes(first.id));
+  assert.deepEqual(sliding.getTokenIds(), tokens.slice(PAGE_SIZE));
+  assert.equal(sliding.allocLen, tokens.length - PAGE_SIZE);
+  assert.equal(sliding.targetToken, 999);
+  assert.throws(() => sliding.discardPrefixPages(2), /invalid/);
+  original.discardPrefixPages(1);
+  assert(cache.availablePages.includes(first.id));
+});
+
 for (const length of [0, PAGE_SIZE - 1, PAGE_SIZE, PAGE_SIZE + 1]) {
   it(`reportTokens rejects unallocated input without changing history at length ${length}`, () => {
     using cache = new PagedKVCache(new MetaOps(), 1, 8, 1, 4, 1);

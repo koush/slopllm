@@ -5,6 +5,37 @@ import pytest
 import torch
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_selector_accepts_target_head_candidates(glm, device, dtype):
+    torch.manual_seed(73)
+    batch, depth, k, rank, vocab = 2, 7, 16, 32, 128
+    gates = torch.randn(batch, depth, rank, device=device, dtype=torch.bfloat16)
+    predecessor = torch.randn(vocab, rank, device=device, dtype=torch.bfloat16)
+    successor = torch.randn_like(predecessor)
+    ids = torch.stack([torch.randperm(vocab, device=device)[:k] for _ in range(batch * depth)]).int().view(batch, depth, k)
+    anchors = torch.tensor([11, 79], device=device, dtype=torch.int32)
+    logits = torch.randn(batch, depth, k, device=device).to(dtype)
+    previous = torch.cat((anchors[:, None, None].expand(-1, 1, k), ids[:, :-1]), 1)
+    gated = (predecessor[previous.long()] * gates[:, :, None]).float()
+    bilinear = torch.einsum("bdpr,bdcr->bdpc", gated, successor[ids.long()].float()).bfloat16()
+    expected = bilinear.float() + logits.float()[:, :, None]
+    scores = torch.empty_like(expected)
+    tokens = torch.empty(batch, depth, dtype=torch.int32, device=device)
+    fn = getattr(glm.lib, "glm_dflash2_select_bf16" if dtype == torch.bfloat16 else "glm_dflash2_select")
+    fn.argtypes = [C.c_void_p] * 9 + [C.c_int] * 5
+    fn.restype = None
+    torch.cuda.synchronize(device)
+    fn(glm.ctx, scores.data_ptr(), tokens.data_ptr(), gates.data_ptr(), ids.data_ptr(), logits.data_ptr(),
+       predecessor.data_ptr(), successor.data_ptr(), anchors.data_ptr(), batch, depth, k, rank, vocab)
+    glm.synchronize()
+    torch.testing.assert_close(scores, expected, atol=0.125, rtol=0.008)
+    prev = torch.zeros(batch, dtype=torch.long, device=device)
+    rows = torch.arange(batch, device=device)
+    for d in range(depth):
+        prev = expected[rows, d, prev].argmax(-1)
+        torch.testing.assert_close(tokens[:, d], ids[rows, d, prev], atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("side", [0, 1])
 def test_dynamic_conv_resets_at_each_block(glm, device, side):
     torch.manual_seed(123)

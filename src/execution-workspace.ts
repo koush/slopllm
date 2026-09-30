@@ -122,6 +122,8 @@ export class ExecutionState {
       positionIds?: Tensor;
       maskKvLen?: Tensor;
       windowLeft?: number;
+      /** Metadata/KV-write-only plan; no attention kernel will run. */
+      kvOnly?: boolean;
     },
   ) {
     const totalKvLen = cache.getPagedKV().sequences.reduce((sum, s) => sum + s.allocLen, 0);
@@ -471,6 +473,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
   }
 
   flashPrefillPaged(state: ExecutionState, query: Tensor, cacheIdx: number, nHeads: number, nKv: number, hd: number, qStrideN: number, qStrideH: number, maskMode: MaskMode, smScale: number): Tensor {
+    if (state.customMask?.kvOnly) throw new Error("Cannot run attention with a KV-write-only plan");
     const pagedKV = state.cache.getPagedKV();
     const out = this.alloc([1, nHeads, state.totalTokens, hd], query.type, undefined, query.parallelism);
     this.ops.batchPrefillPagedRun(
@@ -650,6 +653,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     positionIds?: Tensor;
     maskKvLen?: Tensor;
     windowLeft?: number;
+    kvOnly?: boolean;
   }): ExecutionState {
     const pagedKV = cache.getPagedKV();
     const cfg = model.cfg;
@@ -662,6 +666,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
     if (customMask?.windowLeft !== undefined && (!Number.isInteger(customMask.windowLeft) || customMask.windowLeft < -1 || cfg.kvLoraRank)) {
       throw new Error("Sliding-window prefill requires standard attention and windowLeft >= -1");
     }
+    if (customMask?.kvOnly && cfg.kvLoraRank) throw new Error("KV-write-only plans require standard attention");
     if (!cfg.kvLoraRank && customMask?.mode !== undefined && customMask.mode !== MaskMode.None && customMask.mode !== MaskMode.Causal) {
       throw new Error("Standard paged prefill supports None or Causal masks");
     }
@@ -757,7 +762,7 @@ export class ExecutionWorkspace extends WorkspaceBase {
         }
       });
     } else {
-      this.ops.batchPrefillPagedPlan(
+      if (!customMask?.kvOnly) this.ops.batchPrefillPagedPlan(
         pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
         state.intWs, state.intWsH, BATCH_INT_WS_SIZE,
         state.prefillPlanInfo,

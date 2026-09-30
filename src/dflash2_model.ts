@@ -223,14 +223,23 @@ export class Dflash2Model extends ChatModel {
     using ac = normed.linear(this.weight(`${p}.attention_conv.kernel_projection.weight`));
     using ax = normed.dflash2Conv(ac, this.weight(`${p}.attention_conv.base_kernel`), c.blockSize, c.convGroupSize, 0);
     trace?.(`${p}.attention_input`, ax);
-    using q = ax.linear(this.weight(`${p}.self_attn.q_proj.weight`));
-    using k = ax.linear(this.weight(`${p}.self_attn.k_proj.weight`));
-    using v = ax.linear(this.weight(`${p}.self_attn.v_proj.weight`));
-    using qr = q.fusedNormRope(this.weight(`${p}.self_attn.q_norm.weight`), cos, sin, c.rmsNormEps, c.headDim, rows, 1, undefined, c.ropeInterleaved);
-    using kr = k.fusedNormRope(this.weight(`${p}.self_attn.k_norm.weight`), cos, sin, c.rmsNormEps, c.headDim, rows, 1, undefined, c.ropeInterleaved);
-    state.kvCacheWrite(kr, v, layer, c.numKeyValueHeads, c.headDim);
-    using attention = state.ws.flashPrefillPaged(state, qr, layer, c.numAttentionHeads, c.numKeyValueHeads,
-      c.headDim, c.headDim, rows * c.headDim, MaskMode.None, c.scaling);
+    using attention = (() => {
+      const prepareKV = () => {
+        using k = ax.linear(this.weight(`${p}.self_attn.k_proj.weight`));
+        using v = ax.linear(this.weight(`${p}.self_attn.v_proj.weight`));
+        using kr = k.fusedNormRope(this.weight(`${p}.self_attn.k_norm.weight`), cos, sin, c.rmsNormEps, c.headDim, rows, 1, undefined, c.ropeInterleaved);
+        state.kvCacheWrite(kr, v, layer, c.numKeyValueHeads, c.headDim);
+      };
+      // Overlap the smaller KV branch for small draft batches; larger batches
+      // did not benefit in benchmarks. Release the stream before the phase yield.
+      using kvStream = rows <= 16 ? this.ops.withStream(prepareKV) : undefined;
+      using q = ax.linear(this.weight(`${p}.self_attn.q_proj.weight`));
+      using qr = q.fusedNormRope(this.weight(`${p}.self_attn.q_norm.weight`), cos, sin, c.rmsNormEps, c.headDim, rows, 1, undefined, c.ropeInterleaved);
+      if (kvStream) kvStream.streamWaitEvent();
+      else prepareKV();
+      return state.ws.flashPrefillPaged(state, qr, layer, c.numAttentionHeads, c.numKeyValueHeads,
+        c.headDim, c.headDim, rows * c.headDim, MaskMode.None, c.scaling);
+    })();
     using flattened = attention.reshape([rows, c.numAttentionHeads * c.headDim]);
     using projected = flattened.outputProj(this.weight(`${p}.self_attn.o_proj.weight`));
     using projectedReplicated = projected.replicate();

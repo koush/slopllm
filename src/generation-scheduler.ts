@@ -351,6 +351,7 @@ interface SchedulerOptions {
   chunkSize: number;
   decodeLatencyMs: number;
   numDraftTokens?: number;
+  dflashEnabled?: boolean;
 }
 
 /** Owns batch membership and GPU execution; HTTP handlers own token consumption. */
@@ -645,9 +646,11 @@ export class GenerationScheduler {
           request.decodeStartedAt ??= performance.now();
         }
         const samplingPolicy = this.prepareSampling(false);
-        const generator = numDraftTokens
-          ? model.generateMtpDecode!(ws, cache, numDraftTokens, captureManager, samplingPolicy)
-          : model.generateDecode(ws, cache, captureManager, samplingPolicy);
+        const generator = this.options.dflashEnabled
+          ? model.generateDflashDecode!(ws, cache, captureManager, samplingPolicy, numDraftTokens)
+          : numDraftTokens
+            ? model.generateMtpDecode!(ws, cache, numDraftTokens, captureManager, samplingPolicy)
+            : model.generateDecode(ws, cache, captureManager, samplingPolicy);
         for await (const step of generator) {
           if (step.numDraftTokens > 0) {
             metrics.specDecodeNumDraftsTotal += this.active.length;

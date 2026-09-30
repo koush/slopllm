@@ -548,7 +548,7 @@ export abstract class Tensor implements Disposable {
 
   dflash2Select(ids: Tensor, logits: Tensor, predecessor: Tensor, successor: Tensor, anchors: Tensor, depth: number): { scores: Tensor, tokens: Tensor } {
     const [rows, rank] = this.shape;
-    if (this.type !== "BF16" || this.shape.length !== 2 || ids.type !== "I32" || logits.type !== "F32"
+    if (this.type !== "BF16" || this.shape.length !== 2 || ids.type !== "I32" || (logits.type !== "F32" && logits.type !== "BF16")
       || ids.shape.length !== 2 || ids.shape[0] !== rows || ids.shape[1] < 1
       || !ids.shape.every((n, i) => n === logits.shape[i]) || logits.shape.length !== 2
       || predecessor.type !== "BF16" || successor.type !== "BF16" || predecessor.shape.length !== 2

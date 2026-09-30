@@ -2,9 +2,40 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { parseLoaderArgs, parseWorkerCommand, validateWorkerModelArgs, workerEnvironment } from "../src/run_model_loader";
-import { parseModelArgs } from "../src/model_cli";
+import { modelArenaLayoutSignatures, parseModelArgs } from "../src/model_cli";
+import { Glm51Model } from "../src/glm51_model";
+import { type GlmOps } from "../src/glm_ops";
 
 describe("model loader arguments", () => {
+  it("includes owned draft weights in the resident model signature", () => {
+    const tensor = { data: 1256, allocSize: 256, type: "BF16" };
+    const model = Object.assign(Object.create(Glm51Model.prototype), {
+      tensors: new Map([["target.weight", tensor]]),
+    }) as Glm51Model;
+    const devices = [{ device: 0, arenaBase: 1000 }] as GlmOps[];
+    const targetOnly = modelArenaLayoutSignatures(model, devices).get(0);
+    const draftTensor = { ...tensor, data: 1512 };
+    Object.assign(model, { dflash: { tensors: new Map([["fc.weight", draftTensor]]) } });
+    const combined = modelArenaLayoutSignatures(model, devices).get(0);
+    assert.notEqual(combined, targetOnly);
+    draftTensor.data += 256;
+    assert.notEqual(modelArenaLayoutSignatures(model, devices).get(0), combined);
+  });
+
+  it("loads an owned GLM drafter and prevents executor checkpoint overrides", () => {
+    const shared = ["--glm51", "--dflash", "--cp", "--arena", "92"];
+    const args = parseModelArgs(shared);
+    assert.equal(args.dflashModelDir, "incoai/GLM-5.3-DFlash2");
+    assert.equal(args.useGlm51, true);
+    validateWorkerModelArgs(shared, args);
+    assert.throws(() => validateWorkerModelArgs([...shared, "--dflash-model-dir", "other"], args), /cannot override/);
+    assert.equal(parseModelArgs(["--dflash-model-dir", "draft", "--dflash"]).dflashModelDir, "draft");
+    assert.throws(() => parseModelArgs(["--dflash-model-dir"]), /requires a checkpoint/);
+    for (const mode of ["--qwen3", "--qwen35", "--dflash2", "--fp8"]) {
+      assert.throws(() => parseModelArgs([mode, "--dflash"]), /requires a GLM/);
+    }
+  });
+
   it("loads a standalone DFlash2 workspace and rejects target-model flags", () => {
     const args = parseModelArgs(["--dflash2", "--arena", "8", "--gpus", "0,1"]);
     assert.equal(args.useDflash2, true);

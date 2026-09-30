@@ -428,4 +428,19 @@ export class SamplingWorkspace extends WorkspaceBase implements TokenSelector {
     }
     this.draftTokens.memcpy(draftTokens, batchSize * this.depth * 4, MemcpyKind.DeviceToDevice);
   }
+
+  prepareDeterministicVerification(draftTokens: Tensor, batchSize: number): void {
+    this.prepareBatch(batchSize, this.depth);
+    if (draftTokens.type !== "I32" || draftTokens.numElements !== batchSize * this.depth) {
+      throw new Error("Deterministic proposal must contain B * depth token IDs");
+    }
+    const rows = batchSize * this.depth;
+    this.qInputProbs.fill(0, rows * this.capacity);
+    this.qInputIds.fill(-1, rows * this.capacity);
+    using ones = this.alloc([rows], "F32");
+    ones.fill(1, rows);
+    this.qInputProbs.memcpy2d(0, this.capacity * 4, ones, 0, 4, 4, rows, MemcpyKind.DeviceToDevice);
+    this.qInputIds.memcpy2d(0, this.capacity * 4, draftTokens, 0, 4, 4, rows, MemcpyKind.DeviceToDevice);
+    this.draftTokens.memcpy(draftTokens, rows * 4, MemcpyKind.DeviceToDevice);
+  }
 }

@@ -334,7 +334,7 @@ export class GlmTensor extends Tensor {
     const scores = this.workspace.alloc([this.shape[0], k, k], "F32");
     const tokens = this.workspace.alloc([batch, depth], "I32");
     getNativeAddon().dflash2Select(this.ops.ctx, scores.data, tokens.data, this.data, ids.data, logits.data,
-      predecessor.data, successor.data, anchors.data, batch, depth, k, this.shape[1], predecessor.shape[0]);
+      predecessor.data, successor.data, anchors.data, batch, depth, k, this.shape[1], predecessor.shape[0], logits.type === "BF16");
     return { scores, tokens };
   }
 
@@ -863,9 +863,14 @@ export class GlmTensor extends Tensor {
 }
 
 export class GlmOps implements DeviceOps {
-  getCaptureKeys(state: ExecutionState): readonly (string | number)[] {
+  getCaptureKeys(state: ExecutionState, prefillPlanInfo = state.prefillPlanInfo): readonly (string | number)[] {
     const pagedKV = state.cache.getPagedKV();
     if (!pagedKV.sparseMode) {
+      // FlashInfer's CPU plan fixes launch geometry and workspace offsets into
+      // the graph. A changed split-KV plan cannot replay the previous launch.
+      if (!state.isDecode && !state.model.cfg.kvLoraRank && !state.customMask?.kvOnly && prefillPlanInfo) {
+        return [`prefillPlan:${prefillPlanInfo.readPinnedBuffer().toString("hex")}`];
+      }
       return [];
     }
     // The indexer launches with the native auto split budget under capture

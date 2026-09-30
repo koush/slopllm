@@ -749,7 +749,8 @@ export class ParallelTensor extends Tensor {
     // Replicated weight + Replicated input → Replicated output
     if (WP === TensorParallelism.Replicated && XP === TensorParallelism.Replicated) {
       const W = this.worldSize;
-      if (n % W === 0 && batch <= W && pWeight.numElements > 1048576) {
+      const narrowBatchLimit = pWeight.name === "fc.weight" ? 64 : W;
+      if (n % W === 0 && batch <= narrowBatchLimit && pWeight.numElements > 1048576) {
         // these weights are better as column parallel for decode but replicated for prefill
         using narrowed = this.parallelOps.tryNarrowLinearCandidate(pWeight, batch);
         if (narrowed) {
@@ -3397,10 +3398,13 @@ export class ParallelOps implements DeviceOps {
   /** Decode-sized batches narrow these replicated weights to column-parallel on demand. */
   tryNarrowLinearCandidate(weight: ParallelTensor, batch: number): ParallelTensor | undefined {
     const name = weight.name;
-    if (!name?.includes(".self_attn.q_a_proj.weight") && !name?.includes(".indexer.wq_b.weight") && !name?.includes(".ckv_proj.weight")) {
+    const dflashContext = name === "fc.weight";
+    if (!dflashContext && !name?.includes(".self_attn.q_a_proj.weight") && !name?.includes(".indexer.wq_b.weight") && !name?.includes(".ckv_proj.weight")) {
       return undefined;
     }
-    if (batch > this.worldSize || weight.numElements <= 1048576 || weight.shape[0] % this.worldSize !== 0) {
+    // DFlash verifies up to eight 8-token blocks. Its 432 MiB replicated context
+    // projection remains bandwidth-bound at these sizes; RMSNorm gathers the output.
+    if (batch > (dflashContext ? 64 : this.worldSize) || weight.numElements <= 1048576 || weight.shape[0] % this.worldSize !== 0) {
       return undefined;
     }
     return this.tryNarrowToColumnParallel(weight);
@@ -3997,7 +4001,7 @@ export class ParallelOps implements DeviceOps {
 
   getCaptureKeys(state: ExecutionState): readonly (string | number)[] {
     return this.devices.flatMap((device, rank) =>
-      device.getCaptureKeys(state).map(key => `device:${rank}:${key}`));
+      device.getCaptureKeys(state, state.prefillPlanInfo ? this.cast(state.prefillPlanInfo).shard(rank) : undefined).map(key => `device:${rank}:${key}`));
   }
 
   sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor } {

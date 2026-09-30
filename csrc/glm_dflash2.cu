@@ -33,8 +33,9 @@ void glm_dflash2_conv(GlmCtx* ctx, void* out, const void* input,
         rows, channels, block_size, group_size, side);
 }
 
+template <typename Logit>
 __global__ void dflash2_scores(float* scores, const __nv_bfloat16* gates,
-    const int* ids, const float* logits, const __nv_bfloat16* predecessor,
+    const int* ids, const Logit* logits, const __nv_bfloat16* predecessor,
     const __nv_bfloat16* successor, const int* anchors, int depth, int k, int rank, int vocab) {
     int edge = blockIdx.x;
     int candidate = edge % k, previous = (edge / k) % k, row = edge / (k * k);
@@ -58,7 +59,7 @@ __global__ void dflash2_scores(float* scores, const __nv_bfloat16* gates,
         if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
         __syncthreads();
     }
-    if (!threadIdx.x) scores[edge] = logits[row * k + candidate] + __bfloat162float(__float2bfloat16(partial[0]));
+    if (!threadIdx.x) scores[edge] = float(logits[row * k + candidate]) + __bfloat162float(__float2bfloat16(partial[0]));
 }
 
 __global__ void dflash2_walk(int* tokens, const float* scores, const int* ids, int depth, int k) {
@@ -81,6 +82,17 @@ void glm_dflash2_select(GlmCtx* ctx, float* scores, int* tokens, const void* gat
     cudaSetDevice(ctx->device_id);
     dflash2_scores<<<batch * depth * top_k * top_k, 256, 0, GLM_STREAM(ctx)>>>(scores,
         static_cast<const __nv_bfloat16*>(gates), candidates, logits,
+        static_cast<const __nv_bfloat16*>(predecessor), static_cast<const __nv_bfloat16*>(successor),
+        anchors, depth, top_k, rank, vocab);
+    dflash2_walk<<<batch, 32, 0, GLM_STREAM(ctx)>>>(tokens, scores, candidates, depth, top_k);
+}
+
+void glm_dflash2_select_bf16(GlmCtx* ctx, float* scores, int* tokens, const void* gates,
+    const int* candidates, const void* logits, const void* predecessor,
+    const void* successor, const int* anchors, int batch, int depth, int top_k, int rank, int vocab) {
+    cudaSetDevice(ctx->device_id);
+    dflash2_scores<<<batch * depth * top_k * top_k, 256, 0, GLM_STREAM(ctx)>>>(scores,
+        static_cast<const __nv_bfloat16*>(gates), candidates, static_cast<const __nv_bfloat16*>(logits),
         static_cast<const __nv_bfloat16*>(predecessor), static_cast<const __nv_bfloat16*>(successor),
         anchors, depth, top_k, rank, vocab);
     dflash2_walk<<<batch, 32, 0, GLM_STREAM(ctx)>>>(tokens, scores, candidates, depth, top_k);

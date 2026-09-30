@@ -62,6 +62,17 @@ test("standard attention graphs distinguish mask and sliding-window modes", () =
   assert.deepEqual(lookup(0, 2047), lookup(0, 2047));
 });
 
+test("standard prefill keys follow FlashInfer plan geometry, except KV-only plans", () => {
+  const { ops, state } = fixture();
+  const bytes = Buffer.alloc(120);
+  const s = Object.assign(state(4096, 8, false, false), { prefillPlanInfo: { readPinnedBuffer: () => bytes } });
+  const before = ops.devices[0].getCaptureKeys(s);
+  bytes.writeBigInt64LE(256n, 0);
+  assert.notDeepEqual(ops.devices[0].getCaptureKeys(s), before);
+  Object.assign(s, { customMask: { kvOnly: true } });
+  assert.deepEqual(ops.devices[0].getCaptureKeys(s), []);
+});
+
 test("device capture keys own dispatch and ParallelOps preserves each device's decision", () => {
   const { ops, state } = fixture();
   const s = state(16384);

@@ -43,6 +43,7 @@ interface ServerArgs extends ModelCliArgs {
   decodeLatency: number;
   noCudaGraph: boolean;
   noMtp: boolean;
+  dflashDepth?: number;
   phasedPrefill: boolean;
   apiKey?: string;
   adminApiKey?: string;
@@ -88,6 +89,7 @@ function parseArgs(argv: string[]): ServerArgs {
     else if (a === "--decode-latency" && i + 1 < argv.length) args.decodeLatency = parseInt(argv[++i], 10);
     else if (a === "--no-cuda-graph") args.noCudaGraph = true;
     else if (a === "--no-mtp") args.noMtp = true;
+    else if (a === "--dflash-depth") args.dflashDepth = Number(argv[++i]);
     else if (a === "--phased-prefill") { args.phasedPrefill = true; phasedPrefillExplicit = true; }
     else if (a === "--no-phased-prefill") args.phasedPrefill = false;
     else if (a === "--api-key" && i + 1 < argv.length) args.apiKey = argv[++i];
@@ -103,6 +105,10 @@ function parseArgs(argv: string[]): ServerArgs {
   }
   if (args.maxHostPages < 0 || !Number.isInteger(args.maxHostPages)) {
     throw new Error(`--max-host-pages must be a non-negative integer, got ${args.maxHostPages}`);
+  }
+  if (args.dflashDepth !== undefined) {
+    if (!args.dflashModelDir) throw new Error("--dflash-depth requires --dflash or --dflash-model-dir");
+    if (!Number.isInteger(args.dflashDepth) || args.dflashDepth < 1) throw new Error("--dflash-depth must be a positive integer");
   }
   return args;
 }
@@ -135,6 +141,9 @@ Options:
   --no-cuda-graph               Disable CUDA graph capture
   --mtp [int]                   MTP speculative decoding draft tokens (default: 3)
   --no-mtp                      Disable MTP decoding for an MTP-loaded model
+  --dflash                      Load and use the GLM DFlash2 drafter (7 draft tokens)
+  --dflash-model-dir <path>      Select the owned draft checkpoint
+  --dflash-depth <int>           Proposals to verify (default: 7; shortened multi-GPU batches <= 2)
   --phased-prefill              Overlap pairs of intermediate prefill chunks (default: on)
   --no-phased-prefill           Disable phased prefill
   --api-key <string>            Require this API key (Bearer token) on all endpoints
@@ -370,13 +379,13 @@ function sendMetrics(
     "# HELP vllm:generation_tokens_total slopllm sampled completion tokens.",
     "# TYPE vllm:generation_tokens_total counter",
     `vllm:generation_tokens_total ${metrics.generationTokensTotal}`,
-    "# HELP vllm:spec_decode_num_drafts_total slopllm MTP draft sequences verified.",
+    "# HELP vllm:spec_decode_num_drafts_total slopllm speculative draft sequences verified.",
     "# TYPE vllm:spec_decode_num_drafts_total counter",
     `vllm:spec_decode_num_drafts_total ${metrics.specDecodeNumDraftsTotal}`,
-    "# HELP vllm:spec_decode_num_draft_tokens_total slopllm MTP draft tokens proposed.",
+    "# HELP vllm:spec_decode_num_draft_tokens_total slopllm speculative draft tokens proposed.",
     "# TYPE vllm:spec_decode_num_draft_tokens_total counter",
     `vllm:spec_decode_num_draft_tokens_total ${metrics.specDecodeNumDraftTokensTotal}`,
-    "# HELP vllm:spec_decode_num_accepted_tokens_total slopllm MTP draft tokens accepted.",
+    "# HELP vllm:spec_decode_num_accepted_tokens_total slopllm speculative draft tokens accepted.",
     "# TYPE vllm:spec_decode_num_accepted_tokens_total counter",
     `vllm:spec_decode_num_accepted_tokens_total ${metrics.specDecodeNumAcceptedTokensTotal}`,
     "# HELP glm:mtp_phase_seconds_total GPU-complete wall time spent in MTP execution phases.",
@@ -452,12 +461,22 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const ws = new ExecutionWorkspace(ops, args.batchSize, args.chunkSize);
   const captureManager = new CaptureManager(ops);
   captureManager.disabled = args.noCudaGraph;
-  const mtpEnabled = args.mtp > 0 && !args.noMtp;
+  const dflashEnabled = !!args.dflashModelDir;
+  if (dflashEnabled && (!model.generateDflashDecode || !model.dflashDepth)) throw new Error("DFlash generation is not available");
+  const mtpEnabled = !dflashEnabled && args.mtp > 0 && !args.noMtp;
+  const numDraftTokens = dflashEnabled ? args.dflashDepth ?? model.dflashDepth : mtpEnabled ? args.mtp : 0;
+  if (dflashEnabled && numDraftTokens > model.dflashDepth) throw new Error(`--dflash-depth must be <= ${model.dflashDepth}`);
+  if (dflashEnabled && numDraftTokens < model.dflashDepth && args.batchSize > 2 && ops.worldSize > 1) {
+    throw new Error("Short DFlash verification requires --batch-size <= 2 on multiple GPUs");
+  }
+  if (numDraftTokens && args.chunkSize < args.batchSize * ((dflashEnabled ? model.dflashDepth : numDraftTokens) + 1)) {
+    throw new Error("Speculative decode requires chunk-size >= batch-size * full draft block size");
+  }
   const samplingWorkspace = new SamplingWorkspace(ops,
-    args.batchSize * (mtpEnabled ? args.mtp + 1 : 1),
+    args.batchSize * (numDraftTokens + 1),
     model.cfg.vocabSize, args.repetitionPenaltyWindow,
-    mtpEnabled
-      ? { maxBatchSize: args.batchSize, depth: args.mtp, retainProposalsOnGpu: true }
+    numDraftTokens
+      ? { maxBatchSize: args.batchSize, depth: numDraftTokens, retainProposalsOnGpu: true }
       : undefined);
   const tokenizer = model.tokenizer;
   const eosIds = model.eosIds;
@@ -478,10 +497,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     // arena never needs to satisfy a first-seen allocation mid-serving.
     console.log("Warming up...");
     using warmupSw = new SamplingWorkspace(ops,
-      args.batchSize * (mtpEnabled ? args.mtp + 1 : 1),
+      args.batchSize * (numDraftTokens + 1),
       model.cfg.vocabSize, args.repetitionPenaltyWindow,
-      mtpEnabled
-        ? { maxBatchSize: args.batchSize, depth: args.mtp, retainProposalsOnGpu: true }
+      numDraftTokens
+        ? { maxBatchSize: args.batchSize, depth: numDraftTokens, retainProposalsOnGpu: true }
         : undefined);
     const warmupParams = (rows: number) => Array.from({ length: rows }, () => makeSamplingParamsHelper(args));
     const preparePrefillSampling = (rows: number) => {
@@ -524,9 +543,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       warmupSw.updateSampler(warmupParams(args.batchSize), warmupParams(args.batchSize).map(() => []));
     }
     let warmupSteps = 0;
-    const decode = mtpEnabled
-      ? model.generateMtpDecode!(ws, cache, args.mtp, undefined, warmupSw)
-      : model.generateDecode(ws, cache, undefined, warmupSw);
+    const decode = dflashEnabled
+      ? model.generateDflashDecode!(ws, cache, undefined, warmupSw, numDraftTokens)
+      : mtpEnabled
+        ? model.generateMtpDecode!(ws, cache, args.mtp, undefined, warmupSw)
+        : model.generateDecode(ws, cache, undefined, warmupSw);
     for await (const _ of decode) {
       if (++warmupSteps === 3) {
         break;
@@ -567,7 +588,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const scheduler = new GenerationScheduler({
     requests: decodeQueue, model, ws, cache, hostCache, captureManager, samplingWorkspace, metrics,
     maxBatchSize: args.batchSize, chunkSize: args.chunkSize, decodeLatencyMs: args.decodeLatency,
-    numDraftTokens: mtpEnabled ? args.mtp : undefined,
+    numDraftTokens: numDraftTokens || undefined, dflashEnabled,
   });
   const decoding = scheduler.run().catch(error => {
     console.error("Decode scheduler stopped:", error);
@@ -653,11 +674,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         const effectiveK = temperature <= 0 ? 1 : topK > 0 ? Math.min(topK, model.cfg.vocabSize) : 32;
         if (![temperature, topP, topK, repetitionPenalty, presencePenalty].every(Number.isFinite)
           || !Number.isInteger(topK) || !Number.isInteger(effectiveK)) {
-          sendJSON(res, 400, { error: { message: "Linear MTP requires finite numeric sampling parameters and an integer top_k", type: "invalid_request_error" } });
+          sendJSON(res, 400, { error: { message: "Speculative decoding requires finite numeric sampling parameters and an integer top_k", type: "invalid_request_error" } });
           return;
         }
         if (topK > 256 || effectiveK > 256) {
-          sendJSON(res, 400, { error: { message: "Linear MTP supports top_k <= 256 (effective top_k must not exceed 256)", type: "invalid_request_error", param: "top_k" } });
+          sendJSON(res, 400, { error: { message: "Speculative decoding supports top_k <= 256 (effective top_k must not exceed 256)", type: "invalid_request_error", param: "top_k" } });
           return;
         }
       }
@@ -676,10 +697,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         presencePenalty,
         repetitionPenaltyWindow: args.repetitionPenaltyWindow,
       };
-      if (args.mtp && !args.noMtp && (samplingParams.repetitionPenalty !== 1 || samplingParams.presencePenalty !== 0)) {
+      if (numDraftTokens && (samplingParams.repetitionPenalty !== 1 || samplingParams.presencePenalty !== 0)) {
         sendJSON(res, 400, {
           error: {
-            message: "MTP decoding currently requires repetition_penalty=1 and presence_penalty=0",
+            message: "Speculative decoding currently requires repetition_penalty=1 and presence_penalty=0",
             type: "invalid_request_error",
           },
         });
@@ -1039,7 +1060,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log(`  GET  /health               - Health check`);
     console.log(`  CUDA graphs: ${args.noCudaGraph ? "disabled" : "enabled"}`);
     console.log(`  MTP: ${args.mtp > 0 && !args.noMtp ? `enabled (draft tokens ${args.mtp})` : "disabled"}`);
-    if (samplingWorkspace.mtpEnabled) console.log(`  MTP proposals: GPU-resident`);
+    if (samplingWorkspace.mtpEnabled) console.log(`  ${dflashEnabled ? "DFlash2" : "MTP"} proposals: GPU-resident (${numDraftTokens} tokens)`);
     console.log(`  Phased prefill: ${args.phasedPrefill ? "enabled" : "disabled"}`);
     console.log(`  API key: ${args.apiKey !== undefined ? "required" : "disabled"}`);
     console.log(`  Admin API key: ${args.adminApiKey !== undefined ? "required for /admin endpoints" : "disabled (/admin endpoints return 401)"}`);

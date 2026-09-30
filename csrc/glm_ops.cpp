@@ -3214,15 +3214,21 @@ static Napi::Value CausalConv1dUpdate(const Napi::CallbackInfo& info) {
 
 static Napi::Value Dflash2Select(const Napi::CallbackInfo& info) {
     auto env = info.Env();
-    if (info.Length() != 14) {
-        Napi::TypeError::New(env, "Expected 14 DFlash2 selector arguments").ThrowAsJavaScriptException();
+    if (info.Length() < 14 || info.Length() > 15) {
+        Napi::TypeError::New(env, "Expected 14 DFlash2 selector arguments and optional BF16 logits flag").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     auto ptr = [&](int i) { return reinterpret_cast<void*>(info[i].As<Napi::Number>().Int64Value()); };
     auto val = [&](int i) { return info[i].As<Napi::Number>().Int32Value(); };
-    glm_dflash2_select(static_cast<GlmCtx*>(ptr(0)), static_cast<float*>(ptr(1)), static_cast<int*>(ptr(2)),
+    if (info.Length() > 14 && info[14].As<Napi::Boolean>().Value()) {
+      glm_dflash2_select_bf16(static_cast<GlmCtx*>(ptr(0)), static_cast<float*>(ptr(1)), static_cast<int*>(ptr(2)),
+        ptr(3), static_cast<int*>(ptr(4)), ptr(5), ptr(6), ptr(7),
+        static_cast<int*>(ptr(8)), val(9), val(10), val(11), val(12), val(13));
+    } else {
+      glm_dflash2_select(static_cast<GlmCtx*>(ptr(0)), static_cast<float*>(ptr(1)), static_cast<int*>(ptr(2)),
         ptr(3), static_cast<int*>(ptr(4)), static_cast<float*>(ptr(5)), ptr(6), ptr(7),
         static_cast<int*>(ptr(8)), val(9), val(10), val(11), val(12), val(13));
+    }
     auto err = cudaGetLastError();
     if (err != cudaSuccess) Napi::Error::New(env, cudaGetErrorString(err)).ThrowAsJavaScriptException();
     return env.Undefined();

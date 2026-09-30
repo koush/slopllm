@@ -85,6 +85,52 @@ for (const parallel of [false, true]) {
       assert.deepEqual(readI32(selected).slice(0, B), [7, 300]);
     });
 
+    it("verifies deterministic DFlash proposals with greedy prefix acceptance under capture", () => {
+      using manager = new CaptureManager(ops);
+      using inputs = new WorkspaceBase(ops);
+      using proposal = inputs.alloc([B, D], "I32");
+      proposal.h2d(Buffer.from(new Int32Array([7, 8, 9, 300, 302, 303]).buffer));
+      using verification = logits([7, 8, 9, 10, 300, 301, 302, 303]);
+      sampler.updateMtpSampler([greedy, greedy]);
+      for (let i = 0; i < 6; i++) {
+        sampler.prepareDraft(B, D);
+        const result = manager.run({ proposal, verification }, (_capturing, retained) => {
+          sampler.prepareDeterministicVerification(retained.proposal, B);
+          return sampler.verify(retained.verification);
+        }, ["deterministic-draft"]) as { tokens: Tensor, numAccepted: Tensor };
+        using tokens = result.tokens; using accepted = result.numAccepted;
+        assert.deepEqual(readI32(accepted), [3, 1]);
+        const values = readI32(tokens);
+        assert.equal(values[3], 10);
+        assert.equal(values[5], 301);
+      }
+      assert([...manager.captured.values()].some(graph => graph.graphExec !== null));
+    });
+
+    it("deterministic proposals preserve the target sampling distribution", () => {
+      const batch = 128, iterations = 32;
+      using sampling = new SamplingWorkspace(ops, batch * 2, V, 0, { maxBatchSize: batch, depth: 1 });
+      const params = { ...greedy, temperature: 1, topK: 3 };
+      sampling.updateMtpSampler(Array.from({ length: batch }, () => params));
+      sampling.prepareDraft(batch, 1);
+      using proposals = ws.alloc([batch, 1], "I32");
+      proposals.fill(7, batch);
+      using verification = logits(Array(batch * 2).fill(7));
+      sampling.prepareDeterministicVerification(proposals, batch);
+      const counts = [0, 0, 0];
+      for (let iteration = 0; iteration < iterations; iteration++) {
+        const result = sampling.verify(verification);
+        using tokens = result.tokens; using accepted = result.numAccepted;
+        const values = readI32(tokens);
+        for (let b = 0; b < batch; b++) {
+          assert(values[b * 2] >= 7 && values[b * 2] <= 9);
+          counts[values[b * 2] - 7]++;
+        }
+      }
+      const denominator = Math.exp(2) + Math.exp(1) + 1;
+      counts.forEach((count, i) => assert(Math.abs(count / (batch * iterations) - Math.exp(2 - i) / denominator) < 0.04));
+    });
+
     it("ordinary sampling retains penalty history and caller-owned outputs without MTP allocations", () => {
       using sampling = new SamplingWorkspace(ops, B, V, 8);
       using inputs = new WorkspaceBase(ops);

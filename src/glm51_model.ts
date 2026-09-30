@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { CaptureManager } from "./capture-manager";
+import { Dflash2Model } from "./dflash2_model";
 import type { ChatCache, ChatTemplateKwargs, ChunkedPrefillPlan, MtpDecodeStepResult, TokenSelector } from "./chat_model";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
 import { DeviceOps, MaskMode, MlaQuery, TensorParallelism, type StreamResult } from "./device_ops";
@@ -13,7 +14,7 @@ import { resolveModelPath } from "./model_path";
 import { PagedKVCache } from "./paged_kv";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
-import { UsingHolder } from "./using-holder";
+import { DisposableSet, UsingHolder } from "./using-holder";
 
 export { ExecutionState as BatchState };
 export type { SamplingParams };
@@ -59,6 +60,22 @@ export interface Glm51Config extends CommonModelConfig {
 interface RotaryResult {
   cos: Tensor;
   sin: Tensor;
+}
+
+export interface DflashForwardResult {
+  targetHidden: Tensor;
+  draftHidden: Tensor;
+  scores: Tensor;
+  tokens: Tensor;
+}
+
+class Glm51Cache extends PagedKVCache {
+  dflash?: PagedKVCache;
+  override free(): void {
+    this.dflash?.free();
+    this.dflash = undefined;
+    super.free();
+  }
 }
 
 interface LayerHolders {
@@ -151,6 +168,16 @@ export class Glm51Model extends ChatModel {
   invFreq: Tensor;
   readonly contextParallel: boolean;
   private readonly mtp: boolean;
+  private dflash?: Dflash2Model;
+
+  get dflashModel(): Dflash2Model | undefined { return this.dflash; }
+  override get dflashDepth(): number { return this.dflash ? this.dflash.cfg.blockSize - 1 : 0; }
+
+  override free(): void {
+    this.dflash?.free();
+    this.dflash = undefined;
+    super.free();
+  }
 
   private constructor(ops: DeviceOps, config: Glm51Config, contextParallel = false, mtp = false) {
     super(ops);
@@ -165,12 +192,28 @@ export class Glm51Model extends ChatModel {
     return new GlmParser(this.tokenizer, chatTemplateKwargs);
   }
 
-  static async fromPretrained(ops: DeviceOps, repoIdOrDir: string = GLM51_MODEL_DIR, contextParallel = false, mtp = false): Promise<Glm51Model> {
+  static async fromPretrained(ops: DeviceOps, repoIdOrDir: string = GLM51_MODEL_DIR, contextParallel = false, mtp = false, dflashModelDir?: string): Promise<Glm51Model> {
     const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
     const config = loadConfig(modelDir);
     const model = new Glm51Model(ops, config, contextParallel, mtp);
-    await model.fromPretrained(modelDir, GLM51_REPO);
-    return model;
+    try {
+      await model.fromPretrained(modelDir, GLM51_REPO);
+      if (dflashModelDir) {
+        model.dflash = await Dflash2Model.fromPretrained(ops, dflashModelDir);
+        const draft = model.dflash.cfg;
+        if (draft.hiddenSize !== config.hiddenSize || draft.vocabSize !== config.vocabSize
+          || draft.targetLayerIds.some(i => !Number.isInteger(i) || i < 0 || i >= config.numHiddenLayers)
+          || new Set(draft.targetLayerIds).size !== draft.targetLayerIds.length
+          || draft.maskTokenId < 0 || draft.maskTokenId >= config.vocabSize) {
+          throw new Error("DFlash2 checkpoint is incompatible with the target hidden size, vocabulary, or layers");
+        }
+      }
+      return model;
+    } catch (error) {
+      await ops.synchronizeAsync();
+      model.free();
+      throw error;
+    }
   }
 
   private weightParallelism(name: string): TensorParallelism {
@@ -495,7 +538,12 @@ export class Glm51Model extends ChatModel {
     const hd = cfg.headDim;
     const nLayers = cfg.numHiddenLayers + (this.mtp ? cfg.numNextNPredictLayers ?? 0 : 0);
     const sharedLayers = cfg.indexerTypes.map(t => t === "shared");
-    return new PagedKVCache(this.ops, nKv, hd, nLayers, maxPages, maxBatch, pageSize, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel, cfg.indexHeadDim, sharedLayers, pinned);
+    const cache = new Glm51Cache(this.ops, nKv, hd, nLayers, maxPages, maxBatch, pageSize, cfg.kvLoraRank, cfg.qkRopeHeadDim, this.contextParallel, cfg.indexHeadDim, sharedLayers, pinned);
+    if (this.dflash && !pinned) {
+      const { slidingWindow, blockSize } = this.dflash.cfg;
+      cache.dflash = this.dflash.createCache(maxBatch * (Math.ceil((slidingWindow + blockSize) / 64) + 1), maxBatch);
+    }
+    return cache;
   }
 
   private mlpDense(normed: Tensor, pfx: string, BS: number): Tensor {
@@ -568,7 +616,7 @@ export class Glm51Model extends ChatModel {
 
   private * mlaLayerPhased(cos: Tensor, sin: Tensor,
     normedHolder: UsingHolder<Tensor>, residualHolder: UsingHolder<Tensor>, layerIdx: number, state: ExecutionState,
-    layerHolders?: LayerHolders
+    layerHolders?: LayerHolders, layerCallback?: (normed: Tensor, residual: Tensor) => void
   ): Generator<void, { normed: Tensor, residual: Tensor }, void> {
     layerHolders ||= {};
     const { sharedSlots, sharedSlotsLength, ckvPrefetchStream, indexerPrefetchStream, ckvPrefetch, indexerKPrefetch, indexerKScalePrefetch } = layerHolders;
@@ -925,12 +973,16 @@ export class Glm51Model extends ChatModel {
     residualHolder.release();
     yield;
     const mlpResult = attnResidual.fusedAddRmsnorm(downBuf, nextWeight, cfg.rmsNormEps);
+    using resultNormed = new UsingHolder(mlpResult.normed);
+    using resultResidual = new UsingHolder(mlpResult.residual);
 
     // Only close the prefetch branch at layer end: outputProj reads immutable
     // weights and can use cache hits without waiting for the hint kernel.
     prefetchL2.value?.streamWaitEvent();
+
+    layerCallback?.(mlpResult.normed, mlpResult.residual);
     yield;
-    return { normed: mlpResult.normed, residual: mlpResult.residual };
+    return { normed: resultNormed.detach(), residual: resultResidual.detach() };
   }
 
   private *forwardWithLayerHolders<T>(state: ExecutionState, layerHolders: LayerHolders | undefined, cb: (layerHolders: LayerHolders) => Generator<void, T, void>): Generator<void, T, void> {
@@ -969,6 +1021,11 @@ export class Glm51Model extends ChatModel {
   }
 
   * forwardPhased(state: ExecutionState, layerHolders?: LayerHolders): Generator<void, Tensor, void> {
+    return yield* this.forwardTargetPhased(state, layerHolders);
+  }
+
+  private *forwardTargetPhased(state: ExecutionState, layerHolders?: LayerHolders,
+    layerCallback?: (layer: number, normed: Tensor, residual: Tensor) => void): Generator<void, Tensor, void> {
     const self = this;
     return yield* this.forwardWithLayerHolders(state, layerHolders, function* (layerHolders) {
       const embedTable = self.tensors.get("model.embed_tokens.weight")!;
@@ -985,13 +1042,67 @@ export class Glm51Model extends ChatModel {
       self.prefetchLayerResources(state, layerHolders, 0);
 
       for (let i = 0; i < cfg.numHiddenLayers; i++) {
-        const result = yield* self.mlaLayerPhased(cos, sin, normed, residual, i, state, layerHolders);
+        const result = yield* self.mlaLayerPhased(cos, sin, normed, residual, i, state, layerHolders,
+          layerCallback ? (n, r) => layerCallback(i, n, r) : undefined);
         normed.replace(result.normed);
         residual.replace(result.residual);
       }
 
       return normed.detach();
     });
+  }
+
+  /** All plans and input uploads precede capture. blockState contains sequence-major
+   * [anchor, mask, ...mask] IDs. The caller owns all returned tensors and draft KV. */
+  *forwardDflashPhased(targetState: ExecutionState, contextState: ExecutionState,
+    blockState: ExecutionState, layerHolders?: LayerHolders): Generator<void, DflashForwardResult, void> {
+    const draft = this.dflash;
+    if (!draft) throw new Error("GLM was not loaded with a DFlash2 model");
+    if (targetState.model !== this || contextState.model !== draft || blockState.model !== draft
+      || targetState.ws.ops !== this.ops || contextState.ws.ops !== this.ops
+      || contextState.ws !== blockState.ws || contextState.cache !== blockState.cache
+      || blockState.batchSize !== contextState.batchSize || !blockState.input
+      || contextState.isDecode || targetState.batchSize !== contextState.batchSize
+      || targetState.seqLens.length !== contextState.seqLens.length
+      || targetState.seqLens.some((n, i) => n !== contextState.seqLens[i])) {
+      throw new Error("DFlash plans must use matching target/context token rows and the same backend");
+    }
+    using targetHidden = new UsingHolder(yield* this.forwardDflashContextPhased(targetState, contextState, layerHolders));
+    const block = yield* this.forwardDflashBlockPhased(blockState);
+    return { targetHidden: targetHidden.detach(), ...block };
+  }
+
+  private *forwardDflashContextPhased(targetState: ExecutionState, contextState: ExecutionState,
+    layerHolders?: LayerHolders): Generator<void, Tensor, void> {
+    const draft = this.dflash!;
+    using ownedFeatures = new DisposableSet();
+    const features = draft.cfg.targetLayerIds.map(() => {
+      const holder = new UsingHolder<Tensor>(undefined!);
+      ownedFeatures.add(holder);
+      return holder;
+    });
+    using targetHidden = new UsingHolder(yield* this.forwardTargetPhased(targetState, layerHolders,
+      (layer, _normed, residual) => {
+        const slot = draft.cfg.targetLayerIds.indexOf(layer);
+        if (slot >= 0) features[slot].replace(residual.viewClone());
+      }));
+    yield* draft.prepareContextPhased(contextState, features.map(holder => holder.value));
+    return targetHidden.detach();
+  }
+
+  private *forwardDflashBlockPhased(blockState: ExecutionState): Generator<void, Omit<DflashForwardResult, "targetHidden">, void> {
+    const draft = this.dflash!;
+    using embeddings = blockState.embedding(this.tensors.get("model.embed_tokens.weight")!);
+    using draftHidden = new UsingHolder(yield* draft.forwardBlockPhased(blockState, embeddings));
+    using logits = draftHidden.value.linear(this.tensors.get("lm_head.weight")!);
+    const candidates = logits.topk(draft.cfg.selectorTopK, this.cfg.vocabSize);
+    using values = candidates.values;
+    using ids = candidates.indices;
+    using anchors = blockState.ws.alloc([blockState.batchSize], "I32");
+    anchors.memcpy2d(0, I32, blockState.input!, 0, draft.cfg.blockSize * I32,
+      I32, blockState.batchSize, MemcpyKind.DeviceToDevice);
+    const selected = draft.selectCandidates(draftHidden.value, ids, values, anchors);
+    return { draftHidden: draftHidden.detach(), ...selected };
   }
 
   override forwardModel(state: ExecutionState, layerHolders?: LayerHolders): Tensor {
@@ -1091,7 +1202,7 @@ export class Glm51Model extends ChatModel {
           }
         }
         using hidden = yield* self.forwardPhased(state, holders);
-        if (!self.mtp) {
+        if (!self.mtp || self.dflash) {
           return hidden.viewClone();
         }
 
@@ -1121,7 +1232,7 @@ export class Glm51Model extends ChatModel {
     inputIdsList: readonly number[][], chunkSize = 8192,
     samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() },
   ): ChunkedPrefillPlan {
-    if (!this.mtp) {
+    if (!this.mtp || this.dflash) {
       return super.planChunkedPrefill(ws, cache, inputIdsList, chunkSize, samplingPolicy);
     }
     const sequences = cache.getPagedKV().sequences;
@@ -1152,7 +1263,7 @@ export class Glm51Model extends ChatModel {
     inputIdsList: readonly number[][],
     samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() },
   ): ChunkedPrefillPlan {
-    if (!this.mtp || !inputIdsList.some(ids => ids.length)) {
+    if (!this.mtp || this.dflash || !inputIdsList.some(ids => ids.length)) {
       return super.planPrefillChunk(ws, cache, inputIdsList, samplingPolicy);
     }
     const input = inputIdsList;
@@ -1179,6 +1290,173 @@ export class Glm51Model extends ChatModel {
     })());
   }
 
+  /** Recondition a bounded draft window on entry, then draft and verify in one
+   * graph per step. The target cache remains the source of committed history.
+   * A shorter verification depth keeps the trained draft block intact and only
+   * verifies the selected path's prefix. Shortened multi-GPU verification is
+   * experimental and currently limited to batches of one or two. */
+  async *generateDflashDecode(
+    ws: ExecutionWorkspace, cache: ChatCache,
+    executionManager: ExecutionManager = new EagerExecution(),
+    samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() },
+    numDraftTokens = this.dflashDepth,
+  ): AsyncGenerator<MtpDecodeStepResult, void, void> {
+    const draft = this.dflash;
+    const targetCache = cache.getPagedKV();
+    const draftCache = targetCache instanceof Glm51Cache ? targetCache.dflash : undefined;
+    if (!draft || !draftCache) throw new Error("DFlash decode requires a GLM-owned draft cache");
+    const sequences = targetCache.sequences.slice();
+    const batchSize = sequences.length, blockSize = draft.cfg.blockSize, depth = numDraftTokens;
+    if (!Number.isInteger(depth) || depth < 1 || depth >= blockSize) throw new Error("DFlash verification depth must be between 1 and blockSize - 1");
+    // Larger shortened batches stalled at graph launch in validation. Reject
+    // this experimental combination before modifying sequence/cache state.
+    if (depth < blockSize - 1 && batchSize > 2 && this.ops.worldSize > 1) {
+      throw new Error("Short DFlash verification currently supports multi-GPU batches up to 2");
+    }
+    const verificationSize = depth + 1;
+    if (!batchSize || ws.maxSeqLen < batchSize * blockSize) throw new Error("DFlash decode workspace must fit batch * blockSize tokens");
+    const sampled = samplingPolicy.mtpEnabled === true;
+    if (sampled && (!samplingPolicy.prepareDraft || !samplingPolicy.prepareDeterministicVerification || !samplingPolicy.verify)) {
+      throw new Error("DFlash sampling requires deterministic-proposal verification support");
+    }
+    const nextTargets = await this.prepareDecodeInput(ws, cache, samplingPolicy);
+    const history = sequences.map(sequence => sequence.getTokenIds());
+    const window = draft.cfg.slidingWindow - 1;
+    const starts = history.map(tokens => Math.max(0, tokens.length - window));
+    const offsets = starts.slice();
+    let committedLens = sequences.map(sequence => sequence.allocLen);
+    let speculative = false;
+    const key = `glm51_dflash_${batchSize}_${depth}`;
+    const inputHost = ws.ensureAllocPinned([batchSize, verificationSize], "I32", `${key}_inputs`);
+    const selectedHost = ws.ensureAllocPinned([batchSize, verificationSize], "I32", `${key}_selected`);
+    const acceptedHost = sampled ? ws.ensureAllocPinned([batchSize], "I32", `${key}_accepted`) : undefined;
+    draftCache.reset(batchSize);
+    try {
+      // Replaying only the recent suffix uses the earlier target KV as its causal
+      // prefix. This also works for retained/shared prefixes and batch changes.
+      for (let b = 0; b < batchSize; b++) sequences[b].truncate(starts[b]);
+      committedLens = starts.slice();
+      const targetRows = targetCache.sequences, draftRows = draftCache.sequences;
+      try {
+        // Recondition one row at a time: bounded scratch, and no zero-query rows
+        // in the target's short-prefill sparse MLA path. No step is yielded here.
+        for (let b = 0; b < batchSize; b++) {
+          targetCache.sequences = [targetRows[b]];
+          draftCache.sequences = [draftRows[b]];
+          while (offsets[b] < history[b].length) {
+            ws.assertClear(); ws.clearTracking();
+            const chunk = history[b].slice(offsets[b], offsets[b] + ws.maxSeqLen);
+            speculative = true;
+            const target = ws.planPrefill(this, 1, [chunk.length], cache);
+            target.setInput([chunk]);
+            const context = ws.planPrefill(draft, 1, target.seqLens, draftCache, { positionIds: target.positionIds, kvOnly: true });
+            executionManager.execute({ states: [target, context], inputs: {}, key: [] }, () => {
+              using hidden = this.runPhased(this.forwardDflashContextPhased(target, context));
+            });
+            await this.ops.synchronizeAsync();
+            offsets[b] += chunk.length;
+            cache.reportTokens(0, chunk, offsets[b] < history[b].length ? history[b][offsets[b]] : nextTargets[b]);
+            committedLens[b] = sequences[b].allocLen;
+            speculative = false;
+          }
+        }
+      } finally {
+        targetCache.sequences = targetRows;
+        draftCache.sequences = draftRows;
+      }
+
+      while (true) {
+        ws.assertClear(); ws.clearTracking();
+        if (targetCache.sequences.length !== batchSize || sequences.some((sequence, b) =>
+          targetCache.sequences[b] !== sequence || sequence.allocLen !== committedLens[b])) {
+          throw new Error("DFlash decode batch changed; close and restart the generator");
+        }
+        for (const sequence of draftCache.sequences) {
+          sequence.discardPrefixPages(Math.max(0, Math.floor((sequence.allocLen - window) / draftCache.pageSize)));
+        }
+        const draftLens = draftCache.sequences.map(sequence => sequence.allocLen);
+        speculative = true;
+        const block = draft.planBlock(ws, draftCache);
+        block.setInput(nextTargets.map(token => [token, ...Array(blockSize - 1).fill(draft.cfg.maskTokenId)]));
+        block.positionIdsH.withPinnedBuffer(buf => committedLens.forEach((length, b) => {
+          for (let t = 0; t < blockSize; t++) buf.writeInt32LE(length + t, (b * blockSize + t) * I32);
+        }));
+        block.uploadPlan();
+        // The draft block and verification-derived context use the same slots.
+        // Keep physical pages attached while preparing both sets of metadata.
+        draftCache.sequences.forEach((sequence, b) => { sequence.allocLen = draftLens[b]; });
+        const verification = ws.planPrefill(this, batchSize, Array(batchSize).fill(verificationSize), cache);
+        verification.setInput(nextTargets.map(token => [token, ...Array(depth).fill(0)]));
+        const context = ws.planPrefill(draft, batchSize, verification.seqLens, draftCache,
+          { positionIds: verification.positionIds, kvOnly: true });
+        if (sampled) samplingPolicy.prepareDraft!(batchSize, depth);
+        const execution = executionManager.execute({ states: [block, verification, context], inputs: {},
+          key: ["glm51-dflash-decode", depth, samplingPolicy.captureKey ?? "greedy",
+            sampled ? samplingPolicy.mtpCaptureKey ?? "sampled" : "greedy"] }, () => {
+          const prediction = this.runPhased(this.forwardDflashBlockPhased(block));
+          using hidden = prediction.draftHidden; using scores = prediction.scores; using proposed = prediction.tokens;
+          using prefix = depth < blockSize - 1 ? ws.alloc([batchSize, depth], "I32") : undefined;
+          prefix?.memcpy2d(0, depth * I32, proposed, 0, (blockSize - 1) * I32,
+            depth * I32, batchSize, MemcpyKind.DeviceToDevice);
+          const verificationProposals = prefix ?? proposed;
+          verification.input!.memcpy2d(I32, verificationSize * I32, verificationProposals, 0, depth * I32,
+            depth * I32, batchSize, MemcpyKind.DeviceToDevice);
+          // Match MTP's alternate-stream readbacks and explicit joins. Main-stream
+          // readback nodes have stalled multi-device graph launches on this path.
+          using inputCopy = this.ops.withStream(() => {
+            using input = verification.input!.viewClone();
+            inputHost.memcpy(input, batchSize * verificationSize * I32, MemcpyKind.DeviceToHost);
+          });
+          if (sampled) samplingPolicy.prepareDeterministicVerification!(verificationProposals, batchSize);
+          using verifiedHidden = this.runPhased(this.forwardDflashContextPhased(verification, context));
+          using logits = verification.computeLogits(verifiedHidden, this, true);
+          const result = sampled ? samplingPolicy.verify!(logits) : { tokens: samplingPolicy.selectTarget(logits), numAccepted: undefined };
+          using tokens = new UsingHolder(result.tokens);
+          using counts = new UsingHolder<Tensor>(result.numAccepted!);
+          using outputCopy = this.ops.withStream(() => {
+            using selected = tokens.value.viewClone();
+            using accepted = counts.value?.viewClone();
+            selectedHost.memcpy(selected, batchSize * verificationSize * I32, MemcpyKind.DeviceToHost);
+            if (accepted) acceptedHost!.memcpy(accepted, batchSize * I32, MemcpyKind.DeviceToHost);
+          });
+          inputCopy.streamWaitEvent();
+          outputCopy.streamWaitEvent();
+          return { tokens: tokens.detach(), numAccepted: counts.detach() };
+        });
+        using selectedTokens = new UsingHolder(execution.result.tokens);
+        using acceptedCounts = new UsingHolder<Tensor>(execution.result.numAccepted!);
+        await this.ops.synchronizeAsync();
+        const input = inputHost.readPinnedBuffer(), selected = selectedHost.readPinnedBuffer();
+        const counts = acceptedHost?.readPinnedBuffer();
+        const tokens: number[][] = [], numAccepted: number[] = [];
+        for (let b = 0; b < batchSize; b++) {
+          const base = b * verificationSize;
+          let accepted = counts ? counts.readInt32LE(b * I32) : 0;
+          if (!counts) while (accepted < depth && input.readInt32LE((base + accepted + 1) * I32)
+            === selected.readInt32LE((base + accepted) * I32)) accepted++;
+          if (accepted < 0 || accepted > depth) throw new Error(`Invalid DFlash acceptance count ${accepted}`);
+          const committed = Array.from({ length: accepted + 1 }, (_, t) => input.readInt32LE((base + t) * I32));
+          const replacement = selected.readInt32LE((base + accepted) * I32);
+          sequences[b].truncate(committedLens[b] + accepted + 1);
+          draftCache.sequences[b].truncate(draftLens[b] + accepted + 1);
+          cache.reportTokens(b, committed, replacement);
+          nextTargets[b] = replacement;
+          tokens.push([...committed.slice(1), replacement]); numAccepted.push(accepted);
+        }
+        committedLens = sequences.map(sequence => sequence.allocLen);
+        speculative = false;
+        selectedTokens.release();
+        acceptedCounts.release();
+        ws.assertClear(); ws.clearTracking();
+        yield { tokens, numAccepted, numDraftTokens: depth, warmup: execution.warmup };
+      }
+    } finally {
+      await this.ops.synchronizeAsync();
+      if (speculative) sequences.forEach((sequence, b) => sequence.truncate(committedLens[b]));
+      draftCache.reset(0);
+    }
+  }
+
   /** Owns the draft/verification intermediates until the caller breaks the loop.
      * Prefill must have populated both target and shifted MTP KV. Batch changes
      * require closing this generator and starting a new one to recondition.
@@ -1190,6 +1468,7 @@ export class Glm51Model extends ChatModel {
     executionManager: ExecutionManager = new EagerExecution(),
     samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() },
   ): AsyncGenerator<MtpDecodeStepResult, void, void> {
+    if (this.dflash) throw new Error("Use generateDflashDecode when the DFlash drafter is enabled");
     const pagedKV = cache.getPagedKV();
     const sequences = pagedKV.sequences.slice();
     const batchSize = sequences.length;

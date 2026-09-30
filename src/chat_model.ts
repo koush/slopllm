@@ -93,6 +93,8 @@ export interface TokenSelector {
   prepareVerification?(draft: MtpDraftBatch): void;
   /** Capture-safe preparation for drafts generated on-device in the same graph. */
   prepareVerificationFromDevice?(draftTokens: Tensor, batchSize: number): void;
+  /** A greedy drafter proposes a point mass at each selected token. */
+  prepareDeterministicVerification?(draftTokens: Tensor, batchSize: number): void;
   verify?(logits: Tensor): { tokens: Tensor; numAccepted: Tensor };
 }
 
@@ -442,6 +444,8 @@ export abstract class ChatModel extends WorkspaceBase {
   }
 
   generateMtpDecode?(ws: ExecutionWorkspace, cache: ChatCache, numDraftTokens: number, executionManager?: ExecutionManager, samplingPolicy?: TokenSelector): AsyncGenerator<MtpDecodeStepResult, void, void>;
+  get dflashDepth(): number { return 0; }
+  generateDflashDecode?(ws: ExecutionWorkspace, cache: ChatCache, executionManager?: ExecutionManager, samplingPolicy?: TokenSelector, numDraftTokens?: number): AsyncGenerator<MtpDecodeStepResult, void, void>;
 
   createParser(_chatTemplateKwargs: ChatTemplateKwargs = {}): ChatModelParser {
     return new DefaultChatModelParser(this.tokenizer);
