@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <string.h>
 
@@ -47,6 +48,27 @@ __device__ __forceinline__ float2 fp4x2_to_float2(uint8_t packed) {
     return f;
 #endif
   }
+
+// FP4 E2M1 values are exactly representable in BF16. On SM120a+, unpack
+// directly into a BF16 pair without going through FP16 or FP32.
+__device__ __forceinline__ __nv_bfloat162 fp4x2_to_bfloat162(uint8_t packed) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+    uint32_t bits;
+    asm volatile(
+        "{\n"
+        ".reg .b8 fp4_byte;\n"
+        "mov.b32 {fp4_byte, _, _, _}, %1;\n"
+        "cvt.rn.bf16x2.e2m1x2 %0, fp4_byte;\n"
+        "}\n"
+        : "=r"(bits)
+        : "r"((uint32_t)packed));
+    __nv_bfloat162 pair;
+    memcpy(&pair, &bits, sizeof(pair));
+    return pair;
+#else
+    return __float22bfloat162_rn(fp4x2_to_float2(packed));
+#endif
+}
 
 // FP8 E4M3 → FP16 conversion via inline PTX, reading the HIGH output lane.
 //

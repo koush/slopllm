@@ -795,29 +795,21 @@ nvfp4_mul_mat_id_kernel(
             const uint4* input_v4 = reinterpret_cast<const uint4*>(input_row + k_start);
             uint4 xv0 = input_v4[0];
             uint4 xv1 = input_v4[1];
-            __nv_bfloat16 xb0[8], xb1[8];
-            uint4_to_bf16x8(xv0, xb0);
-            uint4_to_bf16x8(xv1, xb1);
+            const auto* x0 = reinterpret_cast<const __nv_bfloat162*>(&xv0);
+            const auto* x1 = reinterpret_cast<const __nv_bfloat162*>(&xv1);
 
             uint32_t w_lo = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2));
             uint32_t w_hi = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2) + 4);
 
-            float gsum = 0.0f;
+            // Two independent BF16 chains per group; combine and scale in FP32.
+            __nv_bfloat162 a0 = __float2bfloat162_rn(0.0f), a1 = a0;
             #pragma unroll
             for (int j = 0; j < 4; j++) {
-                uint8_t packed = (w_lo >> (j * 8)) & 0xFFu;
-                float2 w = fp4x2_to_float2(packed);
-                gsum += w.x * __bfloat162float(xb0[j * 2])
-                      + w.y * __bfloat162float(xb0[j * 2 + 1]);
+                a0 = __hfma2(fp4x2_to_bfloat162((w_lo >> (j * 8)) & 0xFFu), x0[j], a0);
+                a1 = __hfma2(fp4x2_to_bfloat162((w_hi >> (j * 8)) & 0xFFu), x1[j], a1);
             }
-            #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                uint8_t packed = (w_hi >> (j * 8)) & 0xFFu;
-                float2 w = fp4x2_to_float2(packed);
-                gsum += w.x * __bfloat162float(xb1[j * 2])
-                      + w.y * __bfloat162float(xb1[j * 2 + 1]);
-            }
-            sum += gsum * scale;
+            const float2 p0 = __bfloat1622float2(a0), p1 = __bfloat1622float2(a1);
+            sum = fmaf((p0.x + p0.y) + (p1.x + p1.y), scale, sum);
         }
       } else {
         // Expose independent group loads for the production gate/up shape.
@@ -831,29 +823,21 @@ nvfp4_mul_mat_id_kernel(
             const uint4* input_v4 = reinterpret_cast<const uint4*>(input_row + k_start);
             uint4 xv0 = input_v4[0];
             uint4 xv1 = input_v4[1];
-            __nv_bfloat16 xb0[8], xb1[8];
-            uint4_to_bf16x8(xv0, xb0);
-            uint4_to_bf16x8(xv1, xb1);
+            const auto* x0 = reinterpret_cast<const __nv_bfloat162*>(&xv0);
+            const auto* x1 = reinterpret_cast<const __nv_bfloat162*>(&xv1);
 
             uint32_t w_lo = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2));
             uint32_t w_hi = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2) + 4);
 
-            float gsum = 0.0f;
+            // Two independent BF16 chains per group; combine and scale in FP32.
+            __nv_bfloat162 a0 = __float2bfloat162_rn(0.0f), a1 = a0;
             #pragma unroll
             for (int j = 0; j < 4; j++) {
-                uint8_t packed = (w_lo >> (j * 8)) & 0xFFu;
-                float2 w = fp4x2_to_float2(packed);
-                gsum += w.x * __bfloat162float(xb0[j * 2])
-                      + w.y * __bfloat162float(xb0[j * 2 + 1]);
+                a0 = __hfma2(fp4x2_to_bfloat162((w_lo >> (j * 8)) & 0xFFu), x0[j], a0);
+                a1 = __hfma2(fp4x2_to_bfloat162((w_hi >> (j * 8)) & 0xFFu), x1[j], a1);
             }
-            #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                uint8_t packed = (w_hi >> (j * 8)) & 0xFFu;
-                float2 w = fp4x2_to_float2(packed);
-                gsum += w.x * __bfloat162float(xb1[j * 2])
-                      + w.y * __bfloat162float(xb1[j * 2 + 1]);
-            }
-            sum += gsum * scale;
+            const float2 p0 = __bfloat1622float2(a0), p1 = __bfloat1622float2(a1);
+            sum = fmaf((p0.x + p0.y) + (p1.x + p1.y), scale, sum);
         }
       }
     }
@@ -1262,22 +1246,17 @@ nvfp4_down_reduce_kernel(
                 const uint32_t w0 = *reinterpret_cast<const uint32_t*>(wr + g * 8);
                 const uint32_t w1 = *reinterpret_cast<const uint32_t*>(wr + g * 8 + 4);
                 const float scale = fp8_e4m3_to_float(scales[r * 8 * (K / NVFP4_QUANT_GROUP) + g]) * scale2;
-                float pa = 0.0f, pb = 0.0f;
+                // Packed BF16 math within each 16-element quantization group;
+                // retain FP32 accumulation across groups and the final reduction.
+                // Independent chains for the two packed words expose more ILP.
+                __nv_bfloat162 a0 = __float2bfloat162_rn(0.0f), a1 = a0;
                 #pragma unroll
                 for (int j = 0; j < 4; j++) {
-                    const float2 v = fp4x2_to_float2((w0 >> (j * 8)) & 0xff);
-                    const float2 xf = __bfloat1622float2(xpair[j]);
-                    pa = fmaf(v.x, xf.x, pa);
-                    pb = fmaf(v.y, xf.y, pb);
+                    a0 = __hfma2(fp4x2_to_bfloat162((w0 >> (j * 8)) & 0xff), xpair[j], a0);
+                    a1 = __hfma2(fp4x2_to_bfloat162((w1 >> (j * 8)) & 0xff), xpair[4 + j], a1);
                 }
-                #pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    const float2 v = fp4x2_to_float2((w1 >> (j * 8)) & 0xff);
-                    const float2 xf = __bfloat1622float2(xpair[4 + j]);
-                    pa = fmaf(v.x, xf.x, pa);
-                    pb = fmaf(v.y, xf.y, pb);
-                }
-                sum[r] = fmaf(pa + pb, scale, sum[r]);
+                const float2 p0 = __bfloat1622float2(a0), p1 = __bfloat1622float2(a1);
+                sum[r] = fmaf((p0.x + p0.y) + (p1.x + p1.y), scale, sum[r]);
             }
         }
         #pragma unroll
