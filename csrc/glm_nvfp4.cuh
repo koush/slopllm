@@ -49,6 +49,20 @@ __device__ __forceinline__ float2 fp4x2_to_float2(uint8_t packed) {
 #endif
   }
 
+// Native BF16 multiplicands with FP32 accumulation, without BF16 rounding
+// of the running sum. Older targets retain the equivalent FP32 FMA path.
+__device__ __forceinline__ float bf16_fma_f32(__nv_bfloat16 a, __nv_bfloat16 b, float c) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+    float result;
+    asm("fma.rn.f32.bf16 %0, %1, %2, %3;"
+        : "=f"(result)
+        : "h"(__bfloat16_as_ushort(a)), "h"(__bfloat16_as_ushort(b)), "f"(c));
+    return result;
+#else
+    return fmaf(__bfloat162float(a), __bfloat162float(b), c);
+#endif
+}
+
 // FP4 E2M1 values are exactly representable in BF16. On SM120a+, unpack
 // directly into a BF16 pair without going through FP16 or FP32.
 __device__ __forceinline__ __nv_bfloat162 fp4x2_to_bfloat162(uint8_t packed) {

@@ -801,17 +801,20 @@ nvfp4_mul_mat_id_kernel(
             uint32_t w_lo = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2));
             uint32_t w_hi = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2) + 4);
 
-            // Accumulate each quantization group in BF16, then scale in FP32.
-            __nv_bfloat162 accum = __float2bfloat162_rn(0.0f);
+            // Exact BF16 operands, FP32 accumulation and group scaling.
+            float2 pair = {0.0f, 0.0f};
             #pragma unroll
             for (int j = 0; j < 4; j++) {
-                accum = __hfma2(fp4x2_to_bfloat162((w_lo >> (j * 8)) & 0xFFu), x0[j], accum);
+                const auto weight = fp4x2_to_bfloat162((w_lo >> (j * 8)) & 0xFFu);
+                pair.x = bf16_fma_f32(weight.x, x0[j].x, pair.x);
+                pair.y = bf16_fma_f32(weight.y, x0[j].y, pair.y);
             }
             #pragma unroll
             for (int j = 0; j < 4; j++) {
-                accum = __hfma2(fp4x2_to_bfloat162((w_hi >> (j * 8)) & 0xFFu), x1[j], accum);
+                const auto weight = fp4x2_to_bfloat162((w_hi >> (j * 8)) & 0xFFu);
+                pair.x = bf16_fma_f32(weight.x, x1[j].x, pair.x);
+                pair.y = bf16_fma_f32(weight.y, x1[j].y, pair.y);
             }
-            const float2 pair = __bfloat1622float2(accum);
             sum = fmaf(pair.x + pair.y, scale, sum);
         }
       } else {
@@ -832,17 +835,20 @@ nvfp4_mul_mat_id_kernel(
             uint32_t w_lo = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2));
             uint32_t w_hi = *reinterpret_cast<const uint32_t*>(weight_row + g * (NVFP4_QUANT_GROUP / 2) + 4);
 
-            // Accumulate each quantization group in BF16, then scale in FP32.
-            __nv_bfloat162 accum = __float2bfloat162_rn(0.0f);
+            // Exact BF16 operands, FP32 accumulation and group scaling.
+            float2 pair = {0.0f, 0.0f};
             #pragma unroll
             for (int j = 0; j < 4; j++) {
-                accum = __hfma2(fp4x2_to_bfloat162((w_lo >> (j * 8)) & 0xFFu), x0[j], accum);
+                const auto weight = fp4x2_to_bfloat162((w_lo >> (j * 8)) & 0xFFu);
+                pair.x = bf16_fma_f32(weight.x, x0[j].x, pair.x);
+                pair.y = bf16_fma_f32(weight.y, x0[j].y, pair.y);
             }
             #pragma unroll
             for (int j = 0; j < 4; j++) {
-                accum = __hfma2(fp4x2_to_bfloat162((w_hi >> (j * 8)) & 0xFFu), x1[j], accum);
+                const auto weight = fp4x2_to_bfloat162((w_hi >> (j * 8)) & 0xFFu);
+                pair.x = bf16_fma_f32(weight.x, x1[j].x, pair.x);
+                pair.y = bf16_fma_f32(weight.y, x1[j].y, pair.y);
             }
-            const float2 pair = __bfloat1622float2(accum);
             sum = fmaf(pair.x + pair.y, scale, sum);
         }
       }
@@ -1253,18 +1259,20 @@ nvfp4_down_reduce_kernel(
                 const uint32_t w0 = *reinterpret_cast<const uint32_t*>(wr + g * 8);
                 const uint32_t w1 = *reinterpret_cast<const uint32_t*>(wr + g * 8 + 4);
                 const float scale = fp8_e4m3_to_float(scales[r * 8 * (K / NVFP4_QUANT_GROUP) + g]) * scale2;
-                // Packed BF16 math within each 16-element quantization group;
-                // retain FP32 accumulation across groups and the final reduction.
-                __nv_bfloat162 accum = __float2bfloat162_rn(0.0f);
+                // BF16 operands with FP32 accumulation within and across groups.
+                float2 pair = {0.0f, 0.0f};
                 #pragma unroll
                 for (int j = 0; j < 4; j++) {
-                    accum = __hfma2(fp4x2_to_bfloat162((w0 >> (j * 8)) & 0xff), xpair[j], accum);
+                    const auto weight = fp4x2_to_bfloat162((w0 >> (j * 8)) & 0xff);
+                    pair.x = bf16_fma_f32(weight.x, xpair[j].x, pair.x);
+                    pair.y = bf16_fma_f32(weight.y, xpair[j].y, pair.y);
                 }
                 #pragma unroll
                 for (int j = 0; j < 4; j++) {
-                    accum = __hfma2(fp4x2_to_bfloat162((w1 >> (j * 8)) & 0xff), xpair[4 + j], accum);
+                    const auto weight = fp4x2_to_bfloat162((w1 >> (j * 8)) & 0xff);
+                    pair.x = bf16_fma_f32(weight.x, xpair[4 + j].x, pair.x);
+                    pair.y = bf16_fma_f32(weight.y, xpair[4 + j].y, pair.y);
                 }
-                const float2 pair = __bfloat1622float2(accum);
                 sum = fmaf(pair.x + pair.y, scale, sum);
             }
             sum += __shfl_xor_sync(0xffffffff, sum, 2);
