@@ -17,6 +17,7 @@ import "./test_quantize_fp8";
 import "./test_no_graph";
 import "./test_graph";
 import "./test_cp_prefill";
+import "./test_cp_last_page";
 import "./test_cp_copy_prefix";
 import "./test_cat";
 import "./test_staging";

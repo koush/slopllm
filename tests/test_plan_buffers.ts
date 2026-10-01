@@ -86,7 +86,7 @@ for (const { parallel, mode } of [
         for (const [rank, tensor] of shards(second.lastPageLen).entries()) {
           const length = 65 + 2 * iteration;
           const local = Math.ceil((length - rank) / devices.length);
-          const expected = local % (64 / devices.length) || 64 / devices.length;
+          const expected = local - (Math.ceil(length / 64) - 1) * (64 / devices.length);
           assert.deepEqual(tensor.readInt32LEArray(), [expected, expected]);
         }
         for (const tensor of shards(second.globalLastPageLen)) assert.deepEqual(tensor.readInt32LEArray(), [1 + 2 * iteration, 1 + 2 * iteration]);

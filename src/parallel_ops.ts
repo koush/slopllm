@@ -3740,8 +3740,13 @@ export class ParallelOps implements DeviceOps {
       lastPageLenH.shards[r].withPinnedBuffer(buf => {
         for (let s = 0; s < batchSize; s++) {
           const localKvLen = this.cpLocalKvLen(seqKvLens[s], r);
-          const remainder = localKvLen % effectivePageSize;
-          buf.writeInt32LE(localKvLen > 0 ? (remainder !== 0 ? remainder : effectivePageSize) : 0, s * 4);
+          // Page indices are shared across CP ranks. A newly allocated logical
+          // page can contain no tokens on this rank, even when earlier physical
+          // pages are full. Modulo of localKvLen would incorrectly report a
+          // full last page in that case, making page gathers overrun their output.
+          const pages = Math.ceil(seqKvLens[s] / pageSize);
+          const lastPageLen = pages > 0 ? localKvLen - (pages - 1) * effectivePageSize : 0;
+          buf.writeInt32LE(lastPageLen, s * 4);
         }
       });
     }
