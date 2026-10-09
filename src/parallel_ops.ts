@@ -264,7 +264,8 @@ export class ParallelTensor extends Tensor {
     // An address handed out this iteration was last released after a prior P2P
     // barrier, so no peer can still be writing it.
     // Too big for the P2P group, or an uneven split, falls back to NCCL.
-    if (count > 65536 * 4)
+    // Include 64-token MTP verification at hidden size 6144 (c=16, depth=3).
+    if (count > 65536 * 8)
       return false;
     if (count % this.worldSize !== 0)
       return false;
@@ -2802,7 +2803,8 @@ export class ParallelOps implements DeviceOps {
     workspace: WorkspaceBase,
   ): ParallelTensor {
     const count = partialVOuts.shards[0].shape.reduce((a, b) => a * b, 1);
-    if (this.p2pEnabled && count <= 65536 * 16) {
+    // Include 64-token MTP verification with 64 heads and kvLoraRank=512.
+    if (this.p2pEnabled && count <= 65536 * 32) {
       return CP_MERGE_PULL
         ? this.cpMergeTreeReduce(partialVOuts.shards, partialLses.shards, batchSize, numHeads, vHeadDim, workspace)
         : this.cpMergePushReduce(partialVOuts.shards, partialLses.shards, batchSize, numHeads, vHeadDim, workspace);
