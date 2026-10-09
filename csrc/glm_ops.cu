@@ -345,8 +345,8 @@ void glm_rmsnorm(GlmCtx* ctx, void* out, const void* input,
 // residual[i] = input_a[i] + input_b[i]
 // ---------------------------------------------------------------------------
 
-template <int MaxPairs, bool EvenDim = true>
-__global__ void __launch_bounds__(1024) fused_add_rmsnorm_kernel(
+template <int MaxPairs, bool EvenDim = true, int MaxThreads = 1024>
+__global__ void __launch_bounds__(MaxThreads) fused_add_rmsnorm_kernel(
     __nv_bfloat16* __restrict__ out,
     __nv_bfloat16* __restrict__ residual,
     const __nv_bfloat16* __restrict__ input_a,
@@ -485,6 +485,17 @@ void glm_fused_add_rmsnorm(GlmCtx* ctx, void* out, void* residual,
     size_t shared_mem = (block_size / 32) * sizeof(float);
     int pairs = (dim + 2 * block_size - 1) / (2 * block_size);
     bool even = (dim & 1) == 0;
+
+    // GLM prefill uses 256 threads and caches 12 pairs per thread. Compiling
+    // that shape for 1024 threads caps registers at 64 and spills cached
+    // values. A matching launch bound avoids spills without reordering sums.
+    if (dim == 6144 && block_size == 256) {
+        launch_pdl(fused_add_rmsnorm_kernel<12, true, 256>, batch, block_size, shared_mem, GLM_STREAM(ctx),
+            (__nv_bfloat16*)out, (__nv_bfloat16*)residual,
+            (const __nv_bfloat16*)input_a, (const __nv_bfloat16*)input_b,
+            (const __nv_bfloat16*)weight, eps, dim);
+        return;
+    }
 
 #define DISPATCH_FUSED(P, EV) \
     launch_pdl(fused_add_rmsnorm_kernel<P, EV>, batch, block_size, shared_mem, GLM_STREAM(ctx), \

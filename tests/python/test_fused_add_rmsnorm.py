@@ -15,7 +15,10 @@ def torch_add_rmsnorm(input_a, input_b, weight, eps):
     return normed, residual
 
 
-@pytest.mark.parametrize("batch,dim", [(1, 64), (4, 128), (2, 1024), (8, 512), (1, 6144)])
+@pytest.mark.parametrize("batch,dim", [
+    (1, 64), (4, 128), (2, 1024), (8, 512), (1, 6144),
+    (63, 6144), (64, 6144), (256, 6144),
+])
 def test_fused_add_rmsnorm_random(glm, device, batch, dim):
     a = torch.randn(batch, dim, dtype=torch.bfloat16, device=device)
     b = torch.randn(batch, dim, dtype=torch.bfloat16, device=device)
