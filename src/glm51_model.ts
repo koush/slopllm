@@ -378,15 +378,11 @@ export class Glm51Model extends ChatModel {
       return false;
     }
 
-    // if total tokens is under some threshold, use the sparse gather.
-    if (state.totalTokens <= 32) {
-      // decode should only sparse gather.
+    // Short chunks are decode-shaped even when planned as prefill (e.g. MTP
+    // verification). Batching more sequences must not turn them into full-KV
+    // gathers or change the slot layout carried between verification and drafts.
+    if (state.seqLens.every(length => length <= 8)) {
       return sparseGather;
-    }
-
-    // prevent high batch decode from using the gather path
-    if (state.isDecode) {
-      return false;
     }
 
     // never sparse gather above the threshold

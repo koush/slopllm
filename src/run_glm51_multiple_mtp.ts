@@ -96,9 +96,11 @@ function parseArgs(argv: string[]): Args {
   if (args.instruction !== undefined && !args.file) {
     throw new Error("--instruction requires --file");
   }
-  const maxBatchSize = args.prompt || args.file ? 8 : PROMPTS.length;
-  if (!Number.isInteger(args.batchSize) || args.batchSize < 1 || args.batchSize > maxBatchSize) {
-    throw new Error(`--batch-size must be between 1 and ${maxBatchSize}`);
+  if (!Number.isSafeInteger(args.batchSize) || args.batchSize < 1) {
+    throw new Error(`Invalid --batch-size: ${args.batchSize}`);
+  }
+  if (!args.prompt && !args.file && args.batchSize > PROMPTS.length) {
+    throw new Error(`--batch-size above ${PROMPTS.length} requires --prompt or --file`);
   }
   if (!Number.isInteger(args.maxNewTokens) || args.maxNewTokens < 1) {
     throw new Error(`Invalid --max-new-tokens: ${args.maxNewTokens}`);
