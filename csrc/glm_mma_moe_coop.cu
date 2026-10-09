@@ -234,7 +234,10 @@ __device__ __forceinline__ void direct_dequant_b_regs(
 
 template <int TM, int TN, int DEPTH, int NWARPS, int MaxExperts, bool SPLIT_M,
           int TK = 32, bool DIRECT_DEQUANT = false>
-__global__ void __launch_bounds__(NWARPS * 32, 4)
+// The 128x128/four-warp tile needs 128 accumulator registers per thread.
+// Requiring four resident CTAs caps the whole thread at 128 registers, spilling
+// the accumulators. Two CTAs leave room for staging/dequantization registers.
+__global__ void __launch_bounds__(NWARPS * 32, (TM == 128 && TN == 128 && NWARPS == 4 ? 2 : 4))
 coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
                 __nv_bfloat16* __restrict__ output, int K,
                 const void* const* __restrict__ weight_ptrs,
@@ -662,9 +665,7 @@ static void launch_coop_configured(GlmCtx* ctx, int num_experts, int N,
                                    const int* sorted_to_original) {
     constexpr int MaxExperts = 256;
     const char* cfg_env = getenv("SLOPLLM_COOP_CONFIG");
-    const char* default_cfg = "tm64_tn128_d2_nw2";
-    if (N == 6144 && K == 256)
-        default_cfg = "tm64_tn128_d2_nw4";
+    const char* default_cfg = "tm128_tn128_d2_nw4";
     std::string cfg(cfg_env ? cfg_env : default_cfg);
 
     if (getenv("SLOPLLM_MOE_DIRECT_DEQUANT")) {
