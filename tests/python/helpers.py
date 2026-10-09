@@ -315,6 +315,7 @@ class GlmOps:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,  # global_last_page_len, kv_token_indptr, precomputed_ew
+            ctypes.c_int,  # flat_kv_rows (independent of score stride)
         ]
 
         self.lib.glm_cat_last_dim.restype = None
@@ -1218,6 +1219,7 @@ class GlmOps:
             self._ptr(global_last_page_len) if global_last_page_len is not None else ctypes.c_void_p(0),
             self._ptr(kv_token_indptr) if kv_token_indptr is not None else ctypes.c_void_p(0),
             self._ptr(precomputed_ew) if precomputed_ew is not None else ctypes.c_void_p(0),
+            k_data.numel() // head_dim,
         )
 
     def topk_to_slots(self, slots, topk_idx, page_indices, page_indptr,

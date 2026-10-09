@@ -491,8 +491,8 @@ static Napi::Value IndexerScore(const Napi::CallbackInfo& info) {
 
 static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 32) {
-        Napi::TypeError::New(env, "Expected 32 args").ThrowAsJavaScriptException();
+    if (info.Length() < 35) {
+        Napi::TypeError::New(env, "Expected 35 args").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -556,7 +556,8 @@ static Napi::Value IndexerScoreTopkPrefill(const Napi::CallbackInfo& info) {
         reinterpret_cast<int32_t*>(coarseHist_ptr),
         reinterpret_cast<int32_t*>(fineHist_ptr),
         reinterpret_cast<int32_t*>(meta_ptr),
-        queryTiles, cpWorldSize, cpRank, global_last_page_len, kv_token_indptr, precomputed_ew);
+        queryTiles, cpWorldSize, cpRank, global_last_page_len, kv_token_indptr, precomputed_ew,
+        info[34].As<Napi::Number>().Int32Value());
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("indexerScoreTopkPrefill failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();

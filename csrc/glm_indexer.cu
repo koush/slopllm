@@ -2756,7 +2756,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     int32_t* coarseHist, int32_t* fineHist, int32_t* meta,
     int queryTiles, int cpWorldSize, int cpRank,
     const int32_t* globalLastPageLen, const int32_t* kvTokenIndptr,
-    const float* precomputed_ew) {
+    const float* precomputed_ew, int flatKvRows) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
     const int effectiveCpWorldSize = kvTokenIndptr ? 0 : cpWorldSize;
@@ -2820,8 +2820,10 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
         const bool batchedQ = tmaRequested || (fp8Config
             && std::strcmp(fp8Config, "q32_k256_w8_h8") == 0);
         CUtensorMap kTensorMap{};
+        // maxKv bounds sequence-relative scores; TMA addresses the entire
+        // gathered K buffer using flatStart + tileStart.
         const bool useTma = tmaRequested && kvTokenIndptr
-            && make_indexer_k_tma_map(&kTensorMap, kData, maxKv);
+            && make_indexer_k_tma_map(&kTensorMap, kData, flatKvRows);
         if (useTma) {
             LAUNCH_INDEXER_PREFILL_FP8(32, 256, 8, 8, true, true);
         } else if (batchedQ) {

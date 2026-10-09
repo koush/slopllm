@@ -1566,25 +1566,10 @@ const srcOps = (copies[0].src as GlmTensor).ops;
         throw new Error(`indexerTopk: effectiveWeights provided but the FP8 MMA path requires idxNHeads=32 idxHeadDim=128 with SLOPLLM_INDEXER_DECODE_FP8_MMA!=0 (got ${idxNHeads}/${idxHeadDim})`);
       }
     }
-    const maxKvCapacity = kData.shape[0] * kData.shape[1];
     const useDirect = totalQ <= INDEXER_DIRECT_DISPATCH_MAX;
-    // Direct dispatch keeps storage capacity stable. Larger prefill uses
-    // length-bounded storage.
-    const maxKv = decode || useDirect
-      ? maxKvCapacity
-      : Math.min(maxKvCapacity, CaptureManager.capturing === undefined
-        ? state.getEagerKvLen()
-        : state.getGraphVariantPaddedKvLen());
-    // Under graph capture the split budget must not depend on paddedKvLen —
-    // that would re-key the graph per KV bucket. Pass the native auto
-    // sentinel (0): one resident wave derived from occupancy and totalQ,
-    // both stable across replays. Eager launches keep the KV-bucketed
-    // heuristic.
-    const numSplits = CaptureManager.capturing !== undefined ? 0 : this.indexerNumSplits(state);
-    const queryTiles = Math.ceil(totalQ / 64) + state.batchSize - 1;
     return useDirect
-      ? this.indexerScoreTopkV2(idxQ, kData, kScaleData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, numSplits, decode ? 0 : 1, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr, effectiveWeights)
-      : this.indexerScoreTopkPrefill(idxQ, kData, kScaleData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, maxKv, queryTiles, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr, effectiveWeights);
+      ? this.indexerScoreTopkV2(state, idxQ, kData, kScaleData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, decode ? 0 : 1, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr, effectiveWeights)
+      : this.indexerScoreTopkPrefill(state, idxQ, kData, kScaleData, weights, pageIndices, indptr, lastPageLen, qoIndptr, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, customMask, maskIndptr, maskKvLen, qGlobalStart, cpWorldSize, cpRank, globalLastPageLen, kvTokenIndptr, effectiveWeights);
   }
 
   // Sort each top-k row ascending by index (-1 padding last), in place.
@@ -1665,22 +1650,37 @@ const srcOps = (copies[0].src as GlmTensor).ops;
     };
   }
 
-  private indexerScoreTopkPrefill(q: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, maxKv: number, queryTiles: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart: number = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor } {
+  private indexerScoreTopkPrefill(state: ExecutionState, q: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart: number = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor } {
+    const kvCapacity = kData.shape[0] * kData.shape[1];
+    // Score columns are sequence-relative, unlike flat K addresses. For graphs,
+    // retain the existing keyed aggregate bucket as a conservative upper bound.
+    const globalKvBound = CaptureManager.capturing === undefined
+      ? state.seqKvLens.reduce((max, length) => Math.max(max, length), 0)
+      : state.getGraphVariantPaddedKvLen();
+    const localKvBound = !kvTokenIndptr && cpWorldSize > 1
+      ? Math.max(0, Math.ceil((globalKvBound - cpRank) / cpWorldSize))
+      : globalKvBound;
+    const scoreStride = Math.max(1, Math.min(kvCapacity, localKvBound));
     // sum(ceil(seqQ / 64)) <= ceil(totalQ / 64) + batchSize - 1. This is
     // exact for the single-sequence query-sharded path and stable for capture
     // because totalQ and batchSize are both part of the graph key.
+    const queryTiles = Math.ceil(totalQ / 64) + state.batchSize - 1;
     const indices = q.workspace.alloc([totalQ, topk], "I32");
     const values = q.workspace.alloc([totalQ, topk], "BF16");
-    using scores = q.workspace.alloc([totalQ, maxKv], "BF16");
+    using scores = q.workspace.alloc([totalQ, scoreStride], "BF16");
     using rowLen = q.workspace.alloc([totalQ], "I32");
     using coarseHist = q.workspace.alloc([totalQ, 1024], "I32");
     using fineHist = q.workspace.alloc([totalQ, 64], "I32");
     using meta = q.workspace.alloc([totalQ, 4], "I32");
-    getNativeAddon().indexerScoreTopkPrefill(this.ctx, indices.data, values.data, q.data, kData.data, kScaleData.data, weights?.data ?? 0, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, 1 /*causal*/, qGlobalStart, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, maxKv, coarseHist.data, fineHist.data, meta.data, queryTiles, cpWorldSize, cpRank, globalLastPageLen ? globalLastPageLen.data : 0, kvTokenIndptr?.data ?? 0, effectiveWeights?.data ?? 0);
+    getNativeAddon().indexerScoreTopkPrefill(this.ctx, indices.data, values.data, q.data, kData.data, kScaleData.data, weights?.data ?? 0, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, 1 /*causal*/, qGlobalStart, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, scoreStride, coarseHist.data, fineHist.data, meta.data, queryTiles, cpWorldSize, cpRank, globalLastPageLen ? globalLastPageLen.data : 0, kvTokenIndptr?.data ?? 0, effectiveWeights?.data ?? 0, kvCapacity);
     return { values, indices };
   }
 
-  private indexerScoreTopkV2(q: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, maxKv: number, numSplits: number, causal = 0, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor } {
+  private indexerScoreTopkV2(state: ExecutionState, q: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal = 0, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor } {
+    // Capacity-sized scratch keeps direct decode graphs length-invariant.
+    const maxKv = kData.shape[0] * kData.shape[1];
+    // Capture uses native occupancy-based splitting; eager uses the KV bucket.
+    const numSplits = CaptureManager.capturing !== undefined ? 0 : this.indexerNumSplits(state);
     const indices = q.workspace.alloc([totalQ, topk], "I32");
     const values = q.workspace.alloc([totalQ, topk], "BF16");
     using scores = q.workspace.alloc([totalQ, maxKv], "BF16");

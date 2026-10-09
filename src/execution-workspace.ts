@@ -74,6 +74,8 @@ export class ExecutionState {
   paddedKvLenInvariant = true;
   /** Length snapshot; launch decisions must use getGraphVariantPaddedKvLen() or DeviceOps.getCaptureKeys(). */
   readonly paddedKvLen: number;
+  /** Planned global KV lengths, before later plans can advance the live cache. */
+  readonly seqKvLens: readonly number[];
 
   // Per-state buffers (backed by persistent slot-suffixed allocations).
   // Each plan call gets a unique slot so that plan1+plan2+run1+run2 is safe:
@@ -123,7 +125,8 @@ export class ExecutionState {
       maskKvLen?: Tensor;
     },
   ) {
-    const totalKvLen = cache.getPagedKV().sequences.reduce((sum, s) => sum + s.allocLen, 0);
+    this.seqKvLens = cache.getPagedKV().sequences.map(sequence => sequence.allocLen);
+    const totalKvLen = this.seqKvLens.reduce((sum, length) => sum + length, 0);
     this.paddedKvLen = ExecutionState.getPaddedKvLen(totalKvLen);
 
     const s = (name: string) => `${name}:${slot}`;

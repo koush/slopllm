@@ -244,3 +244,25 @@ def test_flat_topk_matches_paged(glm, device, mode):
     assert torch.equal(flat[0], paged[0])
     assert torch.equal(flat[1], paged[1])
     assert torch.equal(flat[2], paged[2])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_flat_prefill_tma_compact_score_stride(glm, device, monkeypatch):
+    # Later sequences use absolute K offsets beyond the compact score stride.
+    # Keep the TMA extent wide while making each score row sequence-local.
+    monkeypatch.setenv("SLOPLLM_INDEXER_PREFILL_FP8_CONFIG", "q32_k256_w8_h8_tma")
+    seq_lens = [513, 769, 641]
+    n_heads, head_dim = 32, 128
+    caches = _make_caches(device, seq_lens, 64, head_dim, seed=123)
+    query_lens = [70, 83, 65]
+    total_q = sum(query_lens)
+    torch.manual_seed(456)
+    q = torch.randn(total_q, n_heads, head_dim, dtype=torch.bfloat16, device=device)
+    weights = torch.randn(total_q, n_heads, dtype=torch.bfloat16, device=device)
+    qo_indptr = torch.tensor([0, 70, 153, total_q], dtype=torch.int32, device=device)
+    args = (glm, "prefill", q, caches["flat"], caches["flat_scales"], weights,
+            caches, qo_indptr, 32)
+    wide = _run_topk(*args, sum(seq_lens), True, caches["kv_token_indptr"])
+    compact = _run_topk(*args, max(seq_lens), True, caches["kv_token_indptr"])
+    for actual, expected in zip(compact, wide):
+        assert torch.equal(actual, expected)

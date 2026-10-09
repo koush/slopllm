@@ -1,5 +1,6 @@
 import "./test_heap";
 import "./test_sparse_mla_planner";
+import "./test_indexer_sizing";
 import "./test_parallel";
 import "./test_all_gather_two";
 import "./test_parallel_mla";

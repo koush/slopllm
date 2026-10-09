@@ -108,7 +108,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     int32_t* coarseHist, int32_t* fineHist, int32_t* meta,
     int queryTiles, int cpWorldSize, int cpRank,
     const int32_t* globalLastPageLen, const int32_t* kvTokenIndptr,
-    const float* precomputed_ew);
+    const float* precomputed_ew, int flatKvRows);
 
 void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
     __nv_bfloat16* out_scores,
