@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include "glm_nvfp4.cuh"
 
 namespace cg = cooperative_groups;
 
@@ -3178,6 +3179,39 @@ __global__ void __launch_bounds__(256, 4) scatter_add_rows_batched_kernel(
     out[idx] = __float2bfloat16(accum);
 }
 
+// Four independent output channels per thread provide ILP without changing
+// the expert summation order. Keep FP32 accumulators; BF16 arithmetic would
+// round after every expert. The 2D grid also avoids per-thread row division.
+__global__ void __launch_bounds__(256, 4) scatter_add_rows_top8_vec4_kernel(
+    __nv_bfloat16* out,
+    const __nv_bfloat16* input,
+    const __nv_bfloat16* scales,
+    int dim) {
+    const int row = blockIdx.y;
+    const int d = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (d >= dim) return;
+    float accum[4] = {};
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        const __nv_bfloat16 scale = scales[row * 8 + j];
+        alignas(8) __nv_bfloat16 values[4];
+        *reinterpret_cast<uint2*>(values) =
+            *reinterpret_cast<const uint2*>(input + ((size_t)row * 8 + j) * dim + d);
+        #pragma unroll
+        for (int v = 0; v < 4; v++) {
+            accum[v] = bf16_fma_f32(scale, values[v], accum[v]);
+        }
+    }
+    alignas(8) __nv_bfloat16 values[4];
+    #pragma unroll
+    for (int v = 0; v < 4; v += 2) {
+        *reinterpret_cast<__nv_bfloat162*>(values + v) =
+            __floats2bfloat162_rn(accum[v], accum[v + 1]);
+    }
+    *reinterpret_cast<uint2*>(out + (size_t)row * dim + d) =
+        *reinterpret_cast<const uint2*>(values);
+}
+
 // ---------------------------------------------------------------------------
 // Rotate input IDs for MTP prefill
 // ---------------------------------------------------------------------------
@@ -3227,6 +3261,13 @@ void glm_scatter_add_rows(GlmCtx* ctx, void* out, const void* input,
         scatter_add_rows_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
             (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
             (const __nv_bfloat16*)scales, top_k, dim);
+    } else if (top_k == 8 && num_rows >= 128 && num_rows <= 65535 && dim % 4 == 0 &&
+               (reinterpret_cast<uintptr_t>(input) & 7) == 0 &&
+               (reinterpret_cast<uintptr_t>(out) & 7) == 0) {
+        dim3 grid((dim + block_size * 4 - 1) / (block_size * 4), num_rows);
+        scatter_add_rows_top8_vec4_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
+            (const __nv_bfloat16*)scales, dim);
     } else {
         int total = num_rows * dim;
         int grid = (total + block_size - 1) / block_size;

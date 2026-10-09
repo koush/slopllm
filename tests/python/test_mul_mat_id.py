@@ -319,6 +319,35 @@ class TestMulMatId:
         torch.testing.assert_close(output_bf16.cpu().float(), ref.cpu(), atol=2e-2, rtol=2e-2)
 
 class TestScatterAddRows:
+    @pytest.mark.parametrize("rows,dim,topk,input_offset,output_offset", [
+        (128, 6144, 8, 0, 0),
+        (129, 1028, 8, 0, 0),  # Partial final vectorized block.
+        (128, 1027, 8, 0, 0),  # Odd row stride uses the scalar path.
+        (128, 1028, 8, 1, 0),  # Unaligned input view.
+        (128, 1028, 8, 0, 1),  # Unaligned output view.
+        (127, 1028, 8, 0, 0),  # Below the prefill dispatch threshold.
+        (128, 1028, 4, 0, 0),
+    ])
+    def test_scatter_add_rows_prefill(self, glm, device, rows, dim, topk, input_offset, output_offset):
+        torch.manual_seed(42)
+        storage = torch.randn(rows * topk * dim + input_offset, dtype=torch.bfloat16, device=device)
+        inputs = storage[input_offset:].view(rows, topk, dim)
+        scales = torch.randn(rows, topk, dtype=torch.bfloat16, device=device)
+        output_storage = torch.full((rows * dim + output_offset,), 99, dtype=torch.bfloat16, device=device)
+        output = output_storage[output_offset:].view(rows, dim)
+
+        expected = torch.zeros(rows, dim, dtype=torch.float32, device=device)
+        for j in range(topk):
+            # A product of two finite BF16 values in this range is exact in
+            # FP32; sequential FP32 additions match the kernel's FMA order.
+            expected += inputs[:, j].float() * scales[:, j, None].float()
+        expected = expected.to(torch.bfloat16)
+        glm.scatter_add_rows(output.data_ptr(), inputs.data_ptr(), scales.data_ptr(), topk, dim, rows, 0)
+        glm.synchronize()
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        if output_offset:
+            assert output_storage[0].item() == 99
+
     def test_scatter_add_rows_basic(self, glm, device):
         rows_out = 2
         dim = 64
