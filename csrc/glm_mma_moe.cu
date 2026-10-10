@@ -47,9 +47,20 @@ __device__ __forceinline__ void load_frag_a_row(FragA& a, const __nv_bfloat16* s
         : "r"(addr));
 }
 
-template <int TN>
+template <int TN, bool IsNvFP4>
 __device__ __forceinline__ void load_frag_b(FragB& b, const __nv_bfloat16* smem_b, int b_stride, int col_offset) {
     int lane = threadIdx.x % 32;
+    if constexpr (!IsNvFP4) {
+        // BF16 weights are staged as [N, K], already the column-major B
+        // operand expected by MMA. Load its two K=8 panels without transpose.
+        int row = lane & 7;
+        int k_panel = (lane >> 3) & 1;
+        uint32_t addr = __cvta_generic_to_shared(smem_b + (col_offset + row) * TK + k_panel * 8);
+        asm volatile(
+            "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
+            : "=r"(b.reg[0]), "=r"(b.reg[1]) : "r"(addr));
+        return;
+    }
     int row = lane % 16;
     uint32_t addr = __cvta_generic_to_shared(smem_b + row * b_stride + col_offset);
     asm volatile(
@@ -277,7 +288,7 @@ grouped_mma_kernel(
                     for (int ni = 0; ni < MMA_PER_WARP_N; ni++) {
                         if (n_warp_valid > ni * MMA_N) {
                             FragB b_frag;
-                            load_frag_b<TN>(b_frag, smem_b, TN, warp_col_offset + ni * MMA_N);
+                            load_frag_b<TN, IsNvFP4>(b_frag, smem_b, TN, warp_col_offset + ni * MMA_N);
                             #pragma unroll
                             for (int mi = 0; mi < NUM_M_TILES; mi++) {
                                 mma_sync_bf16_f32(c[mi * MMA_PER_WARP_N + ni], a[mi], b_frag, c[mi * MMA_PER_WARP_N + ni]);
@@ -308,15 +319,14 @@ grouped_mma_kernel(
                     cp_async_ca_16(smem_a_buf0 + m * TK + 8, gmem_ptr + 8, pred);
                 }
 
-                for (int i = threadIdx.x; i < n_valid * TK; i += CTA_SIZE) {
-                    int k = i / n_valid;
-                    int n = i % n_valid;
+                // Keep each weight row contiguous: scalar loads across N
+                // stride by K and waste most of each global-memory sector.
+                for (int n = threadIdx.x; n < TN; n += CTA_SIZE) {
                     int global_n = n_start + n;
-                    __nv_bfloat16 val = __float2bfloat16(0.0f);
-                    if (global_n < N) {
-                        val = weight_base_bf16[(size_t)global_n * K + k_start + k];
-                    }
-                    smem_b[k * TN + n] = val;
+                    int pred = global_n < N;
+                    const __nv_bfloat16* src = weight_base_bf16 + (size_t)global_n * K + k_start;
+                    cp_async_ca_16(smem_b + n * TK, src, pred);
+                    cp_async_ca_16(smem_b + n * TK + 8, src + 8, pred);
                 }
 
                 cp_async_commit();
@@ -334,7 +344,7 @@ grouped_mma_kernel(
                     for (int ni = 0; ni < MMA_PER_WARP_N; ni++) {
                         if (n_warp_valid > ni * MMA_N) {
                             FragB b_frag;
-                            load_frag_b<TN>(b_frag, smem_b, TN, warp_col_offset + ni * MMA_N);
+                            load_frag_b<TN, IsNvFP4>(b_frag, smem_b, TN, warp_col_offset + ni * MMA_N);
                             #pragma unroll
                             for (int mi = 0; mi < NUM_M_TILES; mi++) {
                                 mma_sync_bf16_f32(c[mi * MMA_PER_WARP_N + ni], a[mi], b_frag, c[mi * MMA_PER_WARP_N + ni]);
