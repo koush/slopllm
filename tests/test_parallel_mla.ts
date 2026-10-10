@@ -267,9 +267,11 @@ describe("ParallelOps.applyRotaryPosEmb token-major", () => {
 
     const inputF32 = new Float32Array(totalRows * nHeads * inStride);
     for (let i = 0; i < inputF32.length; i++) inputF32[i] = (i % 19 - 9) * 0.1;
+    const inputBytes = f32ToBf16Bytes(inputF32);
+    const uploadedF32 = bf16BytesToF32(inputBytes);
 
     const pInput = ws.alloc([totalRows, nHeads * inStride], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
-    pInput.h2d(f32ToBf16Bytes(inputF32));
+    pInput.h2d(inputBytes);
     po.synchronize();
 
     // ropeDim=0 with inStride > headDim: the kernel runs as a pure gather.
@@ -285,9 +287,9 @@ describe("ParallelOps.applyRotaryPosEmb token-major", () => {
     for (let t = 0; t < totalRows; t++) {
       for (let h = 0; h < nHeads; h++) {
         for (let d = 0; d < headDim; d++) {
-          const expected = inputF32[t * nHeads * inStride + h * inStride + d];
+          const expected = uploadedF32[t * nHeads * inStride + h * inStride + d];
           const got = outF32[(t * nHeads + h) * headDim + d];
-          assert.ok(Math.abs(got - expected) < 1e-3, `t=${t} h=${h} d=${d}: expected ${expected}, got ${got}`);
+          assert.equal(got, expected, `t=${t} h=${h} d=${d}`);
         }
       }
     }
@@ -363,6 +365,61 @@ describe("ParallelOps.applyRotaryPosEmb", () => {
       }
     }
   });
+
+  for (const config of [
+    { name: "indexer prefill", batch: 1, seqLen: 64, layout: "flat", unsqueezeDim: 2, ropeDim: 64, inStride: 128 },
+    { name: "indexer decode", batch: 16, seqLen: 1, layout: "flat", unsqueezeDim: 2, ropeDim: 64, inStride: 128 },
+    { name: "tokens crossing batch boundaries", batch: 3, seqLen: 6, layout: "flat", unsqueezeDim: 2, ropeDim: 64, inStride: 128 },
+    { name: "3D token-major", batch: 3, seqLen: 6, layout: "token3d", unsqueezeDim: 2, ropeDim: 64, inStride: 128 },
+    { name: "4D token-major", batch: 4, seqLen: 3, layout: "token4d", unsqueezeDim: 2, ropeDim: 64, inStride: 128 },
+    { name: "4D head-major", batch: 4, seqLen: 3, layout: "head4d", unsqueezeDim: 1, ropeDim: 64, inStride: 128 },
+    { name: "strided input", batch: 1, seqLen: 16, layout: "flat", unsqueezeDim: 2, ropeDim: 64, inStride: 160 },
+    { name: "stride compaction without rotation", batch: 1, seqLen: 16, layout: "flat", unsqueezeDim: 2, ropeDim: 0, inStride: 160 },
+  ]) {
+    for (const interleaved of [false, true]) {
+      it(`Column-parallel RoPE preserves tokens: ${config.name}, interleaved=${interleaved}`, (t) => {
+        const { batch, seqLen, layout, unsqueezeDim, ropeDim, inStride } = config;
+        const nHeads = 32, headDim = 128, tokens = batch * seqLen;
+        const shape = layout === "head4d" ? [batch, nHeads, seqLen, headDim]
+          : layout === "token4d" ? [batch, seqLen, nHeads, headDim]
+          : layout === "token3d" ? [tokens, nHeads, headDim]
+          : [tokens, nHeads * inStride];
+        const inputBytes = f32ToBf16Bytes(Float32Array.from(
+          { length: tokens * nHeads * inStride }, (_, i) => ((i * 13) % 101 - 50) / 32,
+        ));
+        using input = ws.alloc(shape, "BF16", undefined, TensorParallelism.Column) as ParallelTensor;
+        using referenceInput = refWs.alloc(shape, "BF16");
+        input.h2d(inputBytes);
+        referenceInput.h2d(inputBytes);
+        using cos = ropeDim ? ws.alloc([batch, seqLen, ropeDim], "BF16") as ParallelTensor : undefined;
+        using sin = ropeDim ? ws.alloc([batch, seqLen, ropeDim], "BF16") as ParallelTensor : undefined;
+        using refCos = ropeDim ? refWs.alloc([batch, seqLen, ropeDim], "BF16") : undefined;
+        using refSin = ropeDim ? refWs.alloc([batch, seqLen, ropeDim], "BF16") : undefined;
+        if (ropeDim) {
+          // Distinct phases for every token catch incorrect per-rank position offsets.
+          const cosBytes = f32ToBf16Bytes(Float32Array.from({ length: tokens * ropeDim }, (_, i) => Math.cos(i / 37)));
+          const sinBytes = f32ToBf16Bytes(Float32Array.from({ length: tokens * ropeDim }, (_, i) => Math.sin(i / 37)));
+          cos!.h2d(cosBytes); refCos!.h2d(cosBytes);
+          sin!.h2d(sinBytes); refSin!.h2d(sinBytes);
+        }
+        t.mock.method(input, "allGather", () => { throw new Error("token-column RoPE must not gather"); });
+        using expected = referenceInput.applyRotaryPosEmb(refCos!, refSin!, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved, inStride);
+        using actual = input.applyRotaryPosEmb(cos!, sin!, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved, inStride) as ParallelTensor;
+        po.synchronize(); ref.synchronize();
+        assert.equal(actual.parallelism, TensorParallelism.Column);
+        assert.deepEqual(actual.shape, expected.shape);
+        const expectedBytes = Buffer.alloc(expected.bytes);
+        expected.d2h(expectedBytes);
+        for (let rank = 0; rank < po.worldSize; rank++) {
+          const shard = actual.shard(rank);
+          assert.deepEqual(shard.shape, [actual.shape[0] / po.worldSize, ...actual.shape.slice(1)]);
+          const actualBytes = Buffer.alloc(shard.bytes);
+          shard.d2h(actualBytes);
+          assert.deepEqual(actualBytes, expectedBytes.subarray(rank * shard.bytes, (rank + 1) * shard.bytes), `rank=${rank}`);
+        }
+      });
+    }
+  }
 
   it("Row-parallel applyRotaryPosEmb matches single-GPU", () => {
     const batch = 2;

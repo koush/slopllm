@@ -1961,7 +1961,7 @@ export class ParallelTensor extends Tensor {
 
   applyRotaryPosEmb(cos: Tensor, sin: Tensor, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, unsqueezeDim: number, interleaved?: boolean, inStride?: number): Tensor {
     super.applyRotaryPosEmb(cos, sin, ropeDim, headDim, nHeads, seqLen, batch, unsqueezeDim, interleaved, inStride);
-    if (this.parallelism === TensorParallelism.PartialSum || this.parallelism === TensorParallelism.Column) {
+    if (this.parallelism === TensorParallelism.PartialSum) {
       throw new Error(`applyRotaryPosEmb: unsupported input parallelism ${this.parallelism}`);
     }
     if (ropeDim === 0 && (inStride ?? headDim) === headDim) {
@@ -1980,14 +1980,30 @@ export class ParallelTensor extends Tensor {
     const shardNHeads = this.parallelism === TensorParallelism.Row
       ? this.parallelOps.shardDim(nHeads, "applyRotaryPosEmb nHeads")
       : nHeads;
+    const tokenColumn = this.parallelism === TensorParallelism.Column;
+    // Flattened token-major rows may split a sequence or cross batch boundaries.
+    // Head-major/4D inputs instead shard complete batches along their first axis.
+    const flatTokens = this.shape.length === 2 || (this.shape.length === 3 && this.shape[0] === batch * seqLen);
+    const splitTokens = tokenColumn && flatTokens && (unsqueezeDim === 2 || nHeads === 1 || seqLen === 1);
+    const shardBatch = tokenColumn
+      ? splitTokens ? 1 : this.parallelOps.shardDim(batch, "applyRotaryPosEmb batch")
+      : batch;
+    const shardSeqLen = splitTokens
+      ? this.parallelOps.shardDim(batch * seqLen, "applyRotaryPosEmb tokens")
+      : seqLen;
     const outShape = inStride !== undefined && inStride !== headDim
       ? [this.shape[0], nHeads, headDim]
       : this.shape;
     const outShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
-      const shardCos = ropeDim > 0 ? pCos.shards[i] : undefined!;
-      const shardSin = ropeDim > 0 ? pSin.shards[i] : undefined!;
-      outShards.push(this.shards[i].applyRotaryPosEmb(shardCos, shardSin, ropeDim, headDim, shardNHeads, seqLen, batch, unsqueezeDim, interleaved, inStride));
+      using flatCos = tokenColumn && ropeDim > 0 ? pCos.shards[i].reshape([batch * seqLen, ropeDim]) : undefined;
+      using flatSin = tokenColumn && ropeDim > 0 ? pSin.shards[i].reshape([batch * seqLen, ropeDim]) : undefined;
+      const localTokens = shardBatch * shardSeqLen;
+      using tokenCos = flatCos?.narrow(i * localTokens, localTokens);
+      using tokenSin = flatSin?.narrow(i * localTokens, localTokens);
+      const shardCos = ropeDim > 0 ? tokenCos ?? pCos.shards[i] : undefined!;
+      const shardSin = ropeDim > 0 ? tokenSin ?? pSin.shards[i] : undefined!;
+      outShards.push(this.shards[i].applyRotaryPosEmb(shardCos, shardSin, ropeDim, headDim, shardNHeads, shardSeqLen, shardBatch, unsqueezeDim, interleaved, inStride));
     }
     return this.parallelOps.wrapShards(this.workspace, outShards, outShape, this.type, this.parallelism);
   }
