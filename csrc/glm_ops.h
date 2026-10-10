@@ -1073,6 +1073,18 @@ void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output,
                                             int num_experts, void* workspace);
 
 // Split MoE coop: scatter once, then optionally keep GEMM outputs expert-sorted.
+size_t glm_moe_hybrid_workspace_size(int count, int N);
+void glm_moe_hybrid_mma_reduce(GlmCtx* ctx, void* output, int count, int N, int K, const void* workspace);
+void glm_moe_hybrid_prepare(GlmCtx* ctx, const int* expert_ids, int count,
+                            int num_experts, int min_rows, void* workspace);
+void glm_moe_hybrid_cuda(GlmCtx* ctx, void* output, const void* input,
+                         const void* const* weight_ptrs, const void* const* scale_ptrs,
+                         const void* const* scale2_ptrs, const int* expert_ids,
+                         int top_k, int count, int N, int K, const void* workspace);
+void glm_moe_hybrid_mma(GlmCtx* ctx, void* output, const void* input,
+                        const void* const* weight_ptrs, const void* const* scale_ptrs,
+                        const void* const* scale2_ptrs, const int* expert_ids,
+                        int top_k, int count, int N, int K, const void* workspace);
 size_t glm_mma_moe_coop_scatter_workspace_size(int count, int K, int num_experts);
 size_t glm_mma_moe_coop_gemm_workspace_size(int count, int N);
 void glm_mma_moe_coop_scatter(GlmCtx* ctx, const void* input, const int* expert_ids,

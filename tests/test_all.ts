@@ -33,3 +33,4 @@ import "./test_incremental_decoder";
 import "./test_cuda_ipc";
 import "./test_mtp_sampling";
 import "./test_moe_down_reduce";
+import "./test_moe_hybrid";

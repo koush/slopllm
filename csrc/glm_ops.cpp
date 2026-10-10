@@ -1542,6 +1542,97 @@ static Napi::Value Nvfp4MulMatIdGroupedMmaCoop(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value MoeHybridWorkspaceSize(const Napi::CallbackInfo& info) {
+    if (info.Length() < 2) {
+        Napi::TypeError::New(info.Env(), "Expected (count, N)").ThrowAsJavaScriptException();
+        return info.Env().Undefined();
+    }
+    const int count = info[0].As<Napi::Number>().Int32Value();
+    const int N = info[1].As<Napi::Number>().Int32Value();
+    if (count < 1 || count > 512 || N < 1) {
+        Napi::RangeError::New(info.Env(), "Invalid hybrid workspace dimensions").ThrowAsJavaScriptException();
+        return info.Env().Undefined();
+    }
+    return Napi::Number::New(info.Env(), glm_moe_hybrid_workspace_size(count, N));
+}
+
+static Napi::Value MoeHybridMmaReduce(const Napi::CallbackInfo& info) {
+    const auto env = info.Env();
+    if (info.Length() < 6) {
+        Napi::TypeError::New(env, "Expected (ctx, output, count, N, K, workspace)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    const int count = info[2].As<Napi::Number>().Int32Value();
+    const int N = info[3].As<Napi::Number>().Int32Value();
+    const int K = info[4].As<Napi::Number>().Int32Value();
+    if (count < 1 || count > 512 || N < 1 || K < 128 || K % 128 != 0) {
+        Napi::RangeError::New(env, "Invalid hybrid reduction dimensions").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    glm_moe_hybrid_mma_reduce(reinterpret_cast<GlmCtx*>(info[0].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<void*>(info[1].As<Napi::Number>().Int64Value()), count, N, K,
+        reinterpret_cast<const void*>(info[5].As<Napi::Number>().Int64Value()));
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("moeHybridMmaReduce failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value MoeHybridPrepare(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 6) {
+        Napi::TypeError::New(env, "Expected (ctx, expertIds, count, numExperts, minRows, workspace)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    const int count = info[2].As<Napi::Number>().Int32Value();
+    const int experts = info[3].As<Napi::Number>().Int32Value();
+    const int min_rows = info[4].As<Napi::Number>().Int32Value();
+    if (count < 1 || count > 512 || experts < 1 || experts > 256 || min_rows < 1) {
+        Napi::RangeError::New(env, "Hybrid MoE requires 1..512 routes, 1..256 experts, and minRows >= 1").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    glm_moe_hybrid_prepare(reinterpret_cast<GlmCtx*>(info[0].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const int*>(info[1].As<Napi::Number>().Int64Value()), count, experts, min_rows,
+        reinterpret_cast<void*>(info[5].As<Napi::Number>().Int64Value()));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("moeHybridPrepare failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+template <bool Mma>
+static Napi::Value MoeHybridCompute(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 12) {
+        Napi::TypeError::New(env, "Expected (ctx, output, input, weightPtrs, scalePtrs, scale2Ptrs, expertIds, topK, count, N, K, workspace)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    const int top_k = info[7].As<Napi::Number>().Int32Value();
+    const int count = info[8].As<Napi::Number>().Int32Value();
+    const int N = info[9].As<Napi::Number>().Int32Value();
+    const int K = info[10].As<Napi::Number>().Int32Value();
+    if (count < 1 || count > 512 || top_k < 1 || count % top_k != 0 || N < 1 || K < 128 || K % 128 != 0) {
+        Napi::RangeError::New(env, "Invalid hybrid MoE dimensions (K must be a positive multiple of 128)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    auto fn = Mma ? glm_moe_hybrid_mma : glm_moe_hybrid_cuda;
+    fn(reinterpret_cast<GlmCtx*>(info[0].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<void*>(info[1].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void*>(info[2].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void* const*>(info[3].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void* const*>(info[4].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const void* const*>(info[5].As<Napi::Number>().Int64Value()),
+        reinterpret_cast<const int*>(info[6].As<Napi::Number>().Int64Value()),
+        top_k, count, N, K, reinterpret_cast<const void*>(info[11].As<Napi::Number>().Int64Value()));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("moeHybridCompute failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value MmaMoeCoopScatterWorkspaceSize(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 3) {
@@ -4151,6 +4242,11 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "mmaMoeWorkspaceSize"), Napi::Function::New(env, MmaMoeWorkspaceSize));
     exports.Set(Napi::String::New(env, "nvfp4MulMatIdGroupedMmaCoop"), Napi::Function::New(env, Nvfp4MulMatIdGroupedMmaCoop));
     exports.Set(Napi::String::New(env, "mmaMoeCoopWorkspaceSize"), Napi::Function::New(env, MmaMoeCoopWorkspaceSize));
+    exports.Set("moeHybridWorkspaceSize", Napi::Function::New(env, MoeHybridWorkspaceSize));
+    exports.Set("moeHybridMmaReduce", Napi::Function::New(env, MoeHybridMmaReduce));
+    exports.Set("moeHybridPrepare", Napi::Function::New(env, MoeHybridPrepare));
+    exports.Set("moeHybridCuda", Napi::Function::New(env, MoeHybridCompute<false>));
+    exports.Set("moeHybridMma", Napi::Function::New(env, MoeHybridCompute<true>));
     exports.Set(Napi::String::New(env, "mmaMoeCoopScatterWorkspaceSize"), Napi::Function::New(env, MmaMoeCoopScatterWorkspaceSize));
     exports.Set(Napi::String::New(env, "mmaMoeCoopGemmWorkspaceSize"), Napi::Function::New(env, MmaMoeCoopGemmWorkspaceSize));
     exports.Set(Napi::String::New(env, "mmaMoeCoopScatter"), Napi::Function::New(env, MmaMoeCoopScatter));

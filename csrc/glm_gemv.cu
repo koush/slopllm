@@ -1,4 +1,5 @@
 #include "glm_ops.h"
+#include "glm_moe_hybrid.cuh"
 #include "glm_nvfp4.cuh"
 
 #include <cublas_v2.h>
@@ -733,7 +734,7 @@ nvfp4_dequantize_gemm_smem_kernel(
 // Each block covers GEMV_ROWS_PER_BLOCK * RowsPerWarp rows.
 // ---------------------------------------------------------------------------
 
-template <int RowsPerWarp, bool Fixed6144 = false>
+template <int RowsPerWarp, bool Fixed6144 = false, bool Hybrid = false>
 __global__ void __launch_bounds__(GEMV_BLOCK_SIZE, 4)
 nvfp4_mul_mat_id_kernel(
     __nv_bfloat16* __restrict__ output,
@@ -742,7 +743,7 @@ nvfp4_mul_mat_id_kernel(
     const __nv_fp8_e4m3* const* __restrict__ scale_ptrs,
     const float* const* __restrict__ scale2_ptrs,
     const int* __restrict__ expert_ids,
-    int top_k, int count, int N, int K) {
+    int top_k, int count, int N, int K, const MoeHybridPlan* plan = nullptr) {
 
     constexpr int LANES_PER_ROW = GEMV_WARP_SIZE / RowsPerWarp;
     constexpr int ROWS_PER_BLOCK = GEMV_ROWS_PER_BLOCK * RowsPerWarp;
@@ -753,7 +754,21 @@ nvfp4_mul_mat_id_kernel(
     int warp_id = threadIdx.x / GEMV_WARP_SIZE;
     int lane = threadIdx.x % GEMV_WARP_SIZE;
 
-    if (entry >= count) return;
+    if constexpr (Hybrid) {
+        if (entry >= count) {
+            return;
+        }
+        // No CUDA route queue: every expert is owned entirely by one worker.
+        const int expert = expert_ids[entry];
+        if (plan->offsets[expert + 1] - plan->offsets[expert] >= plan->min_rows) {
+            return;
+        }
+    }
+    else {
+        if (entry >= count) {
+            return;
+        }
+    }
 
     int row_in_warp = lane / LANES_PER_ROW;
     int inner_lane = lane % LANES_PER_ROW;
@@ -1419,6 +1434,29 @@ void glm_nvfp4_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input
             reinterpret_cast<const uint8_t*>(fp4_weight),
             scale_ptr, weight_scale_2, m, n, k);
     }
+}
+
+void glm_moe_hybrid_cuda(GlmCtx* ctx, void* output, const void* input,
+                         const void* const* weight_ptrs, const void* const* scale_ptrs,
+                         const void* const* scale2_ptrs, const int* expert_ids,
+                         int top_k, int count, int N, int K, const void* workspace) {
+    cudaSetDevice(ctx->device_id);
+    const int grid = count * ((N + GEMV_ROWS_PER_BLOCK * 2 - 1) / (GEMV_ROWS_PER_BLOCK * 2));
+    if (K == 6144) {
+        nvfp4_mul_mat_id_kernel<2, true, true><<<grid, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+            static_cast<__nv_bfloat16*>(output), static_cast<const __nv_bfloat16*>(input),
+            reinterpret_cast<const uint8_t* const*>(weight_ptrs),
+            reinterpret_cast<const __nv_fp8_e4m3* const*>(scale_ptrs),
+            reinterpret_cast<const float* const*>(scale2_ptrs), expert_ids, top_k, count, N, K,
+            static_cast<const MoeHybridPlan*>(workspace));
+        return;
+    }
+    nvfp4_mul_mat_id_kernel<2, false, true><<<grid, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+        static_cast<__nv_bfloat16*>(output), static_cast<const __nv_bfloat16*>(input),
+        reinterpret_cast<const uint8_t* const*>(weight_ptrs),
+        reinterpret_cast<const __nv_fp8_e4m3* const*>(scale_ptrs),
+        reinterpret_cast<const float* const*>(scale2_ptrs), expert_ids, top_k, count, N, K,
+        static_cast<const MoeHybridPlan*>(workspace));
 }
 
 void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,

@@ -21,17 +21,110 @@
 
 #include "glm_ops.h"
 #include "glm_nvfp4.cuh"
+#include "glm_moe_hybrid.cuh"
 
 #include <cuda/ptx>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <algorithm>
 #include <string>
 
 namespace ptx = cuda::ptx;
 
 namespace {
+
+// One thread per expert scans bucket, CUDA, and MMA counts together; route
+// scatter stays in shared memory until a coalesced write publishes the plan.
+// The kernel boundary publishes metadata to both compute streams. CUDA uses
+// expert-level ownership directly, so only MMA needs a work queue.
+__global__ void hybrid_prepare_kernel(const int* ids, int count, int num_experts,
+                                      int min_rows, MoeHybridPlan* plan) {
+    __shared__ int counts[256];
+    __shared__ int cursors[256];
+    __shared__ int sorted[MOE_HYBRID_MAX_ROUTES];
+    __shared__ int3 warp_totals[8];
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int warp = tid / 32;
+    counts[tid] = 0;
+    __syncthreads();
+    int experts[2] = {};
+    #pragma unroll
+    for (int item = 0; item < 2; ++item) {
+        const int route = tid + item * 256;
+        if (route < count) {
+            experts[item] = ids[route];
+            atomicAdd(&counts[experts[item]], 1);
+        }
+    }
+    __syncthreads();
+    const int rows = counts[tid];
+    const int cuda_rows = rows < min_rows ? rows : 0;
+    const int tiles = rows >= min_rows ? (rows + MOE_HYBRID_TILE_ROWS - 1) / MOE_HYBRID_TILE_ROWS : 0;
+    int3 sum = make_int3(rows, cuda_rows, tiles);
+    #pragma unroll
+    for (int delta = 1; delta < 32; delta *= 2) {
+        const int x = __shfl_up_sync(0xffffffff, sum.x, delta);
+        const int y = __shfl_up_sync(0xffffffff, sum.y, delta);
+        const int z = __shfl_up_sync(0xffffffff, sum.z, delta);
+        if (lane >= delta) {
+            sum.x += x;
+            sum.y += y;
+            sum.z += z;
+        }
+    }
+    if (lane == 31) {
+        warp_totals[warp] = sum;
+    }
+    __syncthreads();
+    for (int w = 0; w < warp; ++w) {
+        sum.x += warp_totals[w].x;
+        sum.y += warp_totals[w].y;
+        sum.z += warp_totals[w].z;
+    }
+    const int row_base = sum.x - rows;
+    const int mma_base = sum.z - tiles;
+    cursors[tid] = row_base;
+    if (tid < num_experts) {
+        plan->offsets[tid] = row_base;
+    }
+    if (tid == 255) {
+        plan->offsets[num_experts] = sum.x;
+        plan->cuda_count = sum.y;
+        plan->mma_count = sum.z;
+        plan->min_rows = min_rows;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int item = 0; item < 2; ++item) {
+        const int route = tid + item * 256;
+        if (route < count) {
+            const int pos = atomicAdd(&cursors[experts[item]], 1);
+            sorted[pos] = route;
+        }
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int item = 0; item < 2; ++item) {
+        const int route = tid + item * 256;
+        if (route < count) {
+            plan->routes[route] = sorted[route];
+        }
+    }
+    for (int tile = 0; tile < tiles; ++tile) {
+        plan->mma_tasks[mma_base + tile] = make_int2(tid, tile);
+    }
+}
+
+__device__ __forceinline__ int2 hybrid_tile_rows(const MoeHybridPlan* plan, int expert, int tile) {
+    const int rows = plan->offsets[expert + 1] - plan->offsets[expert];
+    const int tiles = (rows + MOE_HYBRID_TILE_ROWS - 1) / MOE_HYBRID_TILE_ROWS;
+    const int base = rows / tiles;
+    const int extra = rows % tiles;
+    return make_int2(tile * base + min(tile, extra), base + (tile < extra));
+}
 
 constexpr int QUANT_GROUP = 16;
 constexpr int SCALE_BATCH = 32;
@@ -232,8 +325,21 @@ __device__ __forceinline__ void direct_dequant_b_regs(
     asm("mul.rn.bf16x2 %0,%1,%2;" : "=r"(b_reg_1) : "r"(b_reg_1), "r"(s2_pair));
 }
 
+template <int SPLIT_K>
+__device__ __forceinline__ void store_coop_output(__nv_bfloat16* output, float* partial,
+                                                 int count, int N, int row, int col, float value) {
+    if (row >= 0 && col < N) {
+        if constexpr (SPLIT_K > 1) {
+            partial[((size_t)blockIdx.y * count + row) * N + col] = value;
+        }
+        else {
+            output[(size_t)row * N + col] = __float2bfloat16(value);
+        }
+    }
+}
+
 template <int TM, int TN, int DEPTH, int NWARPS, int MaxExperts, bool SPLIT_M,
-          int TK = 32, bool DIRECT_DEQUANT = false>
+          int TK = 32, bool DIRECT_DEQUANT = false, bool HYBRID = false, int SPLIT_K = 1>
 // The 128x128/four-warp tile needs 128 accumulator registers per thread.
 // Requiring four resident CTAs caps the whole thread at 128 registers, spilling
 // the accumulators. Two CTAs leave room for staging/dequantization registers.
@@ -245,7 +351,14 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
                 const void* const* __restrict__ scale2_ptrs,
                 const int* __restrict__ expert_offsets, int num_experts, int N,
                 int* __restrict__ tile_counter,
-                const int* __restrict__ sorted_to_original) {
+                const int* __restrict__ sorted_to_original,
+                const MoeHybridPlan* plan = nullptr, int top_k = 1,
+                float* partial = nullptr, int count = 0) {
+    if constexpr (HYBRID) {
+        if (blockIdx.x >= plan->mma_count * ((N + TN - 1) / TN)) {
+            return;
+        }
+    }
     constexpr int CTA_THREADS = NWARPS * 32;
     constexpr int KGPS = TK / QUANT_GROUP;
     constexpr int TOTAL_N_GROUPS = TN / 8;
@@ -269,7 +382,12 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
     int warp = tid / 32;
     int t0 = lane % 4, t1 = lane / 4;
     int num_n_tiles = (N + TN - 1) / TN;
-    int num_k_groups = K / QUANT_GROUP;
+    const int scale_stride = K / QUANT_GROUP;
+    // Split only at 512-element scale-batch boundaries. Unequal partitions
+    // (e.g. K=6144, split=8) still cover K exactly with no overlapping reads.
+    const int k_group_begin = SPLIT_K > 1 ? (blockIdx.y * (K / 512) / SPLIT_K) * SCALE_BATCH : 0;
+    const int k_group_end = SPLIT_K > 1 ? ((blockIdx.y + 1) * (K / 512) / SPLIT_K) * SCALE_BATCH : scale_stride;
+    int num_k_groups = k_group_end - k_group_begin;
     int num_k_steps = num_k_groups / KGPS;
 
     int my_n_start_local;
@@ -283,7 +401,7 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
     }
 
     // Compute tile_prefix once (warp 0), then sync.
-    if (warp == 0 && lane == 0) {
+    if (!HYBRID && warp == 0 && lane == 0) {
         int cumulative = 0;
         smem->tile_prefix[0] = 0;
         for (int e = 0; e < num_experts; e++) {
@@ -293,7 +411,7 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
         }
     }
     __syncthreads();
-    int total_tiles = smem->tile_prefix[num_experts];
+    int total_tiles = HYBRID ? plan->mma_count * num_n_tiles : smem->tile_prefix[num_experts];
 
     // Per-warp MMA accumulators (persist across the K-loop of a tile).
     float frag_c_accum[ACC_SIZE] = {0};
@@ -305,30 +423,57 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
 
     for (;;) {
         // Grab a tile cooperatively.
-        if (tid == 0) smem->work_idx = atomicAdd(tile_counter, 1);
-        __syncthreads();
-        int work_idx = smem->work_idx;
-        if (work_idx >= total_tiles) break;
+        int work_idx;
+        if constexpr (HYBRID) {
+            work_idx = blockIdx.x;
+        }
+        else {
+            if (tid == 0) {
+                smem->work_idx = atomicAdd(tile_counter, 1);
+            }
+            __syncthreads();
+            work_idx = smem->work_idx;
+        }
+        if (work_idx >= total_tiles) {
+            break;
+        }
 
         // Decode (all threads identical).
-        int lo = 0, hi = num_experts;
-        while (lo < hi) {
-            int mid = (lo + hi) >> 1;
-            if (smem->tile_prefix[mid + 1] <= work_idx) lo = mid + 1;
-            else hi = mid;
+        int expert_id, m_start, n_tile;
+        if constexpr (HYBRID) {
+            const int2 task = plan->mma_tasks[work_idx / num_n_tiles];
+            expert_id = task.x;
+            m_start = task.y * TM;
+            n_tile = work_idx % num_n_tiles;
         }
-        int expert_id = lo;
-        int local_idx = work_idx - smem->tile_prefix[expert_id];
-        int m_tile = local_idx / num_n_tiles;
-        int n_tile = local_idx % num_n_tiles;
+        else {
+            int lo = 0, hi = num_experts;
+            while (lo < hi) {
+                int mid = (lo + hi) >> 1;
+                if (smem->tile_prefix[mid + 1] <= work_idx) {
+                    lo = mid + 1;
+                }
+                else {
+                    hi = mid;
+                }
+            }
+            expert_id = lo;
+            int local_idx = work_idx - smem->tile_prefix[expert_id];
+            m_start = (local_idx / num_n_tiles) * TM;
+            n_tile = local_idx % num_n_tiles;
+        }
         int Me = expert_offsets[expert_id + 1] - expert_offsets[expert_id];
-        int m_start = m_tile * TM;
         int m_valid = min(TM, Me - m_start);
+        if constexpr (HYBRID) {
+            const int2 range = hybrid_tile_rows(plan, expert_id, m_start / TM);
+            m_start = range.x;
+            m_valid = range.y;
+        }
         int n_start = n_tile * TN;
         int n_valid = min(TN, N - n_start);
         if (m_valid <= 0 || n_valid <= 0) continue;
 
-        const __nv_bfloat16* expert_input = sorted_input + (size_t)expert_offsets[expert_id] * K;
+        const __nv_bfloat16* expert_input = HYBRID ? sorted_input : sorted_input + (size_t)expert_offsets[expert_id] * K;
         const uint8_t* wbase = reinterpret_cast<const uint8_t* const*>(weight_ptrs)[expert_id];
         const __nv_fp8_e4m3* scale_base = reinterpret_cast<const __nv_fp8_e4m3* const*>(scale_ptrs)[expert_id];
         float scale_2_val = *reinterpret_cast<const float* const*>(scale2_ptrs)[expert_id];
@@ -348,7 +493,7 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
             for (int ks = 0; ks < k_steps_in_batch; ks++) {
                 int buf = stage % DEPTH;
                 int k_group_idx = k_group_batch + ks * KGPS;
-                int k_start = k_group_idx * QUANT_GROUP;
+                int k_start = (k_group_begin + k_group_idx) * QUANT_GROUP;
                 __nv_bfloat16* sa = smem->a_buf[buf];
                 uint8_t* sfp4 = smem->fp4_buf[buf];
 
@@ -358,12 +503,26 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
                     int m = idx / (TK / 8);
                     int c = idx % (TK / 8);
                     int row = m_start + m;
-                    if (row < Me) {
-                        const __nv_bfloat16* gmem = expert_input + (size_t)row * K + k_start;
+                    if (row < Me && (!HYBRID || m < m_valid)) {
+                        const __nv_bfloat16* gmem;
+                        if constexpr (HYBRID) {
+                            const int route = sorted_to_original[expert_offsets[expert_id] + row];
+                            gmem = sorted_input + (size_t)(route / top_k) * K + k_start;
+                        }
+                        else {
+                            gmem = expert_input + (size_t)row * K + k_start;
+                        }
                         int block_row = m / 16, tile_row = (m % 16) / 8, local_row = m % 8, row_base = local_row * 8;
                         int block_col = c / 2, tile_col = c % 2;
                         int offset = (block_row * (TK / 16) + block_col) * 256 + (tile_col * 2 + tile_row) * 64 + row_base;
                         cp_async_ca_16(sa + offset, gmem + c * 8);
+                    }
+                    else if constexpr (HYBRID) {
+                        const int block_row = m / 16, tile_row = (m % 16) / 8, local_row = m % 8;
+                        const int block_col = c / 2, tile_col = c % 2;
+                        const int offset = (block_row * (TK / 16) + block_col) * 256
+                            + (tile_col * 2 + tile_row) * 64 + local_row * 8;
+                        *reinterpret_cast<uint4*>(sa + offset) = make_uint4(0, 0, 0, 0);
                     }
                 }
                 // --- stage fp4 weights ---
@@ -389,7 +548,7 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
                         int b = (i % batch_16b) * 16;
                         int global_n = n_start + n;
                         if (global_n < N) {
-                            const __nv_fp8_e4m3* gmem = scale_base + (size_t)global_n * num_k_groups + k_group_batch;
+                            const __nv_fp8_e4m3* gmem = scale_base + (size_t)global_n * scale_stride + k_group_begin + k_group_batch;
                             int swiz16 = ((n >> 2) & 1) * 16;
                             cp_async_ca_16(reinterpret_cast<uint4*>(smem->scale_batch[buf] + n * SCALE_BATCH + (b ^ swiz16)),
                                            reinterpret_cast<const uint4*>(gmem + b));
@@ -401,7 +560,7 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
                         for (int n = tid; n < TN; n += CTA_THREADS) {
                             int global_n = n_start + n;
                             if (global_n < N && remainder >= 8) {
-                                const __nv_fp8_e4m3* gmem = scale_base + (size_t)global_n * num_k_groups + k_group_batch;
+                                const __nv_fp8_e4m3* gmem = scale_base + (size_t)global_n * scale_stride + k_group_begin + k_group_batch;
                                 int swiz16 = ((n >> 2) & 1) * 16;
                                 cp_async_ca_8(reinterpret_cast<uint2*>(smem->scale_batch[buf] + n * SCALE_BATCH + (b ^ swiz16)),
                                               reinterpret_cast<const uint2*>(gmem + b));
@@ -617,18 +776,21 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
                 int n_start_local = my_n_start_local + n_group * 8;
                 int acc_base = mt * ACC_STRIDE + n_group * 4;
                 int col0 = n_start + n_start_local + 2 * t0, col1 = n_start + n_start_local + 2 * t0 + 1;
-                if (orig0 >= 0 && col0 < N)
-                    output[(size_t)orig0 * N + col0] = __float2bfloat16(frag_c_accum[acc_base + 0]);
-                if (orig0 >= 0 && col1 < N)
-                    output[(size_t)orig0 * N + col1] = __float2bfloat16(frag_c_accum[acc_base + 1]);
-                if (orig1 >= 0 && col0 < N)
-                    output[(size_t)orig1 * N + col0] = __float2bfloat16(frag_c_accum[acc_base + 2]);
-                if (orig1 >= 0 && col1 < N)
-                    output[(size_t)orig1 * N + col1] = __float2bfloat16(frag_c_accum[acc_base + 3]);
+                store_coop_output<SPLIT_K>(output, partial, count, N, orig0, col0, frag_c_accum[acc_base + 0]);
+                store_coop_output<SPLIT_K>(output, partial, count, N, orig0, col1, frag_c_accum[acc_base + 1]);
+                store_coop_output<SPLIT_K>(output, partial, count, N, orig1, col0, frag_c_accum[acc_base + 2]);
+                store_coop_output<SPLIT_K>(output, partial, count, N, orig1, col1, frag_c_accum[acc_base + 3]);
             }
         }
-        for (int i = 0; i < ACC_SIZE; i++) frag_c_accum[i] = 0.0f;
-        __syncthreads();
+        if constexpr (HYBRID) {
+            break;
+        }
+        else {
+            for (int i = 0; i < ACC_SIZE; i++) {
+                frag_c_accum[i] = 0.0f;
+            }
+            __syncthreads();
+        }
     }
 }
 
@@ -803,9 +965,99 @@ static void launch_coop_configured(GlmCtx* ctx, int num_experts, int N,
                                                       weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
 }
 
+int hybrid_split_k(int K) {
+    // Keep each partition at least one complete scale batch. Production
+    // K=6144 uses eight partitions of one or two 512-element batches.
+    if (K % 512 == 0 && K / 512 >= 8) {
+        return 8;
+    }
+    return 1;
+}
+
+template <int SPLIT_K>
+void launch_hybrid_worker(GlmCtx* ctx, void* output, const void* input,
+                          const void* const* weights, const void* const* scales,
+                          const void* const* scales2, int top_k, int count, int N, int K,
+                          const MoeHybridPlan* plan) {
+    // Decode tuning: narrower output tiles and split-K expose more work;
+    // direct dequant + K=64 staging reduce per-CTA instruction/barrier cost.
+    constexpr int TM = MOE_HYBRID_TILE_ROWS, TN = 64, TK = 64, DEPTH = 2, NWARPS = 2;
+    const size_t smem = sizeof(CoopSmem<TM, TN, DEPTH, NWARPS, 256, false, TK>);
+    auto* partial = reinterpret_cast<float*>(const_cast<MoeHybridPlan*>(plan) + 1);
+    // Every MMA task owns at least two routes, including partial tiles.
+    const int max_tasks = std::max(1, count / MOE_HYBRID_MIN_MMA_ROWS);
+    const dim3 grid(max_tasks * ((N + TN - 1) / TN), SPLIT_K);
+    coop_moe_kernel<TM, TN, DEPTH, NWARPS, 256, false, TK, true, true, SPLIT_K>
+        <<<grid, NWARPS * 32, smem, GLM_STREAM(ctx)>>>(
+            static_cast<const __nv_bfloat16*>(input), static_cast<__nv_bfloat16*>(output), K,
+            weights, scales, scales2, plan->offsets, 256, N,
+            nullptr, plan->routes, plan, top_k, partial, count);
+}
+
+__global__ void hybrid_reduce_kernel(__nv_bfloat16* output, const MoeHybridPlan* plan,
+                                      int count, int N, int split_k) {
+    const int task_id = blockIdx.x;
+    if (task_id >= plan->mma_count) {
+        return;
+    }
+    const int2 task = plan->mma_tasks[task_id];
+    const int2 range = hybrid_tile_rows(plan, task.x, task.y);
+    const int start = range.x;
+    const int offset = plan->offsets[task.x];
+    const int rows = range.y;
+    const float* partial = reinterpret_cast<const float*>(plan + 1);
+    for (int i = threadIdx.x; i < rows * N; i += blockDim.x) {
+        const int route = plan->routes[offset + start + i / N];
+        const size_t index = (size_t)route * N + i % N;
+        float sum = 0.0f;
+        for (int split = 0; split < split_k; ++split) {
+            sum += partial[(size_t)split * count * N + index];
+        }
+        output[index] = __float2bfloat16(sum);
+    }
+}
+
 } // namespace
 
 extern "C" {
+
+size_t glm_moe_hybrid_workspace_size(int count, int N) {
+    // FP32 split-K partials are reused by gate/up on the joined MMA stream.
+    return sizeof(MoeHybridPlan) + (size_t)8 * count * N * sizeof(float);
+}
+
+void glm_moe_hybrid_prepare(GlmCtx* ctx, const int* expert_ids, int count,
+                            int num_experts, int min_rows, void* workspace) {
+    cudaSetDevice(ctx->device_id);
+    min_rows = std::max(min_rows, MOE_HYBRID_MIN_MMA_ROWS);
+    hybrid_prepare_kernel<<<1, MOE_HYBRID_MAX_EXPERTS, 0, GLM_STREAM(ctx)>>>(
+        expert_ids, count, num_experts, min_rows, static_cast<MoeHybridPlan*>(workspace));
+}
+
+void glm_moe_hybrid_mma(GlmCtx* ctx, void* output, const void* input,
+                        const void* const* weight_ptrs, const void* const* scale_ptrs,
+                        const void* const* scale2_ptrs, const int* expert_ids,
+                        int top_k, int count, int N, int K, const void* workspace) {
+    cudaSetDevice(ctx->device_id);
+    const auto* plan = static_cast<const MoeHybridPlan*>(workspace);
+    if (hybrid_split_k(K) == 8) {
+        launch_hybrid_worker<8>(ctx, output, input, weight_ptrs, scale_ptrs, scale2_ptrs, top_k, count, N, K, plan);
+    }
+    else {
+        launch_hybrid_worker<1>(ctx, output, input, weight_ptrs, scale_ptrs, scale2_ptrs, top_k, count, N, K, plan);
+    }
+}
+
+void glm_moe_hybrid_mma_reduce(GlmCtx* ctx, void* output, int count, int N, int K, const void* workspace) {
+    const int split = hybrid_split_k(K);
+    if (split == 1) {
+        return;
+    }
+    cudaSetDevice(ctx->device_id);
+    const int max_tasks = std::max(1, count / MOE_HYBRID_MIN_MMA_ROWS);
+    hybrid_reduce_kernel<<<max_tasks, 256, 0, GLM_STREAM(ctx)>>>(
+        static_cast<__nv_bfloat16*>(output), static_cast<const MoeHybridPlan*>(workspace), count, N, split);
+}
 
 size_t glm_mma_moe_coop_workspace_size(int count, int N, int K, int num_experts) {
     size_t sorted_input = (size_t)count * K * 2;

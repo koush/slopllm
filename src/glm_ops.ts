@@ -24,6 +24,14 @@ const MUL_MAT_ID_GROUPED_THRESHOLD = 512;
 export const FUSED_MOE_DOWN_REDUCE = process.env.SLOPLLM_FUSED_MOE_DOWN_REDUCE !== "0";
 // Independent NVFP4 control for grouped-MoE experiments; BF16 dispatch is separate.
 const NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD = Number(process.env.SLOPLLM_NVFP4_MOE_GROUPED_THRESHOLD ?? MUL_MAT_ID_GROUPED_THRESHOLD);
+// Zero retains direct decode; positive values select the expert-occupancy
+// cutoff for the hybrid verification path (default four, minimum two rows).
+// Eligible experts stay entirely on MMA, balanced across up-to-16-row tiles;
+// CUDA filters original routes by expert occupancy without a separate queue.
+const NVFP4_MOE_HYBRID_MIN_ROWS = Number(process.env.SLOPLLM_NVFP4_MOE_HYBRID_MIN_ROWS ?? 4);
+if (!Number.isInteger(NVFP4_MOE_HYBRID_MIN_ROWS) || NVFP4_MOE_HYBRID_MIN_ROWS < 0) {
+  throw new Error("SLOPLLM_NVFP4_MOE_HYBRID_MIN_ROWS must be a non-negative integer");
+}
 if (!Number.isInteger(NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD) || NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD < 0) {
   throw new Error("SLOPLLM_NVFP4_MOE_GROUPED_THRESHOLD must be a non-negative integer");
 }
@@ -746,12 +754,51 @@ export class GlmTensor extends Tensor {
       return out;
     }
     super.swiGluMlpMoe(inputs, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
-    // The routed parent runs at high priority; keep gate competitive with up during graph replay.
-    using gateStream = this.ops.withStream(true, () => this.mulMatId(inputs.gate, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.gate_proj`));
-    using upOut = this.mulMatId(inputs.up, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.up_proj`);
-    gateStream.streamWaitEvent();
-    using gateOut = gateStream.result;
-    using activated = gateOut.siluAndMul(upOut);
+    using activated = (() => {
+      if (NVFP4_MOE_HYBRID_MIN_ROWS > 0 && count >= 256 &&
+          inputs.gate.length <= 256 && inputs.up.length === inputs.gate.length &&
+          inputs.gate[0].type === "U8" && inputs.up[0].type === "U8") {
+        const addon = getNativeAddon();
+        const ctx = this.ops.ctx;
+        const gatePtrs = this.getMoeNvfp4Ptrs(inputs.gate, `${pfx}.gate_proj`);
+        const upPtrs = this.getMoeNvfp4Ptrs(inputs.up, `${pfx}.up_proj`);
+        using plan = this.workspace.allocRaw(addon.moeHybridWorkspaceSize(count, moeIntermediate));
+        using gateOut = this.workspace.alloc([count, moeIntermediate], this.type);
+        using upOut = this.workspace.alloc([count, moeIntermediate], this.type);
+        addon.moeHybridPrepare(ctx, topkIndicesFlat.data, count, inputs.gate.length,
+          NVFP4_MOE_HYBRID_MIN_ROWS, plan.data);
+        // Both streams wait for bucketing. CUDA/MMA own disjoint route rows in
+        // each output; no atomics or merge are needed. Keep plan and outputs
+        // alive on the parent until both completion waits have executed.
+        using mmaStream = this.ops.withStream(true, () => {
+          addon.moeHybridMma(ctx, gateOut.data, this.data, gatePtrs.weightPtrs.data,
+            gatePtrs.scalePtrs.data, gatePtrs.scale2Ptrs.data, topkIndicesFlat.data,
+            topK, count, moeIntermediate, hs, plan.data);
+          addon.moeHybridMmaReduce(ctx, gateOut.data, count, moeIntermediate, hs, plan.data);
+          addon.moeHybridMma(ctx, upOut.data, this.data, upPtrs.weightPtrs.data,
+            upPtrs.scalePtrs.data, upPtrs.scale2Ptrs.data, topkIndicesFlat.data,
+            topK, count, moeIntermediate, hs, plan.data);
+          addon.moeHybridMmaReduce(ctx, upOut.data, count, moeIntermediate, hs, plan.data);
+        });
+        using cudaStream = this.ops.withStream(() => {
+          addon.moeHybridCuda(ctx, gateOut.data, this.data, gatePtrs.weightPtrs.data,
+            gatePtrs.scalePtrs.data, gatePtrs.scale2Ptrs.data, topkIndicesFlat.data,
+            topK, count, moeIntermediate, hs, plan.data);
+          addon.moeHybridCuda(ctx, upOut.data, this.data, upPtrs.weightPtrs.data,
+            upPtrs.scalePtrs.data, upPtrs.scale2Ptrs.data, topkIndicesFlat.data,
+            topK, count, moeIntermediate, hs, plan.data);
+        });
+        mmaStream.streamWaitEvent();
+        cudaStream.streamWaitEvent();
+        return gateOut.siluAndMul(upOut);
+      }
+      // The routed parent runs at high priority; keep gate competitive with up during graph replay.
+      using gateStream = this.ops.withStream(true, () => this.mulMatId(inputs.gate, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.gate_proj`));
+      using upOut = this.mulMatId(inputs.up, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.up_proj`);
+      gateStream.streamWaitEvent();
+      using gateOut = gateStream.result;
+      return gateOut.siluAndMul(upOut);
+    })();
     inputs.normalizedWeightsStream.streamWaitEvent();
     using scales = inputs.normalizedWeightsStream.result.reshape([count]);
     if (scales.type !== "BF16" || topkIndicesFlat.type !== "I32") {

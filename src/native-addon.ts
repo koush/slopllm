@@ -186,6 +186,13 @@ export interface NativeAddon {
   mmaMoeWorkspaceSize(count: number, N: number, K: number, numExperts: number): number;
   mmaMoeCoopWorkspaceSize(count: number, N: number, K: number, numExperts: number): number;
   nvfp4MulMatIdGroupedMmaCoop(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
+  // Includes reusable FP32 split-K partials. Each MMA invocation must be
+  // followed by moeHybridMmaReduce on the same stream before reusing them.
+  moeHybridWorkspaceSize(count: number, N: number): number;
+  moeHybridMmaReduce(ctx: number, output: number, count: number, N: number, K: number, workspace: number): void;
+  moeHybridPrepare(ctx: number, expertIds: number, count: number, numExperts: number, minRows: number, workspace: number): void;
+  moeHybridCuda(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number, workspace: number): void;
+  moeHybridMma(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number, workspace: number): void;
   mmaMoeCoopScatterWorkspaceSize(count: number, K: number, numExperts: number): number;
   mmaMoeCoopGemmWorkspaceSize(count: number, N: number): number;
   mmaMoeCoopScatter(ctx: number, input: number, expertIds: number, topK: number, count: number, K: number, numExperts: number, workspace: number): void;
