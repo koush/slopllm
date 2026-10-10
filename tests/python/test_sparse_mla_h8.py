@@ -8,9 +8,21 @@ import torch
 @pytest.mark.parametrize("mode", ["packed", "split", "fp8"])
 @pytest.mark.parametrize("cpb", [1, 2, 3, 32, "prefill"])
 def test_native_h8(glm, device, monkeypatch, mode, cpb):
+    switch = "FLASHINFER_GLM_H8_PREFILL_SWAP_QK" if cpb == "prefill" else "FLASHINFER_GLM_H8_NATIVE"
+    _check_native_h8(glm, device, monkeypatch, mode, cpb, switch)
+
+
+@pytest.mark.parametrize("mode", ["packed", "split", "fp8"])
+@pytest.mark.parametrize("swap_qk", ["0", "1"])
+def test_h8_direct_kv(glm, device, monkeypatch, mode, swap_qk):
+    monkeypatch.setenv("FLASHINFER_GLM_H8_PREFILL_SWAP_QK", swap_qk)
+    _check_native_h8(glm, device, monkeypatch, mode, "prefill", "FLASHINFER_GLM_H8_PREFILL_DIRECT_KV")
+
+
+def _check_native_h8(glm, device, monkeypatch, mode, cpb, switch):
     torch.manual_seed(782)
     rows, heads, topk, splits = (32 if cpb == "prefill" else 8), 8, 2048, 32
-    switch = "FLASHINFER_GLM_H8_PREFILL_SWAP_QK" if cpb == "prefill" else "FLASHINFER_GLM_H8_NATIVE"
+    direct_kv = switch == "FLASHINFER_GLM_H8_PREFILL_DIRECT_KV"
     q = (torch.randn(rows, heads, 512, device=device) * .3).to(torch.float8_e4m3fn)
     qr = (torch.randn(rows, heads, 64, device=device) * .3).bfloat16()
     qs = 2.0 ** torch.randint(-2, 2, (rows, heads, 4), device=device).float()
@@ -70,8 +82,8 @@ def test_native_h8(glm, device, monkeypatch, mode, cpb):
     monkeypatch.setenv(switch, "1")
     run()
     glm.synchronize()
-    torch.testing.assert_close(out, generic, atol=.002, rtol=.025)
-    torch.testing.assert_close(lse, generic_lse, atol=.002, rtol=.001)
+    torch.testing.assert_close(out, generic, atol=0 if direct_kv else .002, rtol=0 if direct_kv else .025)
+    torch.testing.assert_close(lse, generic_lse, atol=0 if direct_kv else .002, rtol=0 if direct_kv else .001)
     for i, n in enumerate(lengths):
         slots = indices[i, :n].long()
         slots = slots[slots >= 0]
@@ -102,8 +114,8 @@ def test_native_h8(glm, device, monkeypatch, mode, cpb):
         torch.cuda.synchronize(device)
         run()
         glm.synchronize()
-        torch.testing.assert_close(replay, out, atol=.002, rtol=.025)
-        torch.testing.assert_close(replay_lse, lse, atol=.002, rtol=.001)
+        torch.testing.assert_close(replay, out, atol=0 if direct_kv else .002, rtol=0 if direct_kv else .025)
+        torch.testing.assert_close(replay_lse, lse, atol=0 if direct_kv else .002, rtol=0 if direct_kv else .001)
         assert torch.count_nonzero(replay[0]) > 0
         assert torch.count_nonzero(replay[7]) == 0
     finally:
