@@ -1462,6 +1462,46 @@ describe("ParallelOps.rmsnorm", () => {
     }
   });
 
+  for (const parallelism of [TensorParallelism.Column, TensorParallelism.Row]) {
+    for (const dim of [8, 2048]) {
+      it(`rmsnorm handles ${parallelism} input with dim=${dim} (BF16)`, (t) => {
+        const batch = 4;
+        const eps = 1e-6;
+        const inputF32 = Float32Array.from({ length: batch * dim }, (_, i) => ((i * 7) % 23 - 11) / 16);
+        const weightF32 = Float32Array.from({ length: dim }, (_, i) => 0.5 + (i % 7) / 16);
+        const expected = refRmsnorm(inputF32, weightF32, eps, dim, batch);
+        using input = ws.alloc([batch, dim], "BF16", undefined, parallelism) as ParallelTensor;
+        using weight = ws.alloc([dim], "BF16", undefined, TensorParallelism.Replicated) as ParallelTensor;
+        input.h2d(f32ToBf16Bytes(inputF32));
+        weight.h2d(f32ToBf16Bytes(weightF32));
+
+        if (parallelism === TensorParallelism.Column) {
+          t.mock.method(input, "allGather", () => { throw new Error("token-column RMSNorm must not gather"); });
+          t.mock.method(input, "allReduce", () => { throw new Error("token-column RMSNorm must not reduce"); });
+        }
+        using out = input.rmsnorm(weight, eps) as ParallelTensor;
+        po.synchronize();
+        assert.equal(input.parallelism, parallelism);
+        assert.equal(out.parallelism, parallelism === TensorParallelism.Column ? parallelism : TensorParallelism.Replicated);
+        assert.deepEqual(out.shape, [batch, dim]);
+        const localBatch = parallelism === TensorParallelism.Column ? batch / po.worldSize : batch;
+        for (let rank = 0; rank < po.worldSize; rank++) {
+          const shard = out.shard(rank);
+          assert.deepEqual(shard.shape, [localBatch, dim]);
+          const buf = Buffer.alloc(shard.bytes);
+          shard.d2h(buf);
+          const actual = bf16BytesToF32(buf);
+          const offset = parallelism === TensorParallelism.Column ? rank * localBatch * dim : 0;
+          for (let i = 0; i < actual.length; i++) {
+            const want = expected[offset + i];
+            assert.ok(Math.abs(actual[i] - want) <= 0.01 * Math.abs(want) + 1e-4,
+              `rank=${rank}, i=${i}: expected ${want}, got ${actual[i]}`);
+          }
+        }
+      });
+    }
+  }
+
   it("rmsnorm auto-allReduces PartialSum input (BF16)", () => {
     const batch = 2;
     const dim = 8;

@@ -1054,7 +1054,7 @@ export class ParallelTensor extends Tensor {
     //   return result;
     // }
 
-    if (this.parallelism === TensorParallelism.Row || this.parallelism === TensorParallelism.Column) {
+    if (this.parallelism === TensorParallelism.Row) {
       using gathered = this.allGather(this.workspace);
       const result = gathered.rmsnorm(weight, eps);
       return result;
@@ -1066,14 +1066,15 @@ export class ParallelTensor extends Tensor {
     }
 
     const pWeight = weight as ParallelTensor;
-    this.assertParallel("rmsnorm input", this, TensorParallelism.Replicated);
+    // Token-column shards retain complete feature vectors, so normalization is local.
+    this.assertParallel("rmsnorm input", this, TensorParallelism.Replicated, TensorParallelism.Column);
     this.assertParallel("rmsnorm weight", pWeight, TensorParallelism.Replicated);
 
     const shards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
       shards.push(this.shards[i].rmsnorm(pWeight.shards[i], eps));
     }
-    return this.parallelOps.wrapShards(this.workspace, shards, [batch, dim], this.type, TensorParallelism.Replicated);
+    return this.parallelOps.wrapShards(this.workspace, shards, [batch, dim], this.type, this.parallelism);
   }
 
   layernorm(weight: Tensor, bias: Tensor, eps: number): Tensor {
