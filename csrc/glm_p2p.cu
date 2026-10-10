@@ -643,24 +643,64 @@ p2p_reduce_gather_write_kernel(
     const int gid     = blockIdx.x * RS_WRITE_THREADS + threadIdx.x;
     const int gstride = gridDim.x * RS_WRITE_THREADS;
 
+    if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+        // Two adjacent BF16 values per thread, preserving FP32 accumulation
+        // and peer order. Odd or misaligned chunks use scalar memory accesses.
+        union Values { unsigned int packed; __nv_bfloat16 value[2]; };
+        uintptr_t alignment = reinterpret_cast<uintptr_t>(staging);
+        #pragma unroll
+        for (int peer = 0; peer < N; ++peer) {
+            alignment |= reinterpret_cast<uintptr_t>(dsts[peer]);
+        }
+        const bool packed = (chunk_len % 2 == 0) && ((alignment & 3) == 0);
+        if (packed) {
+            for (int i = gid; i < chunk_len / 2; i += gstride) {
+                float acc[2] = {};
+                #pragma unroll
+                for (int j = 0; j < N; ++j) {
+                    Values x;
+                    x.packed = reinterpret_cast<const unsigned int*>(staging + (int64_t)j * chunk_len)[i];
+                    #pragma unroll
+                    for (int v = 0; v < 2; ++v) {
+                        acc[v] += __bfloat162float(x.value[v]);
+                    }
+                }
+                Values result;
+                #pragma unroll
+                for (int v = 0; v < 2; ++v) {
+                    result.value[v] = __float2bfloat16(acc[v]);
+                }
+                #pragma unroll
+                for (int k = 0; k < N; ++k) {
+                    const int peer = (k + rank) % N;
+                    reinterpret_cast<unsigned int*>(dsts[peer] + (int64_t)rank * chunk_len)[i] = result.packed;
+                }
+            }
+            return;
+        }
+    }
     for (int i = gid; i < chunk_len; i += gstride) {
         float acc = 0.0f;
         #pragma unroll
         for (int j = 0; j < N; j++) {
-            if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>)
+            if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
                 acc += __bfloat162float(staging[(int64_t)j * chunk_len + i]);
-            else
+            }
+            else {
                 acc += staging[(int64_t)j * chunk_len + i];
+            }
         }
-        scalar_t v;
-        if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>)
-            v = __float2bfloat16(acc);
-        else
-            v = acc;
+        scalar_t value;
+        if constexpr (std::is_same_v<scalar_t, __nv_bfloat16>) {
+            value = __float2bfloat16(acc);
+        }
+        else {
+            value = acc;
+        }
         #pragma unroll
         for (int k = 0; k < N; k++) {
             int peer = (k + rank) % N;
-            dsts[peer][(int64_t)rank * chunk_len + i] = v;
+            dsts[peer][(int64_t)rank * chunk_len + i] = value;
         }
     }
 }
@@ -889,9 +929,15 @@ void glm_p2p_reduce_gather_write(GlmCtx* ctx,
     cudaStream_t stream = GLM_STREAM(ctx);
     void* p[8] = {p0, p1, p2, p3, p4, p5, p6, p7};
 
-    int grid = (chunk_len + RS_WRITE_THREADS - 1) / RS_WRITE_THREADS;
-    if (grid > 512) grid = 512;
-    if (grid < 1) grid = 1;
+    const int work = dtype == 9 ? (chunk_len + 1) / 2 : chunk_len;
+    const int grid_cap = dtype == 9 ? 64 : 512;
+    int grid = (work + RS_WRITE_THREADS - 1) / RS_WRITE_THREADS;
+    if (grid > grid_cap) {
+        grid = grid_cap;
+    }
+    if (grid < 1) {
+        grid = 1;
+    }
 
     cudaLaunchAttribute attr{};
     attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;

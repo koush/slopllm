@@ -6,6 +6,7 @@ import { TensorParallelism } from "../src/device_ops";
 import { MemcpyKind } from "../src/enums";
 import { Tensor } from "../src/tensor";
 import { ParallelOps, ParallelTensor } from "../src/parallel_ops";
+import { getNativeAddon } from "../src/native-addon";
 
 describe("ParallelOps construction", () => {
   it("accepts a single device", () => {
@@ -994,6 +995,89 @@ describe("ParallelTensor.allReduce", () => {
     const pt = ws.alloc([4, 4], "F32", undefined, TensorParallelism.Replicated) as ParallelTensor;
     assert.throws(() => pt.allReduce(), /PartialSum/);
   });
+
+  // Local peer buffers exercise all peer counts without requiring eight
+  // physical GPUs in the standard two-GPU suite.
+  for (const peers of [2, 4, 8]) {
+    for (const chunk of [17, 18, 128, 49152, 65536]) {
+      it(`packed BF16 reduce/gather matches reference and replays: peers=${peers}, chunk=${chunk}`, () => {
+        const localWs = new WorkspaceBase(glm0);
+        const count = chunk * peers;
+        const addon = getNativeAddon();
+        try {
+          const input = new Float32Array(count);
+          const expected = new Float32Array(chunk);
+          for (let peer = 0; peer < peers; peer++) {
+            for (let i = 0; i < chunk; i++) {
+              // Exactly representable BF16 operands, mixed signs/exponents. The
+              // FP32 sum and final BF16 rounding need not be exact.
+              const value = ((i * (peer + 3) % 29) - 14) / 16 * 2 ** ((i + 5 * peer) % 15 - 7);
+              input[peer * chunk + i] = value;
+              expected[i] = Math.fround(expected[i] + value);
+            }
+          }
+          const staging = localWs.alloc([count], "BF16");
+          staging.h2d(f32ToBf16Bytes(input));
+          const bits = new Uint32Array(expected.buffer);
+          const rounded = new Uint16Array(chunk);
+          for (let i = 0; i < chunk; i++) {
+            rounded[i] = (bits[i] + 0x7fff + ((bits[i] >>> 16) & 1)) >>> 16;
+          }
+          const want = Buffer.concat(Array.from({ length: peers }, () => Buffer.from(rounded.buffer)));
+
+          for (const prefix of [8, 1]) {
+            // A one-element offset forces the scalar alignment fallback. Guards
+            // also catch accidental vector writes outside the requested range.
+            const outputs = Array.from({ length: peers }, () => localWs.alloc([count + prefix + 8], "BF16"));
+            const seed = Buffer.alloc((count + prefix + 8) * 2, 0xa5);
+            outputs.forEach(t => t.h2d(seed));
+            glm0.synchronize();
+            const ptrs = outputs.map(t => t.data + prefix * 2);
+            while (ptrs.length < 8) {
+              ptrs.push(0);
+            }
+            const run = () => {
+              for (let rank = 0; rank < peers; rank++) {
+                addon.p2pReduceGatherWrite(glm0.ctx, staging.data,
+                  ptrs[0], ptrs[1], ptrs[2], ptrs[3], ptrs[4], ptrs[5], ptrs[6], ptrs[7],
+                  peers, chunk, rank, NCCL_BFLOAT16);
+              }
+            };
+            run();
+            glm0.synchronize();
+            const check = () => {
+              for (const output of outputs) {
+                const actual = Buffer.alloc(seed.length);
+                output.d2h(actual);
+                glm0.synchronize();
+                assert.deepEqual(actual.subarray(prefix * 2, (prefix + count) * 2), want);
+                assert.deepEqual(actual.subarray(0, prefix * 2), seed.subarray(0, prefix * 2));
+                assert.deepEqual(actual.subarray((prefix + count) * 2), seed.subarray((prefix + count) * 2));
+              }
+            };
+            check();
+            glm0.graphBeginCapture();
+            run();
+            const graph = glm0.graphEndCapture();
+            const exec = glm0.graphInstantiate(graph);
+            try {
+              outputs.forEach(t => t.h2d(seed));
+              for (let replay = 0; replay < 3; replay++) {
+                glm0.graphLaunch(exec);
+              }
+              glm0.synchronize();
+              check();
+            } finally {
+              glm0.graphExecDestroy(exec);
+              glm0.graphDestroy(graph);
+            }
+          }
+        } finally {
+          localWs.free();
+        }
+      });
+    }
+  }
 });
 
 describe("ParallelTensor.allGather", () => {
