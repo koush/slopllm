@@ -54,6 +54,92 @@ for (const p2p of [true, false]) {
   });
 }
 
+for (const p2p of [true, false]) {
+  for (const [queryLayout, weightLayout, flat] of [
+    [TensorParallelism.Column, TensorParallelism.Replicated, false],
+    [TensorParallelism.Column, TensorParallelism.Replicated, true],
+    [TensorParallelism.Column, TensorParallelism.Column, false],
+    [TensorParallelism.Column, TensorParallelism.Column, true],
+    [TensorParallelism.Row, TensorParallelism.Replicated, false],
+    [TensorParallelism.Row, TensorParallelism.Row, false],
+    [TensorParallelism.Replicated, TensorParallelism.Replicated, false],
+  ] as const) {
+    it(`indexer quantization: q=${queryLayout}, weights=${weightLayout}, flat=${flat}, ${p2p ? 'P2P' : 'NCCL'}`, (t) => {
+      using gpu0 = new GlmOps(0);
+      using gpu1 = new GlmOps(1);
+      using po = new ParallelOps([gpu0, gpu1]);
+      if (p2p) assert.ok(po.p2pEnabled);
+      po.p2pEnabled = p2p;
+      using ws = new WorkspaceBase(po);
+      using referenceWs = new WorkspaceBase(gpu0);
+      const rows = 16, heads = 32, dim = 128;
+      const shape = flat ? [rows, heads * dim] : [rows, heads, dim];
+      const hostQ = f32ToBf16Bytes(Float32Array.from({ length: rows * heads * dim }, (_, i) =>
+        Math.sin(i * 0.13) * (1 + Math.floor(i / dim) % 17)));
+      const hostWeights = f32ToBf16Bytes(Float32Array.from({ length: rows * heads }, (_, i) =>
+        0.125 + (i % 53) / 16));
+      using q = ws.alloc(shape, 'BF16', undefined, queryLayout) as ParallelTensor;
+      using weights = ws.alloc([rows, heads], 'BF16', undefined, weightLayout) as ParallelTensor;
+      using referenceQ = referenceWs.alloc(shape, 'BF16');
+      using referenceWeights = referenceWs.alloc([rows, heads], 'BF16');
+      q.h2d(hostQ); referenceQ.h2d(hostQ);
+      weights.h2d(hostWeights); referenceWeights.h2d(hostWeights);
+      po.synchronize();
+      const reference = gpu0.indexerQuantizeQ(referenceQ, referenceWeights, dim ** -0.5);
+      using referenceQ8 = reference.q8;
+      using referenceEffectiveWeights = reference.effectiveWeights!;
+      t.mock.method(q, 'allGather', () => { throw new Error('must quantize before gathering queries'); });
+      t.mock.method(weights, 'allGather', () => { throw new Error('matching weights must not need a gather'); });
+      const gather = po.allGatherTwo.bind(po);
+      const pairedGather = t.mock.method(po, 'allGatherTwo', (a: ParallelTensor | undefined, b: ParallelTensor | undefined, outputWs: WorkspaceBase) => {
+        assert.equal(a!.parallelism, queryLayout);
+        assert.equal(b!.parallelism, queryLayout);
+        assert.equal(a!.type, 'U8');
+        assert.equal(b!.type, 'F32');
+        return gather(a, b, outputWs);
+      });
+      using stream = po.withStream(() => po.indexerQuantizeQ(q, weights, dim ** -0.5));
+      stream.streamWaitEvent();
+      using q8 = stream.result.q8 as ParallelTensor;
+      using effectiveWeights = stream.result.effectiveWeights as ParallelTensor;
+      po.synchronize();
+      assert.equal(pairedGather.mock.callCount(), 1);
+      assert.equal(q8.parallelism, TensorParallelism.Replicated);
+      assert.equal(effectiveWeights.parallelism, TensorParallelism.Replicated);
+      assert.deepEqual(q8.shape, [rows, heads, dim]);
+      assert.deepEqual(effectiveWeights.shape, [rows, heads]);
+      for (let rank = 0; rank < po.worldSize; rank++) {
+        assert.deepEqual(bytes(q8.shards[rank]), bytes(referenceQ8), `query rank=${rank}`);
+        assert.deepEqual(bytes(effectiveWeights.shards[rank]), bytes(referenceEffectiveWeights), `effective weights rank=${rank}`);
+      }
+    });
+  }
+}
+
+it('indexer quantization preserves token-column BF16 fallback and rejects mismatched weights', () => {
+  using gpu0 = new GlmOps(0);
+  using gpu1 = new GlmOps(1);
+  using po = new ParallelOps([gpu0, gpu1]);
+  using ws = new WorkspaceBase(po);
+  using q = ws.alloc([4, 16, 128], 'BF16', undefined, TensorParallelism.Column) as ParallelTensor;
+  using weights = ws.alloc([4, 16], 'BF16', undefined, TensorParallelism.Column) as ParallelTensor;
+  const host = f32ToBf16Bytes(Float32Array.from({ length: q.numElements }, (_, i) => (i % 31 - 15) / 16));
+  q.h2d(host);
+  const result = po.indexerQuantizeQ(q, weights, 128 ** -0.5);
+  using q8 = result.q8 as ParallelTensor;
+  po.synchronize();
+  assert.equal(result.effectiveWeights, undefined);
+  assert.equal(q8.type, 'BF16');
+  assert.equal(q8.parallelism, TensorParallelism.Column);
+  for (let rank = 0; rank < po.worldSize; rank++) {
+    assert.deepEqual(bytes(q8.shards[rank]), host.subarray(rank * q8.shards[rank].bytes, (rank + 1) * q8.shards[rank].bytes));
+  }
+  using rowWeights = ws.alloc([4, 16], 'BF16', undefined, TensorParallelism.Row);
+  assert.throws(() => po.indexerQuantizeQ(q, rowWeights, 1), /sharded weights must match q parallelism/);
+  using wrongRows = ws.alloc([8, 16], 'BF16');
+  assert.throws(() => po.indexerQuantizeQ(q, wrongRows, 1), /expected weights BF16/);
+});
+
 for (const tokens of [1, 17]) {
   it(`threads native FP8 scales through sparse prefill with ${tokens} tokens`, () => {
     using gpu = new GlmOps(0);
@@ -77,7 +163,10 @@ for (const tokens of [1, 17]) {
     length.h2d(hostLength);
     gpu.synchronize();
     const quantized = gpu.quantizeFp8(q, 128);
-    const state = { totalTokens: tokens } as ExecutionState;
+    const state = {
+      totalTokens: tokens,
+      cache: { getPagedKV: () => ({ contextParallel: false }) },
+    } as ExecutionState;
     const reference = gpu.sparseMlaPrefill(state, q, rope, kv, indices, topk, 0.0791, length, length, length, length);
     const result = gpu.sparseMlaPrefill(state, quantized.values, rope, kv, indices, topk, 0.0791, length, length, length, length, quantized.scales);
     gpu.synchronize();

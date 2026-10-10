@@ -4388,26 +4388,30 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
-  // Row-sharded indexer Q quantization: each rank quantizes its head slice in
-  // place against the Replicated weights (or its Row weight shard) and the
-  // outputs stay sharded — deliberately no gather, matching the fused paths'
-  // head-split GEMM output. Global eligibility follows the FP8 MMA shape
-  // (32 global heads); otherwise returns the identity fallback with q8 still
-  // BF16 so indexerTopk behaves exactly as the fused scorer would.
+  // Quantize local head or token shards before gathering the FP8 query and
+  // effective weights together. Replicated weights are indexed by head offset
+  // for Row queries and narrowed to matching token rows for Column queries.
+  // Non-MMA shapes retain their BF16 query layout through the identity fallback.
   indexerQuantizeQ(q: Tensor, weights: Tensor, scale: number): { q8: Tensor, effectiveWeights: Tensor | undefined } {
     const IDX_QUANT_HEAD_DIM = 128;
     const pQ = this.cast(q);
     const pWeights = this.cast(weights);
-    if (pQ.parallelism !== TensorParallelism.Replicated && pQ.parallelism !== TensorParallelism.Row) {
+    if (pQ.parallelism !== TensorParallelism.Replicated && pQ.parallelism !== TensorParallelism.Row && pQ.parallelism !== TensorParallelism.Column) {
       throw new Error(`indexerQuantizeQ: unsupported q parallelism ${pQ.parallelism}`);
     }
-    if (pWeights.parallelism !== TensorParallelism.Replicated && pWeights.parallelism !== TensorParallelism.Row) {
+    if (pWeights.parallelism !== TensorParallelism.Replicated && pWeights.parallelism !== TensorParallelism.Row && pWeights.parallelism !== TensorParallelism.Column) {
       throw new Error(`indexerQuantizeQ: unsupported weights parallelism ${pWeights.parallelism}`);
     }
     if (pQ.parallelism === TensorParallelism.Replicated && pWeights.parallelism === TensorParallelism.Row) {
       throw new Error("indexerQuantizeQ: Replicated q with Row weights would need a gather");
     }
+    if (pWeights.parallelism !== TensorParallelism.Replicated && pWeights.parallelism !== pQ.parallelism) {
+      throw new Error("indexerQuantizeQ: sharded weights must match q parallelism");
+    }
     const rows = pQ.shape[0];
+    if (pWeights.type !== "BF16" || pWeights.shape.length !== 2 || pWeights.shape[0] !== rows) {
+      throw new Error(`indexerQuantizeQ: expected weights BF16 [${rows}, nHeads], got ${pWeights.type}[${pWeights.shape}]`);
+    }
     const headDim = pQ.shape.length === 3 ? pQ.shape[2] : IDX_QUANT_HEAD_DIM;
     const globalNHeads = pQ.shape.length === 3 ? pQ.shape[1] : pQ.shape[1] / IDX_QUANT_HEAD_DIM;
     // Global fallback: the FP8 score path exists only for the full 32-head
@@ -4425,7 +4429,11 @@ export class ParallelOps implements DeviceOps {
         && pWeights.parallelism === TensorParallelism.Replicated
         ? i * shardNHeads
         : 0;
-      const r = this.devices[i].indexerQuantizeQ(pQ.shards[i], pWeights.shards[i], scale, weightHeadOffset);
+      const localRows = pQ.shards[i].shape[0];
+      using tokenWeights = pQ.parallelism === TensorParallelism.Column && pWeights.parallelism === TensorParallelism.Replicated
+        ? pWeights.shards[i].narrow(i * localRows, localRows)
+        : undefined;
+      const r = this.devices[i].indexerQuantizeQ(pQ.shards[i], tokenWeights ?? pWeights.shards[i], scale, weightHeadOffset);
       q8Shards.push(r.q8!);
       ewShards.push(r.effectiveWeights!);
     }
