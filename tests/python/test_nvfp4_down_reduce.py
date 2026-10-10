@@ -5,7 +5,7 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-@pytest.mark.parametrize("rows", [1, 4, 8, 12, 16, 20, 24, 28, 32])
+@pytest.mark.parametrize("rows", [1, 4, 8, 12, 16, 20, 24, 28, 32, 33, 48, 64])
 def test_nvfp4_down_reduce_graph_matches_unfused(glm, device, rows):
     torch.manual_seed(814 + rows)
     experts, n, k, topk = 17, 6144, 256, 8

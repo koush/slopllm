@@ -1432,8 +1432,8 @@ static Napi::Value Nvfp4MulMatIdReduce(const Napi::CallbackInfo& info) {
         return env.Undefined();
     }
     int rows = info[8].As<Napi::Number>().Int32Value();
-    if (rows < 1 || rows > 32) {
-        Napi::RangeError::New(env, "nvfp4MulMatIdReduce requires 1..32 rows").ThrowAsJavaScriptException();
+    if (rows < 1 || rows > 64) {
+        Napi::RangeError::New(env, "nvfp4MulMatIdReduce requires 1..64 rows").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     glm_nvfp4_mul_mat_id_reduce(

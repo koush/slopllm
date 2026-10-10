@@ -732,10 +732,11 @@ export class GlmTensor extends Tensor {
     moeIntermediate: number, hs: number,
     pfx: string,
   ): Tensor {
+    // 512 routed entries cover 64 tokens (batch 16 with four-position MTP verification).
     const fuseDown = FUSED_MOE_DOWN_REDUCE && this.type === "BF16" &&
       inputs.down[0]?.type === "U8" && hs === 6144 && moeIntermediate === 256 &&
       inputs.down[0].shape[0] === hs && inputs.down[0].shape[1] === moeIntermediate / 2 &&
-      topK === 8 && count > 0 && count <= 256 && count % topK === 0;
+      topK === 8 && count > 0 && count <= 512 && count % topK === 0;
     if (!fuseDown) {
       using downOut = this.swiGluMlpMoe(inputs, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
       inputs.normalizedWeightsStream.streamWaitEvent();

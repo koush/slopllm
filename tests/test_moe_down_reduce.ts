@@ -114,7 +114,7 @@ it("swiGluMlpMoeReduce reads routing weights after the BF16 fallback MLP", () =>
 });
 
 it("native fused down rejects unsupported row counts before touching pointers", () => {
-  for (const rows of [0, 33]) {
-    assert.throws(() => getNativeAddon().nvfp4MulMatIdReduce(0, 0, 0, 0, 0, 0, 0, 0, rows), /1\.\.32 rows/);
+  for (const rows of [0, 65]) {
+    assert.throws(() => getNativeAddon().nvfp4MulMatIdReduce(0, 0, 0, 0, 0, 0, 0, 0, rows), /1\.\.64 rows/);
   }
 });
