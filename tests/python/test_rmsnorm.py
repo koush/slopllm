@@ -9,7 +9,10 @@ def torch_rmsnorm(x, weight, eps):
     return (weight.float() * x_f * inv_rms).to(torch.bfloat16)
 
 
-@pytest.mark.parametrize("batch,dim", [(1, 64), (4, 128), (2, 6144), (8, 512)])
+@pytest.mark.parametrize("batch,dim", [
+    (1, 64), (4, 128), (2, 6144), (8, 512),
+    (63, 6144), (64, 6144), (256, 6144),
+])
 def test_rmsnorm_random(glm, device, batch, dim):
     x = torch.randn(batch, dim, dtype=torch.bfloat16, device=device)
     w = torch.randn(dim, dtype=torch.bfloat16, device=device)

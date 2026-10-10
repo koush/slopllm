@@ -206,8 +206,8 @@ __device__ float compute_inv_rms(const __nv_bfloat16* x, int dim, float eps, flo
 // RMSNorm kernel (register-cached: reads input once)
 // ---------------------------------------------------------------------------
 
-template <int MaxPairs, bool EvenDim = true>
-__global__ void __launch_bounds__(1024) rmsnorm_kernel(
+template <int MaxPairs, bool EvenDim = true, int MaxThreads = 1024>
+__global__ void __launch_bounds__(MaxThreads) rmsnorm_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* input,
     const __nv_bfloat16* weight,
@@ -303,6 +303,15 @@ void glm_rmsnorm(GlmCtx* ctx, void* out, const void* input,
     size_t shared_mem = (block_size / 32) * sizeof(float);
     int pairs = (dim + 2 * block_size - 1) / (2 * block_size);
     bool even = (dim & 1) == 0;
+
+    // Match the GLM prefill launch so the 12 cached pairs do not spill under
+    // the register limit imposed by the generic 1024-thread specialization.
+    if (dim == 6144 && block_size == 256) {
+        launch_pdl(rmsnorm_kernel<12, true, 256>, batch, block_size, shared_mem, GLM_STREAM(ctx),
+            (__nv_bfloat16*)out, (const __nv_bfloat16*)input,
+            (const __nv_bfloat16*)weight, eps, dim);
+        return;
+    }
 
 #define DISPATCH_RMS(P, EV) \
     launch_pdl(rmsnorm_kernel<P, EV>, batch, block_size, shared_mem, GLM_STREAM(ctx), \
