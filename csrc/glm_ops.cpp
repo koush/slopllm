@@ -3160,6 +3160,45 @@ static Napi::Value Nvfp4LinearDecode(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+enum class FlashHybridOp { KdaScan, KdaNorm, MhcPre, MhcPost, MhcStreams };
+
+template <FlashHybridOp Op>
+static Napi::Value FlashHybrid(const Napi::CallbackInfo& info) {
+    const auto env = info.Env();
+    constexpr int argc = Op == FlashHybridOp::KdaScan ? 14 : Op == FlashHybridOp::KdaNorm ? 7 :
+        Op == FlashHybridOp::MhcPre ? 13 : Op == FlashHybridOp::MhcPost ? 8 : 6;
+    if (info.Length() != argc) {
+        Napi::TypeError::New(env, "Invalid Flash hybrid operation argument count").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    for (int i = 0; i < argc; ++i) {
+        if (!info[i].IsNumber()) {
+            Napi::TypeError::New(env, "Flash hybrid operation arguments must be numbers").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+    }
+    auto ptr = [&](int i) { return reinterpret_cast<void*>(info[i].As<Napi::Number>().Int64Value()); };
+    auto integer = [&](int i) { return info[i].As<Napi::Number>().Int32Value(); };
+    auto scalar = [&](int i) { return info[i].As<Napi::Number>().FloatValue(); };
+    auto ctx = static_cast<GlmCtx*>(ptr(0));
+    if constexpr (Op == FlashHybridOp::KdaScan) {
+        glm_kda_scan(ctx, ptr(1), (float*)ptr(2), ptr(3), ptr(4), ptr(5), ptr(6), ptr(7),
+            (const float*)ptr(8), (const float*)ptr(9), (const int*)ptr(10), integer(11), integer(12), scalar(13));
+    } else if constexpr (Op == FlashHybridOp::KdaNorm) {
+        glm_kda_norm(ctx, ptr(1), ptr(2), ptr(3), ptr(4), integer(5), scalar(6));
+    } else if constexpr (Op == FlashHybridOp::MhcPre) {
+        glm_mhc_pre(ctx, ptr(1), (float*)ptr(2), (float*)ptr(3), ptr(4), ptr(5),
+            (const float*)ptr(6), (const float*)ptr(7), integer(8), integer(9), scalar(10), scalar(11), integer(12));
+    } else if constexpr (Op == FlashHybridOp::MhcPost) {
+        glm_mhc_post(ctx, ptr(1), ptr(2), ptr(3), (const float*)ptr(4), (const float*)ptr(5), integer(6), integer(7));
+    } else {
+        glm_mhc_streams(ctx, ptr(1), ptr(2), integer(3), integer(4), integer(5));
+    }
+    const auto err = cudaGetLastError();
+    if (err != cudaSuccess) Napi::Error::New(env, cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    return env.Undefined();
+}
+
 static Napi::Value GdnRecurrentStep(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 15) {
@@ -4298,6 +4337,11 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "graphExecDestroy"), Napi::Function::New(env, GraphExecDestroy));
     exports.Set(Napi::String::New(env, "fp8LinearDecode"), Napi::Function::New(env, Fp8LinearDecode));
     exports.Set(Napi::String::New(env, "nvfp4LinearDecode"), Napi::Function::New(env, Nvfp4LinearDecode));
+    exports.Set("kdaScan", Napi::Function::New(env, FlashHybrid<FlashHybridOp::KdaScan>));
+    exports.Set("kdaNorm", Napi::Function::New(env, FlashHybrid<FlashHybridOp::KdaNorm>));
+    exports.Set("mhcPre", Napi::Function::New(env, FlashHybrid<FlashHybridOp::MhcPre>));
+    exports.Set("mhcPost", Napi::Function::New(env, FlashHybrid<FlashHybridOp::MhcPost>));
+    exports.Set("mhcStreams", Napi::Function::New(env, FlashHybrid<FlashHybridOp::MhcStreams>));
     exports.Set(Napi::String::New(env, "gdnRecurrentStep"), Napi::Function::New(env, GdnRecurrentStep));
     exports.Set(Napi::String::New(env, "gdnPrefill"), Napi::Function::New(env, GdnPrefill));
     exports.Set(Napi::String::New(env, "causalConv1d"), Napi::Function::New(env, CausalConv1d));

@@ -507,7 +507,7 @@ export abstract class ChatModel extends WorkspaceBase {
     });
 
     const loadBatchSize = parseInt(process.env.SLOPLLM_LOAD_BATCH_SIZE ?? "8", 10);
-    const layerRe = /^model\.layers\.(\d+)\./;
+    const layerRe = /^model\.(?:language_model\.)?layers\.(\d+)\./;
     let totalTensors = 0;
     let totalBytes = 0;
     let maxLayer = -1;

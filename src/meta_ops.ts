@@ -6,6 +6,8 @@ import { MemcpyKind } from "./sampling";
 import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
 import type { HeapKey } from "./heap";
+import type { MhcPreResult } from "./device_ops";
+import { validateKdaScan, validateKdaNorm, validateMhcPre, validateMhcPost, validateMhcStreams } from "./flash_hybrid_validation";
 
 export class MetaTensor extends Tensor {
     private fakePinned?: Buffer;
@@ -280,6 +282,35 @@ export class MetaTensor extends Tensor {
 }
 
 export class MetaOps implements DeviceOps {
+    kdaScan(query: Tensor, state: Tensor, key: Tensor, value: Tensor, forget: Tensor, beta: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, lowerBound = -5): Tensor {
+        validateKdaScan(this, query, state, key, value, forget, beta, aLog, dtBias, cuSeqlens, lowerBound);
+        return query.workspace.alloc(query.shape, "BF16");
+    }
+
+    kdaNorm(input: Tensor, gate: Tensor, weight: Tensor, eps: number): Tensor {
+        validateKdaNorm(this, input, gate, weight, eps);
+        return input.workspace.alloc(input.shape, "BF16");
+    }
+
+    mhcPre(input: Tensor, fn: Tensor, base: Tensor, scale: Tensor, normEps = 1e-5, hcEps = 1e-6, iters = 20): MhcPreResult {
+        validateMhcPre(this, input, fn, base, scale, normEps, hcEps, iters);
+        return {
+            collapsed: input.workspace.alloc([input.shape[0], input.shape[2]], "BF16"),
+            post: input.workspace.alloc([input.shape[0], 4], "F32"),
+            comb: input.workspace.alloc([input.shape[0], 4, 4], "F32"),
+        };
+    }
+
+    mhcPost(residual: Tensor, block: Tensor, post: Tensor, comb: Tensor): Tensor {
+        validateMhcPost(this, residual, block, post, comb);
+        return residual.workspace.alloc(residual.shape, "BF16");
+    }
+
+    mhcStreams(input: Tensor, expand: boolean): Tensor {
+        validateMhcStreams(this, input, expand);
+        return input.workspace.alloc(expand ? [input.shape[0], 4, input.shape[1]] : [input.shape[0], input.shape[2]], "BF16");
+    }
+
     getCaptureKeys(_state: ExecutionState): readonly (string | number)[] {
         return [];
     }

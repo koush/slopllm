@@ -37,6 +37,8 @@ export type MlaQuery = { qAbsorbed: Tensor, qPe: Tensor, qAbsorbedScales?: Tenso
 /** E4M3 values and FP32 power-of-two dequantization scales along the last dimension. */
 export type Fp8Quantized = { values: Tensor, scales: Tensor };
 
+export type MhcPreResult = { collapsed: Tensor; post: Tensor; comb: Tensor };
+
 export interface StreamResult<T> extends Disposable {
   streamId: number;
   result: T;
@@ -147,6 +149,17 @@ export interface DeviceOps extends Disposable {
   mlaKvCacheAppend(state: ExecutionState, cacheIdx: number, ckvData: Tensor, kpeData: Tensor | null, indices: Tensor | undefined, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, pageSize?: number, cpWorldSize?: number, cpRank?: number): { ckv: Tensor; kpe?: Tensor };
   concatAndCacheDsMla(state: ExecutionState, cacheIdx: number, kvCache: Tensor, appendCkv: Tensor, appendKpe: Tensor, indices: Tensor | undefined, indptr: Tensor, batchIndices: Tensor, positions: Tensor, nnz: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number): Tensor;
   quantizeFp8(input: Tensor, blockSize: number): Fp8Quantized;
+
+  /** Packed token-major KDA; cuSeqlens partitions sequences, state is updated in place. Output uses query.workspace. */
+  kdaScan(query: Tensor, state: Tensor, key: Tensor, value: Tensor, forget: Tensor, beta: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, lowerBound?: number): Tensor;
+  /** Independent 128-channel RMSNorms with sigmoid output gating. Output uses input.workspace. */
+  kdaNorm(input: Tensor, gate: Tensor, weight: Tensor, eps: number): Tensor;
+  /** Four-stream coefficient projection, Sinkhorn normalization, and collapse. Outputs use input.workspace. */
+  mhcPre(input: Tensor, fn: Tensor, base: Tensor, scale: Tensor, normEps?: number, hcEps?: number, iters?: number): MhcPreResult;
+  /** FP32 residual mixing with BF16 output. Reduces TP PartialSum block outputs in place. Output uses residual.workspace. */
+  mhcPost(residual: Tensor, block: Tensor, post: Tensor, comb: Tensor): Tensor;
+  /** Replicate embeddings into four streams, or take the final stream mean. Output uses input.workspace. */
+  mhcStreams(input: Tensor, expand: boolean): Tensor;
 
   // Decode chunking hint: 0 selects automatic planning; the actual prefill kernel ignores it.
   sparseMlaPrefill(state: ExecutionState, qAbsorbed: Tensor, qPe: Tensor, kvCache: Tensor, indices: Tensor, topk: number, smScale: number, topkLength: Tensor, pageIndptrD: Tensor, lastPageLen: Tensor, kvTokenIndptrD: Tensor, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor };

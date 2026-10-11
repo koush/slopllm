@@ -163,7 +163,7 @@ async function main(): Promise<void> {
   if (loaderArgs.initialCommand) validateWorkerModelArgs(loaderArgs.initialCommand.args, modelArgs);
   if (!modelArgs.arenaExplicit) throw new Error("run_model_loader requires --arena <GiB>");
   if (modelArgs.useQwen35 || modelArgs.useFp8) {
-    throw new Error("The model loader currently supports Qwen3 and GLM-5.1");
+    throw new Error("The model loader currently supports Qwen3, GLM-5.1, and GLM-5.3-Flash");
   }
 
   console.log(`Loading ${modelLabel(modelArgs)} for persistent worker execution...`);

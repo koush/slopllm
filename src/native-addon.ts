@@ -42,6 +42,11 @@ export function profilerStop(): void {
 }
 
 export interface NativeAddon {
+  kdaScan(ctx: number, out: number, state: number, q: number, k: number, v: number, forget: number, beta: number, aLog: number, dtBias: number, cuSeqlens: number, heads: number, batch: number, lowerBound: number): void;
+  kdaNorm(ctx: number, out: number, input: number, gate: number, weight: number, rows: number, eps: number): void;
+  mhcPre(ctx: number, out: number, post: number, comb: number, input: number, fn: number, base: number, scale: number, rows: number, dim: number, normEps: number, hcEps: number, iters: number): void;
+  mhcPost(ctx: number, out: number, residual: number, block: number, post: number, comb: number, rows: number, dim: number): void;
+  mhcStreams(ctx: number, out: number, input: number, rows: number, dim: number, expand: number): void;
   init(deviceId: number): number;
   deviceSmCount(deviceId: number): number;
   free(ctx: number): void;

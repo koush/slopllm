@@ -847,6 +847,18 @@ void glm_nvfp4_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input
 // A_log: [num_heads] FP32 (shared across batch)
 // dt_bias: [num_heads] FP32 (shared across batch)
 // state_stride: stride (in float elements) between batch elements in state
+// GLM-5.3-Flash hybrid primitives. KDA uses fixed 128x128 head states.
+void glm_kda_scan(GlmCtx* ctx, void* out, float* state, const void* q, const void* k,
+                  const void* v, const void* forget, const void* beta, const float* a_log,
+                  const float* dt_bias, const int* cu, int heads, int batch, float lower_bound);
+void glm_kda_norm(GlmCtx* ctx, void* out, const void* x, const void* gate, const void* weight, int rows, float eps);
+void glm_mhc_pre(GlmCtx* ctx, void* out, float* post, float* comb, const void* x,
+                 const void* fn, const float* base, const float* scale,
+                 int rows, int dim, float norm_eps, float hc_eps, int iters);
+void glm_mhc_post(GlmCtx* ctx, void* out, const void* residual, const void* block,
+                  const float* post, const float* comb, int rows, int dim);
+void glm_mhc_streams(GlmCtx* ctx, void* out, const void* x, int rows, int dim, int expand);
+
 void glm_gdn_recurrent_step(GlmCtx* ctx, void* output, void* state,
                               const void* qkv,
                               const void* a_raw, const void* b_raw,

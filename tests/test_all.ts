@@ -23,6 +23,7 @@ import "./test_cp_copy_prefix";
 import "./test_cat";
 import "./test_staging";
 import "./test_glm51";
+import "./test_glm53_flash";
 import "./test_narrow";
 import "./test_slice";
 import "./test_index_select";

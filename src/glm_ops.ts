@@ -8,6 +8,8 @@ import type { WorkspaceBase } from "./workspace";
 import { MemcpyKind } from "./enums";
 import { getNativeAddon } from "./native-addon";
 import { sparseMlaChunksPerBlock } from "./sparse-mla-planner";
+import type { MhcPreResult } from "./device_ops";
+import { validateKdaScan, validateKdaNorm, validateMhcPre, validateMhcPost, validateMhcStreams } from "./flash_hybrid_validation";
 
 // Above `count == topK` (single-token decode), mulMatId can either:
 //  - run the direct per-(token,expert) GEMV kernel (mulMatId/nvfp4MulMatId), which
@@ -925,6 +927,45 @@ export class GlmTensor extends Tensor {
 }
 
 export class GlmOps implements DeviceOps {
+  kdaScan(query: Tensor, state: Tensor, key: Tensor, value: Tensor, forget: Tensor, beta: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, lowerBound = -5): Tensor {
+    validateKdaScan(this, query, state, key, value, forget, beta, aLog, dtBias, cuSeqlens, lowerBound);
+    const out = query.workspace.alloc(query.shape, "BF16");
+    getNativeAddon().kdaScan(this.ctx, out.data, state.data, query.data, key.data, value.data, forget.data, beta.data, aLog.data, dtBias.data, cuSeqlens.data, query.shape[1] / 128, state.shape[0], lowerBound);
+    return out;
+  }
+
+  kdaNorm(input: Tensor, gate: Tensor, weight: Tensor, eps: number): Tensor {
+    validateKdaNorm(this, input, gate, weight, eps);
+    const out = input.workspace.alloc(input.shape, "BF16");
+    getNativeAddon().kdaNorm(this.ctx, out.data, input.data, gate.data, weight.data, input.numElements / 128, eps);
+    return out;
+  }
+
+  mhcPre(input: Tensor, fn: Tensor, base: Tensor, scale: Tensor, normEps = 1e-5, hcEps = 1e-6, iters = 20): MhcPreResult {
+    validateMhcPre(this, input, fn, base, scale, normEps, hcEps, iters);
+    const [rows, , dim] = input.shape;
+    const collapsed = input.workspace.alloc([rows, dim], "BF16");
+    const post = input.workspace.alloc([rows, 4], "F32");
+    const comb = input.workspace.alloc([rows, 4, 4], "F32");
+    getNativeAddon().mhcPre(this.ctx, collapsed.data, post.data, comb.data, input.data, fn.data, base.data, scale.data, rows, dim, normEps, hcEps, iters);
+    return { collapsed, post, comb };
+  }
+
+  mhcPost(residual: Tensor, block: Tensor, post: Tensor, comb: Tensor): Tensor {
+    validateMhcPost(this, residual, block, post, comb);
+    const out = residual.workspace.alloc(residual.shape, "BF16");
+    getNativeAddon().mhcPost(this.ctx, out.data, residual.data, block.data, post.data, comb.data, residual.shape[0], residual.shape[2]);
+    return out;
+  }
+
+  mhcStreams(input: Tensor, expand: boolean): Tensor {
+    validateMhcStreams(this, input, expand);
+    const rows = input.shape[0], dim = input.shape[expand ? 1 : 2];
+    const out = input.workspace.alloc(expand ? [rows, 4, dim] : [rows, dim], "BF16");
+    getNativeAddon().mhcStreams(this.ctx, out.data, input.data, rows, dim, expand ? 1 : 0);
+    return out;
+  }
+
   getCaptureKeys(state: ExecutionState): readonly (string | number)[] {
     const pagedKV = state.cache.getPagedKV();
     if (!pagedKV.sparseMode) {

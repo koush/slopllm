@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { ChatModel } from "./chat_model";
 import { DeviceOps } from "./device_ops";
 import { Glm51Model } from "./glm51_model";
+import { Glm53FlashModel, GLM53_FLASH_REPO } from "./glm53_flash_model";
 import { GlmOps } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import { ParallelOps, ParallelTensor } from "./parallel_ops";
@@ -23,6 +24,7 @@ export interface ModelCliArgs {
   modelDir: string | undefined;
   useQwen35: boolean;
   useGlm51: boolean;
+  useGlm53Flash: boolean;
   glm51Small: boolean;
   useFp8: boolean;
   useNvfp4: boolean;
@@ -48,6 +50,7 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
     modelDir: undefined,
     useQwen35: false,
     useGlm51: true,
+    useGlm53Flash: false,
     glm51Small: false,
     useFp8: false,
     useNvfp4: false,
@@ -68,6 +71,7 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
     else if (a === "--qwen35") { args.useQwen35 = true; args.useGlm51 = false; qwen35Explicit = true; }
     else if (a === "--glm51") { args.useGlm51 = true; glm51Explicit = true; }
     else if (a === "--glm51-small") { args.useGlm51 = true; args.glm51Small = true; glm51Explicit = true; }
+    else if (a === "--glm53-flash") { args.useGlm53Flash = true; args.useGlm51 = false; }
     else if (a === "--fp8") { args.useFp8 = true; args.useGlm51 = false; }
     else if (a === "--nvfp4") args.useNvfp4 = true;
     else if (a === "--cp") args.cp = true;
@@ -78,7 +82,7 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
     }
   }
 
-  if (!args.arenaExplicit && args.useGlm51 && !args.glm51Small) args.arena = 92;
+  if (!args.arenaExplicit && ((args.useGlm51 && !args.glm51Small) || args.useGlm53Flash)) args.arena = 92;
   if (args.gpus.length === 0 || args.gpus.some(gpu => !Number.isInteger(gpu) || gpu < 0)) {
     throw new Error(`Invalid GPU list: ${args.gpus.join(",")}`);
   }
@@ -89,18 +93,24 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
   if (qwen3Explicit && qwen35Explicit) throw new Error("--qwen3 and --qwen35 are mutually exclusive");
   if (qwen35Explicit && args.useFp8) throw new Error("--fp8 is not supported with --qwen35");
   if (glm51Explicit && args.useFp8) throw new Error("--fp8 is not supported with --glm51 (use --qwen3 --fp8)");
-  if (args.useNvfp4 && !args.useGlm51) throw new Error("--nvfp4 requires the GLM model");
+  if (args.useGlm53Flash && (glm51Explicit || qwen3Explicit || qwen35Explicit || args.useFp8)) {
+    throw new Error("--glm53-flash cannot be combined with another model selection");
+  }
+  if (args.useGlm53Flash && (args.cp || args.mtp > 0)) throw new Error("--glm53-flash does not support --cp or --mtp yet");
+  if (args.useNvfp4 && !args.useGlm51 && !args.useGlm53Flash) throw new Error("--nvfp4 requires the GLM model");
   if (!Number.isInteger(args.mtp) || args.mtp < 0) throw new Error(`Invalid --mtp draft depth: ${args.mtp}`);
   return args;
 }
 
 export function modelLabel(args: ModelCliArgs): string {
+  if (args.useGlm53Flash) return "GLM-5.3-Flash-NVFP4";
   if (args.useQwen35) return "Qwen3.5-0.8B";
   if (args.useGlm51) return args.glm51Small ? "GLM-5.1-small" : (args.useNvfp4 ? "GLM-5.1-NVFP4" : "GLM-5.1");
   return args.useFp8 ? "Qwen3-0.6B-FP8" : "Qwen3-0.6B";
 }
 
 export function resolveModelSelection(args: ModelCliArgs): { modelDir: string, repoId: string } {
+  if (args.useGlm53Flash) return { modelDir: args.modelDir ?? GLM53_FLASH_REPO, repoId: GLM53_FLASH_REPO };
   const repoId = args.useGlm51 ? GLM51_REPO
     : args.useQwen35 ? QWEN35_REPO
       : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO);
@@ -119,7 +129,9 @@ export function createDeviceOps(args: ModelCliArgs): { ops: DeviceOps, gpuDevice
 }
 
 export async function loadModel(ops: DeviceOps, args: ModelCliArgs, modelDir: string): Promise<ChatModel> {
-  const model = await (args.useGlm51
+  const model = await (args.useGlm53Flash
+    ? Glm53FlashModel.fromPretrained(ops, modelDir)
+    : args.useGlm51
     ? Glm51Model.fromPretrained(ops, modelDir, args.cp, args.mtp > 0)
     : args.useQwen35
       ? Qwen35Model.fromPretrained(ops, modelDir)

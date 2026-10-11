@@ -9,6 +9,8 @@ import { SafeTensorFile } from "./safetensors";
 import { Tensor, type MoeRoutingOptions, type MoeRoutingResult } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
+import type { MhcPreResult } from "./device_ops";
+import { validateKdaScan, validateKdaNorm, validateMhcPre, validateMhcPost, validateMhcStreams } from "./flash_hybrid_validation";
 
 // Fall back to the read-based (pull) CP merge; the push path is the default.
 export const CP_MERGE_PULL = process.env.SLOPLLM_CP_MERGE_PULL === "1";
@@ -2358,6 +2360,61 @@ interface CommunicationPool {
 }
 
 export class ParallelOps implements DeviceOps {
+  kdaScan(query: Tensor, state: Tensor, key: Tensor, value: Tensor, forget: Tensor, beta: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, lowerBound = -5): Tensor {
+    validateKdaScan(this, query, state, key, value, forget, beta, aLog, dtBias, cuSeqlens, lowerBound);
+    const [q, s, k, v, f, b, a, dt, cu] = [query, state, key, value, forget, beta, aLog, dtBias, cuSeqlens].map(t => this.cast(t));
+    this.assertParallel("kdaScan query", q, TensorParallelism.Row, TensorParallelism.Replicated);
+    for (const t of [s, k, v, f, b]) this.assertParallel("kdaScan state/activation", t, q.parallelism);
+    const weightPar = q.parallelism === TensorParallelism.Row ? TensorParallelism.Column : TensorParallelism.Replicated;
+    for (const t of [a, dt]) this.assertParallel("kdaScan decay weight", t, weightPar);
+    this.assertParallel("kdaScan cuSeqlens", cu, TensorParallelism.Replicated);
+    const shards = this.devices.map((device, i) => device.kdaScan(q.shards[i], s.shards[i], k.shards[i], v.shards[i], f.shards[i], b.shards[i], a.shards[i], dt.shards[i], cu.shards[i], lowerBound));
+    return this.wrapShards(query.workspace, shards, query.shape, "BF16", q.parallelism);
+  }
+
+  kdaNorm(input: Tensor, gate: Tensor, weight: Tensor, eps: number): Tensor {
+    validateKdaNorm(this, input, gate, weight, eps);
+    const x = this.cast(input), g = this.cast(gate), w = this.cast(weight);
+    this.assertParallel("kdaNorm input", x, TensorParallelism.Row, TensorParallelism.Replicated);
+    this.assertParallel("kdaNorm gate", g, x.parallelism);
+    this.assertParallel("kdaNorm weight", w, TensorParallelism.Replicated);
+    const shards = this.devices.map((device, i) => device.kdaNorm(x.shards[i], g.shards[i], w.shards[i], eps));
+    return this.wrapShards(input.workspace, shards, input.shape, "BF16", x.parallelism);
+  }
+
+  mhcPre(input: Tensor, fn: Tensor, base: Tensor, scale: Tensor, normEps = 1e-5, hcEps = 1e-6, iters = 20): MhcPreResult {
+    validateMhcPre(this, input, fn, base, scale, normEps, hcEps, iters);
+    const x = this.cast(input), f = this.cast(fn), b = this.cast(base), s = this.cast(scale);
+    for (const t of [x, f, b, s]) this.assertParallel("mhcPre", t, TensorParallelism.Replicated);
+    const result = this.devices.map((device, i) => device.mhcPre(x.shards[i], f.shards[i], b.shards[i], s.shards[i], normEps, hcEps, iters));
+    const wrap = (shards: Tensor[], shape: number[], type: "BF16" | "F32") =>
+      this.wrapShards(input.workspace, shards, shape, type, TensorParallelism.Replicated);
+    return {
+      collapsed: wrap(result.map(r => r.collapsed), [input.shape[0], input.shape[2]], "BF16"),
+      post: wrap(result.map(r => r.post), [input.shape[0], 4], "F32"),
+      comb: wrap(result.map(r => r.comb), [input.shape[0], 4, 4], "F32"),
+    };
+  }
+
+  mhcPost(residual: Tensor, block: Tensor, post: Tensor, comb: Tensor): Tensor {
+    validateMhcPost(this, residual, block, post, comb);
+    const r = this.cast(residual), b = this.cast(block), p = this.cast(post), c = this.cast(comb);
+    for (const t of [r, p, c]) this.assertParallel("mhcPost", t, TensorParallelism.Replicated);
+    this.assertParallel("mhcPost block", b, TensorParallelism.Replicated, TensorParallelism.PartialSum);
+    if (b.parallelism === TensorParallelism.PartialSum) b.allReduce();
+    const shards = this.devices.map((device, i) => device.mhcPost(r.shards[i], b.shards[i], p.shards[i], c.shards[i]));
+    return this.wrapShards(residual.workspace, shards, residual.shape, "BF16", TensorParallelism.Replicated);
+  }
+
+  mhcStreams(input: Tensor, expand: boolean): Tensor {
+    validateMhcStreams(this, input, expand);
+    const x = this.cast(input);
+    this.assertParallel("mhcStreams", x, TensorParallelism.Replicated);
+    const shape = expand ? [input.shape[0], 4, input.shape[1]] : [input.shape[0], input.shape[2]];
+    const shards = this.devices.map((device, i) => device.mhcStreams(x.shards[i], expand));
+    return this.wrapShards(input.workspace, shards, shape, "BF16", TensorParallelism.Replicated);
+  }
+
   readonly devices: readonly GlmOps[];
   readonly worldSize: number;
   synchronizeListeners: WeakRef<WorkspaceBase>[] = [];
