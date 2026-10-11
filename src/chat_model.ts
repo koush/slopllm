@@ -480,16 +480,44 @@ export abstract class ChatModel extends WorkspaceBase {
   protected abstract loadTensor(name: string, meta: TensorMeta, source: CheckpointTensor): Promise<void>;
 
   /**
+   * Executor replay (SLOPLLM_SKIP_MMAP_LOAD) reconstructs allocation
+   * layouts only: model loading must not read the checkpoint or move data.
+   * mmapLoad already skips its transfer at the tensor layer; staged uploads
+   * and source reads are guarded here (port plan §11.1). h2d itself is never
+   * disabled — executors upload tokens and planning data while serving.
+   */
+  protected get loadReplay(): boolean {
+    return !!process.env.SLOPLLM_SKIP_MMAP_LOAD;
+  }
+
+  /** h2d enqueues asynchronously; staging must survive until the next drain. */
+  private pendingLoadBuffers: Buffer[] = [];
+
+  protected uploadStaged(tensor: Tensor, bytes: Buffer): void {
+    if (this.loadReplay) return;
+    this.pendingLoadBuffers.push(bytes);
+    tensor.h2d(bytes);
+  }
+
+  /** One transfer window at a time (§11.2): complete queued copies before reuse. */
+  protected async drainLoadTransfers(): Promise<void> {
+    await this.ops.synchronizeAsync();
+    this.pendingLoadBuffers.length = 0;
+  }
+
+  /**
    * Load one tensor's logical bytes into a device tensor: direct file
    * mapping when the bytes are physically contiguous, bounded host staging
-   * otherwise (e.g. lossless CSF scale expansion). Multiple strided specs
-   * fill disjoint destination regions of the same tensor.
+   * otherwise (e.g. CSF scale expansion). Multiple strided specs fill
+   * disjoint destination regions of the same tensor.
    */
   protected async loadTensorBytes(tensor: Tensor, source: CheckpointTensor, strided?: StridedMmap): Promise<void> {
     await this.loadTensorStrided(tensor, source, strided ? [strided] : []);
   }
 
   protected async loadTensorStrided(tensor: Tensor, source: CheckpointTensor, specs: StridedMmap[]): Promise<void> {
+    // Allocation-only replay: no source reads, no expansion, no transfers.
+    if (this.loadReplay) return;
     const mapping = source.mapping();
     if (mapping) {
       for (const spec of specs) {
@@ -502,7 +530,7 @@ export abstract class ChatModel extends WorkspaceBase {
     }
     const bytes = source.read();
     if (!specs.length) {
-      tensor.h2d(bytes);
+      this.uploadStaged(tensor, bytes);
       return;
     }
     const out = Buffer.alloc(tensor.bytes);
@@ -512,7 +540,7 @@ export abstract class ChatModel extends WorkspaceBase {
         bytes.copy(out, spec.dstOffset + r * spec.dstPitch, src, src + spec.width);
       }
     }
-    tensor.h2d(out);
+    this.uploadStaged(tensor, out);
   }
 
   /** The checkpoint source opened by loadWeights (closed after loading). */
@@ -591,12 +619,20 @@ export abstract class ChatModel extends WorkspaceBase {
         loadedTensors += batch.length;
         const layerMatch = layerRe.exec(batch[batch.length - 1]);
         if (layerMatch) currentLayer = Math.max(currentLayer, Number(layerMatch[1]));
+        // Serialized completion (port plan §11.2): one transfer window at a
+        // time. With SLOPLLM_LOAD_BATCH_SIZE=1 this is exactly one logical
+        // tensor in flight; TP shard copies for that tensor may overlap.
+        await this.drainLoadTransfers();
         drawProgress(false);
       }
-
-      await this.ops.synchronizeAsync();
     } finally {
-      // Close shard handles and mappings on failure as well as success.
+      // Drain pending transfers before closing/unmapping the source, on
+      // success and on failure (§11.2).
+      try {
+        await this.drainLoadTransfers();
+      } catch {
+        // the original load error wins
+      }
       source.close();
     }
 

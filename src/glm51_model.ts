@@ -240,9 +240,13 @@ export class Glm51Model extends ChatModel {
     // input_scale/intermediate_scale fields at A4-preparation time; loading
     // never applies that reciprocal itself.
     if (name.endsWith(".input_scale")) {
-      validateCalibrationScalar(name, meta, source.read());
+      // Replay reconstructs the allocation only; owner loading validates and
+      // uploads through the guarded helper (port plan §11.1).
       const tensor = this.alloc(meta.shape, "F32", name, this.weightParallelism(name));
-      await this.loadTensorBytes(tensor, source);
+      if (!this.loadReplay) {
+        validateCalibrationScalar(name, meta, source.read());
+        await this.loadTensorBytes(tensor, source);
+      }
       return;
     }
     // NVFP4 scale tensors: rename to match linear() lookup convention
@@ -266,9 +270,11 @@ export class Glm51Model extends ChatModel {
     if (meta.dtype === "F32" && !name.endsWith(".weight_scale_2")) {
       const numElements = meta.shape.reduce((a, b) => a * b, 1);
       const tensor = this.alloc(meta.shape, "BF16", storeName, par);
-      const f32Bytes = source.read();
-      const f32Arr = new Float32Array(f32Bytes.buffer, f32Bytes.byteOffset, numElements);
-      tensor.h2d(f32ToBf16Bytes(f32Arr));
+      if (!this.loadReplay) {
+        const f32Bytes = source.read();
+        const f32Arr = new Float32Array(f32Bytes.buffer, f32Bytes.byteOffset, numElements);
+        this.uploadStaged(tensor, f32ToBf16Bytes(f32Arr));
+      }
 
       if (this.cfg.tieWordEmbeddings && name === "model.embed_tokens.weight" && !this.tensors.has("lm_head.weight")) {
         const lmHead = this.alloc(meta.shape, "BF16", "lm_head.weight", TensorParallelism.Column);
