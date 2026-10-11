@@ -23,13 +23,14 @@ function read(tensor: Tensor, ops: GlmOps): Buffer {
   return result;
 }
 
-for (const [count, N, K] of [[1, 130, 128], [2, 130, 128], [4, 130, 6144], [8, 130, 128], [64, 130, 128], [64, 130, 6144], [512, 256, 6144]]) {
+for (const [count, N, K] of [[1, 130, 128], [2, 130, 128], [4, 130, 6144], [8, 130, 128], [64, 130, 128], [64, 130, 6144], [512, 256, 6144], [512, 6144, 256]]) {
   it(`hybrid MoE partitions disjoint outputs and replays changing routes: ${count}x${N}x${K}`, () => {
     using ops = new GlmOps(0);
     using ws = new WorkspaceBase(ops);
     const addon = getNativeAddon();
     const experts = 256;
-    const topK = Math.min(8, count);
+    // Down gathers a distinct activation per route, rather than per token.
+    const topK = K === 256 ? 1 : Math.min(8, count);
     const inputs = Array.from({ length: count / topK * K }, (_, i) => ((i * 7) % 23 - 11) / 32);
     using input = ws.alloc([count / topK, K], "BF16");
     input.h2d(bf16(inputs));
@@ -110,6 +111,16 @@ for (const [count, N, K] of [[1, 130, 128], [2, 130, 128], [4, 130, 6144], [8, 1
           ops.graphLaunch(exec);
           const want = read(reference, ops);
           assert.deepEqual(read(output, ops), want, `threshold ${threshold}: graph result`);
+          if (K === 256 && N === 6144) {
+            using routing = ws.alloc([count], "BF16");
+            routing.h2d(bf16(Array.from({ length: count }, (_, i) => (1 + (i * 3) % 8) / 16)));
+            using combined = ws.alloc([count / 8, N], "BF16");
+            using fused = ws.alloc([count / 8, N], "BF16");
+            addon.scatterAddRows(ops.ctx, combined.data, output.data, routing.data, 8, N, count / 8, 0);
+            addon.nvfp4MulMatIdReduce(ops.ctx, fused.data, input.data, wp.data, sp.data, s2p.data,
+              ids.data, routing.data, count / 8);
+            assert.deepEqual(read(combined, ops), read(fused, ops), "hybrid down plus weighted combine matches fused down");
+          }
           if (K === 128) {
             const fp4 = [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6];
             const expected: number[] = [];

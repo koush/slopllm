@@ -37,7 +37,7 @@ function combine(down: Tensor, routing: Tensor, topK: number, rows: number): Ten
   return out;
 }
 
-for (const [worldSize, rows] of [[1, 1], [2, 1], [1, 32], [2, 32]]) {
+for (const [worldSize, rows] of [[1, 1], [2, 1], [1, 32], [2, 32], [1, 64], [2, 64]]) {
   it(`swiGluMlpMoeReduce matches decomposed NVFP4 MLP on ${worldSize} GPU(s), ${rows} rows, with lazy local waits`, () => {
     using device0 = new GlmOps(0);
     using device1 = worldSize === 2 ? new GlmOps(1) : undefined;

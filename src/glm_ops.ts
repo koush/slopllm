@@ -29,6 +29,14 @@ const NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD = Number(process.env.SLOPLLM_NVFP4_MOE_
 // Eligible experts stay entirely on MMA, balanced across up-to-16-row tiles;
 // CUDA filters original routes by expert occupancy without a separate queue.
 const NVFP4_MOE_HYBRID_MIN_ROWS = Number(process.env.SLOPLLM_NVFP4_MOE_HYBRID_MIN_ROWS ?? 4);
+// Verification down uses MMA for experts with at least two rows, with CUDA
+// handling singleton routes. Zero retains fused CUDA down. Reuse gate/up
+// metadata when cutoffs match; otherwise rebucket into the same allocation.
+// K=256 needs no split-K partials, only a separate weighted top-8 combine.
+const NVFP4_MOE_HYBRID_DOWN_MIN_ROWS = Number(process.env.SLOPLLM_NVFP4_MOE_HYBRID_DOWN_MIN_ROWS ?? 2);
+if (!Number.isInteger(NVFP4_MOE_HYBRID_DOWN_MIN_ROWS) || NVFP4_MOE_HYBRID_DOWN_MIN_ROWS < 0) {
+  throw new Error("SLOPLLM_NVFP4_MOE_HYBRID_DOWN_MIN_ROWS must be a non-negative integer");
+}
 if (!Number.isInteger(NVFP4_MOE_HYBRID_MIN_ROWS) || NVFP4_MOE_HYBRID_MIN_ROWS < 0) {
   throw new Error("SLOPLLM_NVFP4_MOE_HYBRID_MIN_ROWS must be a non-negative integer");
 }
@@ -754,15 +762,16 @@ export class GlmTensor extends Tensor {
       return out;
     }
     super.swiGluMlpMoe(inputs, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
+    const addon = getNativeAddon();
+    const ctx = this.ops.ctx;
+    const hybrid = NVFP4_MOE_HYBRID_MIN_ROWS > 0 && count >= 256 &&
+      inputs.gate.length <= 256 && inputs.up.length === inputs.gate.length &&
+      inputs.gate[0].type === "U8" && inputs.up[0].type === "U8";
+    using plan = hybrid ? this.workspace.allocRaw(addon.moeHybridWorkspaceSize(count, moeIntermediate)) : undefined;
     using activated = (() => {
-      if (NVFP4_MOE_HYBRID_MIN_ROWS > 0 && count >= 256 &&
-          inputs.gate.length <= 256 && inputs.up.length === inputs.gate.length &&
-          inputs.gate[0].type === "U8" && inputs.up[0].type === "U8") {
-        const addon = getNativeAddon();
-        const ctx = this.ops.ctx;
+      if (plan) {
         const gatePtrs = this.getMoeNvfp4Ptrs(inputs.gate, `${pfx}.gate_proj`);
         const upPtrs = this.getMoeNvfp4Ptrs(inputs.up, `${pfx}.up_proj`);
-        using plan = this.workspace.allocRaw(addon.moeHybridWorkspaceSize(count, moeIntermediate));
         using gateOut = this.workspace.alloc([count, moeIntermediate], this.type);
         using upOut = this.workspace.alloc([count, moeIntermediate], this.type);
         addon.moeHybridPrepare(ctx, topkIndicesFlat.data, count, inputs.gate.length,
@@ -806,6 +815,29 @@ export class GlmTensor extends Tensor {
     }
     const out = this.workspace.alloc([count / topK, hs], this.type);
     const ptrs = this.getMoeNvfp4Ptrs(inputs.down, `${pfx}.down_proj`);
+    if (plan && NVFP4_MOE_HYBRID_DOWN_MIN_ROWS > 0 && inputs.down.length === inputs.gate.length) {
+      if (NVFP4_MOE_HYBRID_DOWN_MIN_ROWS !== NVFP4_MOE_HYBRID_MIN_ROWS) {
+        addon.moeHybridPrepare(ctx, topkIndicesFlat.data, count, inputs.down.length,
+          NVFP4_MOE_HYBRID_DOWN_MIN_ROWS, plan.data);
+      }
+      using downOut = this.workspace.alloc([count, hs], this.type);
+      // Each route now has its own post-SwiGLU activation: input topK is one.
+      // K=256 is unsplit, so the gate/up plan allocation is sufficient.
+      using mmaStream = this.ops.withStream(true, () => {
+        addon.moeHybridMma(ctx, downOut.data, activated.data, ptrs.weightPtrs.data,
+          ptrs.scalePtrs.data, ptrs.scale2Ptrs.data, topkIndicesFlat.data,
+          1, count, hs, moeIntermediate, plan.data);
+      });
+      using cudaStream = this.ops.withStream(() => {
+        addon.moeHybridCuda(ctx, downOut.data, activated.data, ptrs.weightPtrs.data,
+          ptrs.scalePtrs.data, ptrs.scale2Ptrs.data, topkIndicesFlat.data,
+          1, count, hs, moeIntermediate, plan.data);
+      });
+      mmaStream.streamWaitEvent();
+      cudaStream.streamWaitEvent();
+      addon.scatterAddRows(ctx, out.data, downOut.data, scales.data, topK, hs, count / topK, 0);
+      return out;
+    }
     getNativeAddon().nvfp4MulMatIdReduce(this.ops.ctx, out.data, activated.data,
       ptrs.weightPtrs.data, ptrs.scalePtrs.data, ptrs.scale2Ptrs.data,
       topkIndicesFlat.data, scales.data, count / topK);

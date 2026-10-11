@@ -16,4 +16,6 @@ struct alignas(128) MoeHybridPlan {
     // their rows evenly across ceil(rows/16) tiles, each at least two rows.
     int2 mma_tasks[MOE_HYBRID_MAX_ROUTES];
     int min_rows;
+    // Compact sparse-expert routes for the wide-output, short-K down worker.
+    int cuda_routes[MOE_HYBRID_MAX_ROUTES];
 };

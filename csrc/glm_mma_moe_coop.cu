@@ -37,8 +37,9 @@ namespace {
 
 // One thread per expert scans bucket, CUDA, and MMA counts together; route
 // scatter stays in shared memory until a coalesced write publishes the plan.
-// The kernel boundary publishes metadata to both compute streams. CUDA uses
-// expert-level ownership directly, so only MMA needs a work queue.
+// The kernel boundary publishes metadata to both compute streams. Gate/up
+// CUDA filters original routes; down uses a compact queue to avoid empty CTAs
+// across its much wider output dimension.
 __global__ void hybrid_prepare_kernel(const int* ids, int count, int num_experts,
                                       int min_rows, MoeHybridPlan* plan) {
     __shared__ int counts[256];
@@ -115,6 +116,10 @@ __global__ void hybrid_prepare_kernel(const int* ids, int count, int num_experts
     }
     for (int tile = 0; tile < tiles; ++tile) {
         plan->mma_tasks[mma_base + tile] = make_int2(tid, tile);
+    }
+    const int cuda_base = sum.y - cuda_rows;
+    for (int row = 0; row < cuda_rows; ++row) {
+        plan->cuda_routes[cuda_base + row] = sorted[row_base + row];
     }
 }
 
@@ -974,14 +979,14 @@ int hybrid_split_k(int K) {
     return 1;
 }
 
-template <int SPLIT_K>
+template <int SPLIT_K, int TN = 64, int TK = 64, int NWARPS = 2>
 void launch_hybrid_worker(GlmCtx* ctx, void* output, const void* input,
                           const void* const* weights, const void* const* scales,
                           const void* const* scales2, int top_k, int count, int N, int K,
                           const MoeHybridPlan* plan) {
     // Decode tuning: narrower output tiles and split-K expose more work;
     // direct dequant + K=64 staging reduce per-CTA instruction/barrier cost.
-    constexpr int TM = MOE_HYBRID_TILE_ROWS, TN = 64, TK = 64, DEPTH = 2, NWARPS = 2;
+    constexpr int TM = MOE_HYBRID_TILE_ROWS, DEPTH = 2;
     const size_t smem = sizeof(CoopSmem<TM, TN, DEPTH, NWARPS, 256, false, TK>);
     auto* partial = reinterpret_cast<float*>(const_cast<MoeHybridPlan*>(plan) + 1);
     // Every MMA task owns at least two routes, including partial tiles.
@@ -1040,6 +1045,11 @@ void glm_moe_hybrid_mma(GlmCtx* ctx, void* output, const void* input,
                         int top_k, int count, int N, int K, const void* workspace) {
     cudaSetDevice(ctx->device_id);
     const auto* plan = static_cast<const MoeHybridPlan*>(workspace);
+    if (K == 256 && N == 6144 && top_k == 1) {
+        // Short-K down uses wider output tiles and four warps, without split-K.
+        launch_hybrid_worker<1, 128, 64, 4>(ctx, output, input, weight_ptrs, scale_ptrs, scale2_ptrs, top_k, count, N, K, plan);
+        return;
+    }
     if (hybrid_split_k(K) == 8) {
         launch_hybrid_worker<8>(ctx, output, input, weight_ptrs, scale_ptrs, scale2_ptrs, top_k, count, N, K, plan);
     }

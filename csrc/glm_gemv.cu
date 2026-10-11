@@ -1231,6 +1231,60 @@ nvfp4_linear_splitk_kernel(
     }
 }
 
+// Unfused hybrid down: compact sparse-expert queue, four lanes per output
+// column, and a bounded grid. No work is launched per MMA-owned route/column.
+__global__ void __launch_bounds__(128)
+nvfp4_hybrid_down_kernel(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    const uint8_t* const* __restrict__ weight_ptrs,
+    const __nv_fp8_e4m3* const* __restrict__ scale_ptrs,
+    const float* const* __restrict__ scale2_ptrs,
+    const int* __restrict__ expert_ids,
+    const MoeHybridPlan* __restrict__ plan) {
+    constexpr int N = 6144, K = 256, COLS = 32;
+    const int inner = threadIdx.x % 4;
+    const int col = threadIdx.x / 4;
+    for (int work = blockIdx.x; work < plan->cuda_count * (N / COLS); work += gridDim.x) {
+        const int route = plan->cuda_routes[work / (N / COLS)];
+        const int row = (work % (N / COLS)) * COLS + col;
+        const int expert = expert_ids[route];
+        const auto* x = input + (size_t)route * K;
+        const auto* w = weight_ptrs[expert] + (size_t)row * (K / 2);
+        const auto* scales = scale_ptrs[expert] + (size_t)row * (K / NVFP4_QUANT_GROUP);
+        const float scale2 = *scale2_ptrs[expert];
+        float sum = 0.0f;
+        #pragma unroll
+        for (int g = inner; g < K / NVFP4_QUANT_GROUP; g += 4) {
+            const auto* xv = reinterpret_cast<const uint4*>(x + g * NVFP4_QUANT_GROUP);
+            const uint4 xw[2] = {xv[0], xv[1]};
+            const auto* xpair = reinterpret_cast<const __nv_bfloat162*>(xw);
+            const uint32_t w0 = *reinterpret_cast<const uint32_t*>(w + g * 8);
+            const uint32_t w1 = *reinterpret_cast<const uint32_t*>(w + g * 8 + 4);
+            const float scale = fp8_e4m3_to_float(scales[g]) * scale2;
+            float2 pair = {0.0f, 0.0f};
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const auto weight = fp4x2_to_bfloat162((w0 >> (j * 8)) & 0xff);
+                pair.x = bf16_fma_f32(weight.x, xpair[j].x, pair.x);
+                pair.y = bf16_fma_f32(weight.y, xpair[j].y, pair.y);
+            }
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const auto weight = fp4x2_to_bfloat162((w1 >> (j * 8)) & 0xff);
+                pair.x = bf16_fma_f32(weight.x, xpair[4 + j].x, pair.x);
+                pair.y = bf16_fma_f32(weight.y, xpair[4 + j].y, pair.y);
+            }
+            sum = fmaf(pair.x + pair.y, scale, sum);
+        }
+        sum += __shfl_xor_sync(0xffffffff, sum, 2);
+        sum += __shfl_xor_sync(0xffffffff, sum, 1);
+        if (inner == 0) {
+            output[(size_t)route * N + row] = __float2bfloat16(sum);
+        }
+    }
+}
+
 // Production TP=8 MoE down shape: K=256, N=6144, eight experts per token.
 // Four warps compute two experts each. A CTA owns sixteen output columns, so the
 // weighted reduction is deterministic and needs no global intermediate/atomics.
@@ -1441,6 +1495,15 @@ void glm_moe_hybrid_cuda(GlmCtx* ctx, void* output, const void* input,
                          const void* const* scale2_ptrs, const int* expert_ids,
                          int top_k, int count, int N, int K, const void* workspace) {
     cudaSetDevice(ctx->device_id);
+    if (K == 256 && N == 6144 && top_k == 1) {
+        nvfp4_hybrid_down_kernel<<<1024, 128, 0, GLM_STREAM(ctx)>>>(
+            static_cast<__nv_bfloat16*>(output), static_cast<const __nv_bfloat16*>(input),
+            reinterpret_cast<const uint8_t* const*>(weight_ptrs),
+            reinterpret_cast<const __nv_fp8_e4m3* const*>(scale_ptrs),
+            reinterpret_cast<const float* const*>(scale2_ptrs), expert_ids,
+            static_cast<const MoeHybridPlan*>(workspace));
+        return;
+    }
     const int grid = count * ((N + GEMV_ROWS_PER_BLOCK * 2 - 1) / (GEMV_ROWS_PER_BLOCK * 2));
     if (K == 6144) {
         nvfp4_mul_mat_id_kernel<2, true, true><<<grid, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
