@@ -34,3 +34,5 @@ import "./test_cuda_ipc";
 import "./test_mtp_sampling";
 import "./test_moe_down_reduce";
 import "./test_moe_hybrid";
+import "./test_csf_codec";
+import "./test_csf_checkpoint";
