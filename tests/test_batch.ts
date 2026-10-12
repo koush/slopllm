@@ -4,12 +4,14 @@ import { CaptureManager } from "../src/capture-manager";
 import { SamplingParams, makeSamplingParams, type ChatCache, type ChatModel } from "../src/chat_model";
 import { GlmOps } from "../src/glm_ops";
 import { Qwen35Model } from "../src/qwen35_model";
-import type { Qwen35GdnState } from "../src/qwen35_gdn_state";
 import { Qwen3Model } from "../src/qwen3_model";
 import { SamplingWorkspace } from "../src/sampling";
 import { Tensor } from "../src/tensor";
 import { ExecutionWorkspace } from "../src/execution-workspace";
 import { PagedKVCache } from "../src/paged_kv";
+import type { DeviceOps } from "../src/device_ops";
+import { createDeviceOps, parseModelArgs } from "../src/model_cli";
+import { ParallelOps } from "../src/parallel_ops";
 import { generateBatchTokens, generateTokens } from "./test_helper";
 
 import { PAGE_SIZE } from "../src/paged_kv";
@@ -609,22 +611,46 @@ describe("Qwen3-0.6B batch tests", () => {
 });
 
 describe("Qwen3.5-0.8B chunked prefill tests", () => {
-  let ops: GlmOps;
+  let ops: DeviceOps;
+  let gpuDevices: GlmOps[];
   let model: Qwen35Model;
   let ws: ExecutionWorkspace;
   const PROMPT = [151643, 151644, 151645, 1, 2, 3, 4, 5, 6, 7];
 
   before(async () => {
-    const deviceId = parseInt(process.env.SLOPLLM_GPU ?? "0", 10);
-    ops = new GlmOps(deviceId);
+    ({ ops, gpuDevices } = createDeviceOps(parseModelArgs(["--qwen35"])));
     model = await Qwen35Model.fromPretrained(ops, "Qwen/Qwen3.5-0.8B");
     ws = new ExecutionWorkspace(ops, 1, 128);
   });
 
   after(() => {
-    ws[Symbol.dispose]();
-    model.free();
-    ops.free();
+    ops?.synchronize();
+    ws?.[Symbol.dispose]();
+    model?.free();
+    if (ops instanceof ParallelOps) ops.free();
+    for (const device of gpuDevices ?? []) device.free();
+  });
+
+  it("prefill and decode leave inactive recurrent capacity slots untouched", async () => {
+    using cache = model.createChatCache(8, 2, 128);
+    cache.reset(1);
+    const tensors = [...cache.convState, ...cache.recurrentState].filter(t => t !== undefined);
+    const snapshotInactive = () => tensors.map(t => {
+      using inactive = t.narrow(1, 1);
+      const bytes = Buffer.alloc(inactive.bytes);
+      inactive.d2h(bytes);
+      return bytes;
+    });
+    for (const t of tensors) {
+      using inactive = t.narrow(1, 1);
+      inactive.fill(.25, inactive.numElements);
+    }
+    const inactive = snapshotInactive();
+    await model.executePrefill(ws, cache, [[1, 2, 3, 4]]);
+    assert.deepEqual(snapshotInactive(), inactive);
+    ws.forwardEagerDecode(model, [cache.sequences[0].targetToken!], cache);
+    assert.deepEqual(snapshotInactive(), inactive);
+    ws.assertClear();
   });
 
   it("Qwen3.5 phased prefill keeps unequal halves' sequence boundaries independent", async () => {
@@ -648,8 +674,7 @@ describe("Qwen3.5-0.8B chunked prefill tests", () => {
         await model.executePrefill(ws, cache, [prompt.slice(0, 4)]);
         await model.executePrefill(ws, cache, [prompt.slice(4)]);
       }
-      const { gdnState } = cache as ChatCache & { gdnState: Qwen35GdnState };
-      const state = [...gdnState.convState, ...gdnState.recurrentState].filter(Boolean).map(tensor => {
+      const state = [...cache.convState, ...cache.recurrentState].filter(t => t !== undefined).map(tensor => {
         const bytes = Buffer.alloc(tensor.bytes);
         tensor.d2h(bytes);
         return bytes;
@@ -663,9 +688,8 @@ describe("Qwen3.5-0.8B chunked prefill tests", () => {
   it("pending-token decode preserves Qwen3.5 recurrent state across restarts", async () => {
     using cache = model.createChatCache(32, 1, 128);
     const prompt = [1, 2, 3, 4, 5, 6, 7];
-    const { gdnState } = cache as ChatCache & { gdnState: Qwen35GdnState };
-    const snapshot = () => [...gdnState.convState, ...gdnState.recurrentState]
-      .filter(Boolean).map(tensor => {
+    const snapshot = () => [...cache.convState, ...cache.recurrentState]
+      .filter(t => t !== undefined).map(tensor => {
         const bytes = Buffer.alloc(tensor.bytes);
         tensor.d2h(bytes);
         return bytes;

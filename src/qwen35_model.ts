@@ -1,50 +1,42 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { ChatCache } from "./chat_model";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
 import { DeviceOps, StridedMmap, TensorParallelism } from "./device_ops";
 import { ExecutionState, ExecutionWorkspace } from "./execution-workspace";
 import { f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache, PAGE_SIZE } from "./paged_kv";
-import { Qwen35GdnState } from "./qwen35_gdn_state";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 
-class Qwen35ChatCache implements ChatCache {
+type Qwen35CacheConfig = Pick<Qwen35Config,
+  "numKeyValueHeads" | "headDim" | "numFullAttnLayers" | "layerTypes" |
+  "linearNumKeyHeads" | "linearKeyHeadDim" | "linearValueHeadDim" | "linearConvKernelDim">;
+
+export class Qwen35ChatCache extends PagedKVCache {
   constructor(
-    public readonly pagedKV: PagedKVCache,
-    public readonly gdnState: Qwen35GdnState,
-    public maxBatch = 1,
+    ops: DeviceOps,
+    cfg: Qwen35CacheConfig,
+    maxPages = 256,
+    maxBatch = 1,
     public maxSeqLen = 4096,
-  ) {}
-
-  getPagedKV(): PagedKVCache { return this.pagedKV; }
-
-  reset(batchSize: number): void {
-    this.pagedKV.reset(batchSize);
-    this.gdnState.reset();
+    pinned = false,
+  ) {
+    const convDim = cfg.linearNumKeyHeads * (2 * cfg.linearKeyHeadDim + cfg.linearValueHeadDim);
+    const recurrentStateSize = cfg.linearNumKeyHeads * cfg.linearKeyHeadDim * cfg.linearValueHeadDim;
+    const recurrentLayers = cfg.layerTypes.map(type => type === "linear_attention" ? {
+      convStateSize: convDim * (cfg.linearConvKernelDim - 1),
+      recurrentStateSize,
+    } : undefined);
+    super(ops, cfg.numKeyValueHeads, cfg.headDim, cfg.numFullAttnLayers, maxPages, maxBatch,
+      PAGE_SIZE, 0, 0, false, 0, [], pinned, recurrentLayers);
   }
 
-  free(): void {
-    this.gdnState.free();
-    this.pagedKV.free();
-  }
-
-  [Symbol.dispose](): void {
-    this.free();
-  }
-
-  prefixMatch(seqIdx: number, inputIds: number[]): number[] {
-    const batchSize = Math.max(this.pagedKV.sequences.length, 1);
-    this.pagedKV.reset(batchSize);
-    this.gdnState.reset();
+  override prefixMatch(_seqIdx: number, inputIds: number[]): number[] {
+    const batchSize = Math.max(this.sequences.length, 1);
+    this.reset(batchSize);
     return inputIds.slice();
-  }
-
-  reportTokens(seqIdx: number, tokens: number[], targetToken?: number): void {
-    this.pagedKV.reportTokens(seqIdx, tokens, targetToken);
   }
 
   prefillBatchPlanHook(
@@ -162,6 +154,8 @@ export class Qwen35Model extends ChatModel {
   }
 
   protected async loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void> {
+    // This backend executes the text decoder only.
+    if (name.startsWith("model.visual.")) return;
     const prefix = Qwen35Model.WEIGHT_PREFIX;
     const par = this.weightParallelism(name);
     const gemmaNormSuffixes = [
@@ -239,10 +233,8 @@ export class Qwen35Model extends ChatModel {
     }
   }
 
-  createChatCache(maxPages = 256, maxBatch = 1, maxSeqLen = 4096, _pageSize = 16, pinned = false): ChatCache {
-    const pagedKV = new PagedKVCache(this.ops, this.cfg.numKeyValueHeads, this.cfg.headDim, this.cfg.numFullAttnLayers, maxPages, maxBatch, PAGE_SIZE, 0, 0, false, 0, [], pinned);
-    const gdnState = new Qwen35GdnState(this.ops, this.cfg, maxBatch);
-    return new Qwen35ChatCache(pagedKV, gdnState, maxBatch, maxSeqLen);
+  createChatCache(maxPages = 256, maxBatch = 1, maxSeqLen = 4096, _pageSize = 16, pinned = false): Qwen35ChatCache {
+    return new Qwen35ChatCache(this.ops, this.cfg, maxPages, maxBatch, maxSeqLen, pinned);
   }
 
   private fullAttnCacheIdx(layerIdx: number): number {
@@ -257,7 +249,7 @@ export class Qwen35Model extends ChatModel {
     return normed.swiGluMlp(this.swiGluMlpWeights(`${pfx}.mlp`));
   }
 
-  private *gdnLayerPrefillPhased(state: ExecutionState, normed: Tensor, residual: Tensor, layerIdx: number, gdnState: Qwen35GdnState): Generator<void, { normed: Tensor, residual: Tensor }, void> {
+  private *gdnLayerPrefillPhased(state: ExecutionState, normed: Tensor, residual: Tensor, layerIdx: number): Generator<void, { normed: Tensor, residual: Tensor }, void> {
     const cfg = this.cfg;
     const ws = state.ws;
     const hs = cfg.hiddenSize;
@@ -271,15 +263,16 @@ export class Qwen35Model extends ChatModel {
     const pfx = `${Qwen35Model.WEIGHT_PREFIX}layers.${layerIdx}.linear_attn`;
     const S = state.totalTokens;
     const BS = S;
-    const batchSize = gdnState.batchSize;
+    const batchSize = state.batchSize;
 
     using qkvLinear = normed.linear(this.tensors.get(`${pfx}.in_proj_qkv.weight`)!);
     using aBuf = normed.linear(this.tensors.get(`${pfx}.in_proj_a.weight`)!);
     using bBuf = normed.linear(this.tensors.get(`${pfx}.in_proj_b.weight`)!);
     using zBuf = normed.linear(this.tensors.get(`${pfx}.in_proj_z.weight`)!);
 
-    const convState = gdnState.convState[layerIdx];
-    const recurrentState = gdnState.recurrentState[layerIdx];
+    const cache = state.cache.getPagedKV();
+    const convState = cache.convState[layerIdx]!;
+    const recurrentState = cache.recurrentState[layerIdx]!;
     const kernelSize = cfg.linearConvKernelDim;
 
     using convOut = ws.alloc([S, fullConvDim], "BF16", undefined, TensorParallelism.Row);
@@ -318,7 +311,7 @@ export class Qwen35Model extends ChatModel {
     return { normed: mlpResult.normed, residual: mlpResult.residual };
   }
 
-  private *gdnLayerDecodePhased(state: ExecutionState, normed: Tensor, residual: Tensor, layerIdx: number, gdnState: Qwen35GdnState): Generator<void, { normed: Tensor, residual: Tensor }, void> {
+  private *gdnLayerDecodePhased(state: ExecutionState, normed: Tensor, residual: Tensor, layerIdx: number): Generator<void, { normed: Tensor, residual: Tensor }, void> {
     const cfg = this.cfg;
     const ws = state.ws;
     const hs = cfg.hiddenSize;
@@ -337,8 +330,9 @@ export class Qwen35Model extends ChatModel {
     using bBuf = normed.linear(this.tensors.get(`${pfx}.in_proj_b.weight`)!);
     using zBuf = normed.linear(this.tensors.get(`${pfx}.in_proj_z.weight`)!);
 
-    const convState = gdnState.convState[layerIdx];
-    const recurrentState = gdnState.recurrentState[layerIdx];
+    const cache = state.cache.getPagedKV();
+    const convState = cache.convState[layerIdx]!;
+    const recurrentState = cache.recurrentState[layerIdx]!;
     const kernelSize = cfg.linearConvKernelDim;
 
     using convOut = qkvBuf.causalConv1dUpdate(convState, qkvBuf, this.tensors.get(`${pfx}.conv1d.weight`)!, fullConvDim, kernelSize, BS, fullConvStateStride);
@@ -434,8 +428,6 @@ export class Qwen35Model extends ChatModel {
 
   *forwardPhased(state: ExecutionState): Generator<void, Tensor, void> {
     const ws = state.ws;
-    const cache = state.cache as Qwen35ChatCache;
-    const { gdnState } = cache;
     const cfg = this.cfg;
     const hs = cfg.hiddenSize;
     const hd = cfg.headDim;
@@ -459,9 +451,9 @@ export class Qwen35Model extends ChatModel {
       let result: { normed: Tensor, residual: Tensor };
       if (cfg.layerTypes[i] === "linear_attention") {
         if (state.isDecode) {
-          result = yield* this.gdnLayerDecodePhased(state, normed.value, residual.value, i, gdnState);
+          result = yield* this.gdnLayerDecodePhased(state, normed.value, residual.value, i);
         } else {
-          result = yield* this.gdnLayerPrefillPhased(state, normed.value, residual.value, i, gdnState);
+          result = yield* this.gdnLayerPrefillPhased(state, normed.value, residual.value, i);
         }
       } else {
         result = yield* this.fullAttnLayerPhased(normed.value, residual.value, i, state, cos, sin);

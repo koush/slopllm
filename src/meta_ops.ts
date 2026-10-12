@@ -113,7 +113,8 @@ export class MetaTensor extends Tensor {
 
     argmax(): Tensor {
         super.argmax();
-        const { indices } = this.max();
+        const { values, indices } = this.max();
+        values[Symbol.dispose]();
         return indices;
     }
 

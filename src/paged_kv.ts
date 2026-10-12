@@ -9,6 +9,12 @@ import { PAGE_SIZE, Sequence, type Page } from "./paged_sequence";
 export { PAGE_SIZE, Sequence } from "./paged_sequence";
 export type { Page } from "./paged_sequence";
 
+/** Flattened per-sequence state sizes for a recurrent model layer. */
+export interface RecurrentLayerLayout {
+  convStateSize: number;
+  recurrentStateSize: number;
+}
+
 export class PageAllocationError extends Error {
   constructor(requiredPages: number, availablePages: number) {
     super(`allocAppendPages: need ${requiredPages} pages, ${availablePages} available`);
@@ -32,6 +38,9 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   vData: Tensor[];
   ckvData: Tensor[];
   kpeData: Tensor[];
+  /** Indexed by model layer, independently of the compact attention-cache indices. */
+  readonly convState: (Tensor | undefined)[];
+  readonly recurrentState: (Tensor | undefined)[];
   /** FlashInfer float workspace — shared across workspaces. Only allocated for non-sparse modes (MHA + dense MLA). */
   floatWs!: Tensor;
   availablePages: number[];
@@ -41,7 +50,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
 
   getPagedKV(): PagedKVCache { return this; }
 
-  constructor(ops: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, physicalPageSize = PAGE_SIZE, kvLoraRank = 0, qkRopeDim = 0, contextParallel = false, indexHeadDim = 0, sharedLayers: boolean[] = [], pinned = false) {
+  constructor(ops: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, physicalPageSize = PAGE_SIZE, kvLoraRank = 0, qkRopeDim = 0, contextParallel = false, indexHeadDim = 0, sharedLayers: boolean[] = [], pinned = false, recurrentLayers: readonly (RecurrentLayerLayout | undefined)[] = []) {
     super(ops);
     this.pinned = pinned;
     this.nKv = nKv;
@@ -60,6 +69,14 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.vData = [];
     this.ckvData = [];
     this.kpeData = [];
+    this.convState = new Array(recurrentLayers.length).fill(undefined);
+    this.recurrentState = new Array(recurrentLayers.length).fill(undefined);
+    for (const layout of recurrentLayers) {
+      if (layout && (!Number.isSafeInteger(layout.convStateSize) || layout.convStateSize <= 0 ||
+          !Number.isSafeInteger(layout.recurrentStateSize) || layout.recurrentStateSize <= 0)) {
+        throw new Error("PagedKVCache: recurrent state sizes must be positive integers");
+      }
+    }
     if (sharedLayers.length > 0 && sharedLayers.length < nLayers)
       throw new Error(`PagedKVCache: sharedLayers length ${sharedLayers.length} != nLayers ${nLayers}`);
     for (let i = 0; i < nLayers; i++) {
@@ -95,7 +112,23 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       this.floatWs = this.alloc([BATCH_FLOAT_WS_SIZE], "U8", "floatWs");
     }
 
+    for (let i = 0; i < recurrentLayers.length; i++) {
+      const layout = recurrentLayers[i];
+      if (!layout) continue;
+      // Live recurrent state stays on-device, including when KV pages are pinned.
+      this.convState[i] = this.alloc([maxBatch, layout.convStateSize], "BF16", `convState${i}`, TensorParallelism.Row);
+      this.recurrentState[i] = this.alloc([maxBatch, layout.recurrentStateSize], "F32", `recurrentState${i}`, TensorParallelism.Row);
+    }
+    this.resetRecurrentState();
     this.freeze();
+  }
+
+  protected resetRecurrentState(): void {
+    for (const tensors of [this.convState, this.recurrentState]) {
+      for (const tensor of tensors) {
+        if (tensor) tensor.fill(0, tensor.numElements);
+      }
+    }
   }
 
   reset(batchSize: number): void {
@@ -115,6 +148,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       }
     }
     this.sequences = Array.from({ length: batchSize }, () => new Sequence(this));
+    this.resetRecurrentState();
   }
 
   stageSequence(seqIdx: number, stagingKey: number): void {
