@@ -1149,7 +1149,22 @@ export class Glm51Model extends ChatModel {
       }
       return sequence.getTokenIds().at(-1);
     });
-    const chunk = this.selectPrefillChunk(inputIdsList, chunkSize, overlaps);
+    // Fix A (CORRECTED per consult #8 verdict Q3a): the tail-merge overflow is
+    // a caller-approved option ONLY for this qualified GLM single-request
+    // phased path. Eligibility inputs are fixed HERE, before any MTP rewind
+    // below — no try/catch retry on a mutated cache. `inputIdsList.length` is
+    // the ORIGINAL batch length (empty rows count, so [8198, []] stays
+    // ineligible), ws.maxSeqLen is the real workspace capacity (planPrefill
+    // rejects totals above it; merged halves must fit), and `mtp` mirrors the
+    // planner that will plan the merged chunk (planPrefillChunk's phased
+    // branch below). Unphased/batched/other-model/unqualified-chunk calls use
+    // the base selector defaults and keep today's greedy slicing. The
+    // per-call tailMergeMax = 0 hook reproduces pre-Fix-A splitting exactly.
+    const chunk = this.selectPrefillChunk(inputIdsList, chunkSize, overlaps, {
+      maxSeqLen: ws.maxSeqLen,
+      batchLength: inputIdsList.length,
+      mtp: this.mtp,
+    });
     // Only selected rows rewind; deferred rows retain their cache and history.
     for (let i = 0; i < sequences.length; i++) {
       if (chunk.prefillInputIdsList[i].length && overlaps[i] !== undefined) {

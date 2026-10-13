@@ -1,6 +1,6 @@
 import { createAsyncQueue } from "@scrypted/deferred";
 import type { CaptureManager } from "./capture-manager";
-import type { ChatCache, ChatModel, SamplingParams, TokenSelector } from "./chat_model";
+import { prefillTailMergeMaxSetting, selectPrefillTakes, type PrefillTailMergeContext, type ChatCache, type ChatModel, type SamplingParams, type TokenSelector } from "./chat_model";
 import type { DeviceOps } from "./device_ops";
 import type { ExecutionWorkspace } from "./execution-workspace";
 import { PageAllocationError, type PagedKVCache, type Sequence } from "./paged_kv";
@@ -552,6 +552,55 @@ export class GenerationScheduler {
       }
     });
     return plan.remainingInputIdsList.every(ids => !ids.length);
+  }
+
+  /** PREFILL_CHUNK_TRACE: integer replay of selectPrefillChunk's shared-budget
+      chunking over the remaining input, for the total_chunks field. Exact while
+      the batch is stable; best-effort when rows join or leave mid-prefill.
+      Fix A (CORRECTED per consult #8 verdict Q3c): runs the SAME pure policy
+      (selectPrefillTakes) as ChatModel.selectPrefillChunk — identical global
+      executed-row cap incl. prepended overlap, positive-take rule, replay
+      state, and overflow eligibility. The one-row restriction uses the
+      ORIGINAL batch length (this.active.length — EMPTY ROWS COUNT), not the
+      filtered nonempty rows below, so [8198, []] stays ineligible exactly as
+      in actual selection; the capacity/model/mode guard sees the same inputs
+      (ws.maxSeqLen, the model's mtp flag, the same env). total_chunks remains
+      explicitly best-effort for batch changes. */
+  private estimateRemainingPrefillChunks(mtp: boolean, chunkSize: number): number {
+    // Verdict Q3c: eligibility batch length is the ORIGINAL row count,
+    // including empty rows — NOT the filtered nonempty rows.
+    const ctx: PrefillTailMergeContext = {
+      chunkSize,
+      tailMergeMax: prefillTailMergeMaxSetting(),
+      maxSeqLen: this.options.ws.maxSeqLen,
+      batchLength: this.active.length,
+      mtp,
+    };
+    const rows = this.active.filter(request => request.inputIds.length > 0);
+    const lens = rows.map(request => request.inputIds.length);
+    const replay = rows.map(request => mtp && request.cachedTokenCount + request.prefillTokenCount > 0);
+    let chunks = 0;
+    while (lens.some(length => length > 0)) {
+      // Same pure policy as ChatModel.selectPrefillChunk: shared budget, greedy
+      // take, and (where eligible) the corrected bounded tail merge.
+      const takes = selectPrefillTakes(lens,
+        replay.map((active, i) => active && lens[i] ? 1 : 0), ctx);
+      let progress = false;
+      for (let i = 0; i < lens.length; i++) {
+        if (takes[i]) {
+          lens[i] -= takes[i];
+          replay[i] = mtp;
+          progress = true;
+        }
+      }
+      chunks++;
+      // No-progress (e.g. chunkSize 1 with a required overlap) stops the
+      // prediction here; actual selection throws in selectPrefillChunk.
+      if (!progress || chunks > 1000000) {
+        break;
+      }
+    }
+    return Math.max(1, chunks);
   }
 
   private async yieldToRequests(): Promise<void> {

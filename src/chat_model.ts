@@ -154,6 +154,143 @@ export interface ChatTemplateKwargs {
   [key: string]: unknown;
 }
 
+/** Fix A (tail-chunk merge), CORRECTED per Codex consult #8
+ *  (verdict-lowctx-20261013.md Q3a/Q3c/Q3f): a request left with an actual
+ *  tail of at most this many tokens after the greedy take is absorbed into
+ *  the current chunk ONLY through the caller-approved, capacity-guarded
+ *  overflow path below. Inclusive endpoint (<= 256 merges, 257 does not).
+ *  0 reproduces the pre-Fix-A splitting exactly (the fixture's split arm and
+ *  the per-call reproduction hook). One shared bound: the PREFILL_CHUNK_TRACE
+ *  integer mirror (GenerationScheduler.estimateRemainingPrefillChunks) runs
+ *  the SAME pure policy — never diverge the two. */
+export const PREFILL_TAIL_MERGE_MAX = 256;
+
+/** Serving-path runtime override (arm toggle for the maintenance-window
+ *  validation; RUNBOOK-window1 §7.2 arms 0/1/2 switch WITHOUT rebuilds).
+ *  Read at chunk-plan build time — where ChatModel.selectPrefillChunk and the
+ *  scheduler mirror resolve their tail ceiling — so one build serves every
+ *  arm:
+ *    SLOPLLM_TAIL_MERGE_MAX=0    arm 0 / reproduction hook: pre-Fix-A
+ *                                splitting exactly (same as per-call
+ *                                `tailMergeMax: 0`);
+ *    SLOPLLM_TAIL_MERGE_MAX=256  arm 1 default (inclusive endpoint);
+ *    unset                       PREFILL_TAIL_MERGE_MAX (shipped state).
+ *  Values must be safe integers >= 0; anything else fails loudly at plan
+ *  time. The selector and the mirror share this one resolver — never let the
+ *  two diverge (verdict Q3c). */
+export function prefillTailMergeMaxSetting(): number {
+  const raw = process.env.SLOPLLM_TAIL_MERGE_MAX;
+  if (raw === undefined || raw === "") {
+    return PREFILL_TAIL_MERGE_MAX;
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Invalid SLOPLLM_TAIL_MERGE_MAX: ${raw}`);
+  }
+  return value;
+}
+
+/** The qualified execution-row budget the 256-token ceiling was sized against
+ *  (verdict Q3f: 256/8192 ~= 3.1%; other chunk sizes are NOT qualified — with
+ *  small C a fixed 256 would invalidate existing chunk-budget behavior). */
+export const PREFILL_TAIL_MERGE_QUALIFIED_CHUNK_SIZE = 8192;
+
+/** Phased-prefill row threshold — must match the actual planner predicates
+ *  (planPrefillChunk in this file and the GLM override in glm51_model.ts,
+ *  `total >= 4096`). Kept as a named anchor for the overflow eligibility rule;
+ *  do not change one site without the others. */
+export const PHASED_PREFILL_MIN_ROWS = 4096;
+
+/** Inputs to the one shared tail-merge/overflow rule (selectPrefillTakes).
+ *  Prediction (scheduler mirror) and actual selection must supply the SAME
+ *  values for every field (verdict Q3c). */
+export interface PrefillTailMergeOptions {
+  /** Inclusive tail ceiling T; 0 disables all merging (pre-Fix-A behavior). */
+  tailMergeMax?: number;
+  /** Workspace capacity (ws.maxSeqLen): ceil(mergedRows/2) must fit in it. */
+  maxSeqLen?: number;
+  /** ORIGINAL batch length (inputIdsList.length) — EMPTY ROWS COUNT. A batch
+   *  of [8198, []] has batchLength 2 and is never eligible (verdict Q3a/Q3c). */
+  batchLength?: number;
+  /** Caller-approved overflow: true only where the qualified GLM MTP planner
+   *  will plan the merged chunk (glm51 planChunkedPrefill). Everything else —
+   *  unphased, batched, other-model, unqualified chunk sizes — passes false or
+   *  nothing and keeps today's greedy slicing. */
+  mtp?: boolean;
+  /** Chunk budget the ceiling is qualified for (default 8192). */
+  qualifiedChunkSize?: number;
+}
+
+export interface PrefillTailMergeContext extends PrefillTailMergeOptions {
+  /** C: per-chunk execution-token budget, prepended overlap included. */
+  chunkSize: number;
+}
+
+/** The ONE overflow-eligibility rule (verdict Q3a "mandated first
+ *  implementation"), applied identically by ChatModel.selectPrefillChunk and
+ *  the scheduler mirror. Overflow is a caller-approved option ONLY for the
+ *  qualified GLM single-request phased path:
+ *    - original inputIdsList.length === 1 (batchLength; empty rows count),
+ *    - the ACTUAL planner selects phased execution for the merged row
+ *      (GLM MTP planner predicate: batch 1 + SLOPLLM_PHASED_PREFILL !== "0"
+ *      + merged rows >= 4096 — see planPrefillChunk in glm51_model.ts),
+ *    - ceil(mergedExecutionRows/2) <= ws.maxSeqLen (planPrefill rejects total
+ *      execution rows above capacity; the phased halves must each fit),
+ *    - the chunk budget is the qualified one (8192 rows; verdict Q3f).
+ *  Decided BEFORE any MTP rewind; never retried on a mutated cache. */
+export function prefillTailMergeOverflowEligible(ctx: PrefillTailMergeContext,
+  mergedExecutionRows: number): boolean {
+  return (ctx.tailMergeMax ?? prefillTailMergeMaxSetting()) > 0
+    && (ctx.batchLength ?? -1) === 1
+    && ctx.mtp === true
+    && ctx.chunkSize === (ctx.qualifiedChunkSize ?? PREFILL_TAIL_MERGE_QUALIFIED_CHUNK_SIZE)
+    && process.env.SLOPLLM_PHASED_PREFILL !== "0"
+    && mergedExecutionRows >= PHASED_PREFILL_MIN_ROWS
+    && Math.ceil(mergedExecutionRows / 2) <= (ctx.maxSeqLen ?? ctx.chunkSize);
+}
+
+/** Shared pure length-selection policy for ChatModel.selectPrefillChunk and
+ *  GenerationScheduler.estimateRemainingPrefillChunks (verdict Q3c: one
+ *  algorithm, not two). Returns the per-row greedy take, with the corrected
+ *  bounded overflow applied where eligible. Executed rows per row =
+ *  take + overlapCost (the prepended replay overlap); the shared budget counts
+ *  them exactly as the pre-Fix-A slicing did. */
+export function selectPrefillTakes(inputLengths: readonly number[],
+  overlapCosts: readonly number[],
+  ctx: PrefillTailMergeContext): number[] {
+  if (!Number.isSafeInteger(ctx.chunkSize) || ctx.chunkSize < 1) {
+    throw new Error(`Invalid prefill chunk size: ${ctx.chunkSize}`);
+  }
+  const tailMergeMax = ctx.tailMergeMax ?? prefillTailMergeMaxSetting();
+  if (!Number.isSafeInteger(tailMergeMax) || tailMergeMax < 0) {
+    throw new Error(`Invalid prefill tail merge max: ${tailMergeMax}`);
+  }
+  let budget = ctx.chunkSize;
+  const takes: number[] = [];
+  for (let i = 0; i < inputLengths.length; i++) {
+    const length = inputLengths[i];
+    const overlapCost = i < overlapCosts.length ? overlapCosts[i] : 0;
+    let take = Math.min(length, Math.max(0, budget - overlapCost));
+    // Corrected bounded merge (verdict Q3a): positive take, an ACTUAL tail
+    // (0 < length - take <= T), and ONE global executed-row cap including the
+    // prepended overlap: Eused + length + overlapCost <= C + T with
+    // Eused = C - budget. No budget replenishment and no per-request T: a
+    // negative budget after an accepted merge simply clamps later ordinary
+    // takes to zero. take === 0 is deliberately NOT a merge shortcut — it
+    // would bypass the no-progress throw and rewind a formerly deferred row.
+    const remainder = length - take;
+    const mergedExecutionRows = length + overlapCost;
+    if (take > 0 && remainder > 0 && remainder <= tailMergeMax
+      && (ctx.chunkSize - budget) + mergedExecutionRows <= ctx.chunkSize + tailMergeMax
+      && prefillTailMergeOverflowEligible(ctx, mergedExecutionRows)) {
+      take = length;
+    }
+    takes.push(take);
+    budget -= take ? take + overlapCost : 0;
+  }
+  return takes;
+}
+
 export abstract class ChatModel extends WorkspaceBase {
   abstract readonly eosIds: Set<number>;
   abstract readonly cfg: CommonModelConfig;
@@ -281,19 +418,29 @@ export abstract class ChatModel extends WorkspaceBase {
   }
 
   protected selectPrefillChunk(inputIdsList: readonly number[][], chunkSize: number,
-    overlapTokens: readonly (number | undefined)[] = []): {
+    overlapTokens: readonly (number | undefined)[] = [],
+    tailMerge: PrefillTailMergeOptions = {}): {
       prefillInputIdsList: number[][];
       remainingInputIdsList: number[][];
     } {
-    if (!Number.isSafeInteger(chunkSize) || chunkSize < 1) {
-      throw new Error(`Invalid prefill chunk size: ${chunkSize}`);
-    }
+    const ctx: PrefillTailMergeContext = {
+      ...tailMerge,
+      chunkSize,
+      batchLength: tailMerge.batchLength ?? inputIdsList.length,
+    };
+    // The one shared pure policy (selectPrefillTakes) owns the greedy take and
+    // the corrected bounded overflow; this method only assembles slices. The
+    // overflow eligibility (caller-approved GLM single-request phased path,
+    // capacity guard) is decided HERE — before any MTP rewind in the caller —
+    // and is never retried on a mutated cache (verdict Q3a).
+    const takes = selectPrefillTakes(inputIdsList.map(ids => ids.length),
+      overlapTokens.map(overlap => overlap === undefined ? 0 : 1), ctx);
     let budget = chunkSize;
     const prefillInputIdsList: number[][] = [];
     const remainingInputIdsList: number[][] = [];
     for (const [index, ids] of inputIdsList.entries()) {
       const overlap = overlapTokens[index];
-      const take = Math.min(ids.length, Math.max(0, budget - (overlap === undefined ? 0 : 1)));
+      const take = takes[index];
       const input = ids.slice(0, take);
       if (take && overlap !== undefined) {
         input.unshift(overlap);
