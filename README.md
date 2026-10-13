@@ -85,6 +85,31 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 > **Note:** the server does not perform an exhaustive warmup across all context length and batch size combinations. When a new combination is first encountered, CUDA graphs must be captured for it, causing a momentary stall at these graph compile points. Subsequent requests with the same shape replay the captured graph without stalling.
 
+### NVFP4-CSF checkpoint
+
+The loader accepts a GLM-5.3 NVFP4 checkpoint packed in the
+`lil-nvfp4-csf-checkpoint/1` container format (byte-window4 scale codec with
+contract checks, TP-sliced per rank). The container is validated on read
+(`src/csf_codec.ts` contract checks, `src/csf_checkpoint.ts` integrity split)
+and loads through the same `ChatModel.loadWeights` path via the checkpoint-source
+abstraction; the format's executable spec is `tests/csf_fixture.ts`. The packed
+checkpoint is bit-for-bit equivalent to the safetensors NVFP4 weights
+(`tests/test_csf_gpu_equivalence.ts`).
+
+```sh
+node node_modules/tsx/dist/cli.mjs src/run_model_loader.ts \
+  --control-host 127.0.0.1 --control-port 8098 \
+  --model-dir /path/to/GLM-5.3-NVFP4-CSF \
+  --arena 92 --gpus 0,1,2,3,4,5,6,7 --glm51 --cp --mtp 3 \
+  src/openai-server.ts --max-pages 8513
+```
+
+At CP8, `--max-pages 8513` gives a 4,358,656-token KV pool (vs 4,194,304 at
+`--max-pages 8192`); at `--arena 92` this configuration holds ~3.3 GiB of
+scratch headroom per rank on 96 GB cards and is validated end-to-end on 8x
+RTX Pro 6000. Decode and prefill throughput match the safetensors checkpoint
+within run-to-run noise.
+
 ## Building
 
 ```bash

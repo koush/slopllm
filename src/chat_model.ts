@@ -2,14 +2,20 @@ import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
 import fs from "node:fs";
 import path from "node:path";
 import { ChatModelParser, DefaultChatModelParser } from "./chat-model-parser";
-import { DeviceOps } from "./device_ops";
+import {
+  openCheckpointSource,
+  resolveCheckpointConfigDir,
+  type CheckpointSource,
+  type CheckpointTensor,
+} from "./checkpoint_source";
+import { DeviceOps, type StridedMmap } from "./device_ops";
 import { EagerExecution, type ExecutionManager } from "./execution-manager";
 import { ExecutionState, type ExecutionWorkspace } from "./execution-workspace";
 import { f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import { mmapClose, mmapOpen } from "./native-addon";
 import { PagedKVCache } from "./paged_kv";
-import { SafeTensorFile, type TensorMeta } from "./safetensors";
+import type { TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
@@ -148,6 +154,143 @@ export interface ChatTemplateKwargs {
   [key: string]: unknown;
 }
 
+/** Fix A (tail-chunk merge), CORRECTED per Codex consult #8
+ *  (verdict-lowctx-20261013.md Q3a/Q3c/Q3f): a request left with an actual
+ *  tail of at most this many tokens after the greedy take is absorbed into
+ *  the current chunk ONLY through the caller-approved, capacity-guarded
+ *  overflow path below. Inclusive endpoint (<= 256 merges, 257 does not).
+ *  0 reproduces the pre-Fix-A splitting exactly (the fixture's split arm and
+ *  the per-call reproduction hook). One shared bound: the PREFILL_CHUNK_TRACE
+ *  integer mirror (GenerationScheduler.estimateRemainingPrefillChunks) runs
+ *  the SAME pure policy — never diverge the two. */
+export const PREFILL_TAIL_MERGE_MAX = 256;
+
+/** Serving-path runtime override (arm toggle for the maintenance-window
+ *  validation; RUNBOOK-window1 §7.2 arms 0/1/2 switch WITHOUT rebuilds).
+ *  Read at chunk-plan build time — where ChatModel.selectPrefillChunk and the
+ *  scheduler mirror resolve their tail ceiling — so one build serves every
+ *  arm:
+ *    SLOPLLM_TAIL_MERGE_MAX=0    arm 0 / reproduction hook: pre-Fix-A
+ *                                splitting exactly (same as per-call
+ *                                `tailMergeMax: 0`);
+ *    SLOPLLM_TAIL_MERGE_MAX=256  arm 1 default (inclusive endpoint);
+ *    unset                       PREFILL_TAIL_MERGE_MAX (shipped state).
+ *  Values must be safe integers >= 0; anything else fails loudly at plan
+ *  time. The selector and the mirror share this one resolver — never let the
+ *  two diverge (verdict Q3c). */
+export function prefillTailMergeMaxSetting(): number {
+  const raw = process.env.SLOPLLM_TAIL_MERGE_MAX;
+  if (raw === undefined || raw === "") {
+    return PREFILL_TAIL_MERGE_MAX;
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Invalid SLOPLLM_TAIL_MERGE_MAX: ${raw}`);
+  }
+  return value;
+}
+
+/** The qualified execution-row budget the 256-token ceiling was sized against
+ *  (verdict Q3f: 256/8192 ~= 3.1%; other chunk sizes are NOT qualified — with
+ *  small C a fixed 256 would invalidate existing chunk-budget behavior). */
+export const PREFILL_TAIL_MERGE_QUALIFIED_CHUNK_SIZE = 8192;
+
+/** Phased-prefill row threshold — must match the actual planner predicates
+ *  (planPrefillChunk in this file and the GLM override in glm51_model.ts,
+ *  `total >= 4096`). Kept as a named anchor for the overflow eligibility rule;
+ *  do not change one site without the others. */
+export const PHASED_PREFILL_MIN_ROWS = 4096;
+
+/** Inputs to the one shared tail-merge/overflow rule (selectPrefillTakes).
+ *  Prediction (scheduler mirror) and actual selection must supply the SAME
+ *  values for every field (verdict Q3c). */
+export interface PrefillTailMergeOptions {
+  /** Inclusive tail ceiling T; 0 disables all merging (pre-Fix-A behavior). */
+  tailMergeMax?: number;
+  /** Workspace capacity (ws.maxSeqLen): ceil(mergedRows/2) must fit in it. */
+  maxSeqLen?: number;
+  /** ORIGINAL batch length (inputIdsList.length) — EMPTY ROWS COUNT. A batch
+   *  of [8198, []] has batchLength 2 and is never eligible (verdict Q3a/Q3c). */
+  batchLength?: number;
+  /** Caller-approved overflow: true only where the qualified GLM MTP planner
+   *  will plan the merged chunk (glm51 planChunkedPrefill). Everything else —
+   *  unphased, batched, other-model, unqualified chunk sizes — passes false or
+   *  nothing and keeps today's greedy slicing. */
+  mtp?: boolean;
+  /** Chunk budget the ceiling is qualified for (default 8192). */
+  qualifiedChunkSize?: number;
+}
+
+export interface PrefillTailMergeContext extends PrefillTailMergeOptions {
+  /** C: per-chunk execution-token budget, prepended overlap included. */
+  chunkSize: number;
+}
+
+/** The ONE overflow-eligibility rule (verdict Q3a "mandated first
+ *  implementation"), applied identically by ChatModel.selectPrefillChunk and
+ *  the scheduler mirror. Overflow is a caller-approved option ONLY for the
+ *  qualified GLM single-request phased path:
+ *    - original inputIdsList.length === 1 (batchLength; empty rows count),
+ *    - the ACTUAL planner selects phased execution for the merged row
+ *      (GLM MTP planner predicate: batch 1 + SLOPLLM_PHASED_PREFILL !== "0"
+ *      + merged rows >= 4096 — see planPrefillChunk in glm51_model.ts),
+ *    - ceil(mergedExecutionRows/2) <= ws.maxSeqLen (planPrefill rejects total
+ *      execution rows above capacity; the phased halves must each fit),
+ *    - the chunk budget is the qualified one (8192 rows; verdict Q3f).
+ *  Decided BEFORE any MTP rewind; never retried on a mutated cache. */
+export function prefillTailMergeOverflowEligible(ctx: PrefillTailMergeContext,
+  mergedExecutionRows: number): boolean {
+  return (ctx.tailMergeMax ?? prefillTailMergeMaxSetting()) > 0
+    && (ctx.batchLength ?? -1) === 1
+    && ctx.mtp === true
+    && ctx.chunkSize === (ctx.qualifiedChunkSize ?? PREFILL_TAIL_MERGE_QUALIFIED_CHUNK_SIZE)
+    && process.env.SLOPLLM_PHASED_PREFILL !== "0"
+    && mergedExecutionRows >= PHASED_PREFILL_MIN_ROWS
+    && Math.ceil(mergedExecutionRows / 2) <= (ctx.maxSeqLen ?? ctx.chunkSize);
+}
+
+/** Shared pure length-selection policy for ChatModel.selectPrefillChunk and
+ *  GenerationScheduler.estimateRemainingPrefillChunks (verdict Q3c: one
+ *  algorithm, not two). Returns the per-row greedy take, with the corrected
+ *  bounded overflow applied where eligible. Executed rows per row =
+ *  take + overlapCost (the prepended replay overlap); the shared budget counts
+ *  them exactly as the pre-Fix-A slicing did. */
+export function selectPrefillTakes(inputLengths: readonly number[],
+  overlapCosts: readonly number[],
+  ctx: PrefillTailMergeContext): number[] {
+  if (!Number.isSafeInteger(ctx.chunkSize) || ctx.chunkSize < 1) {
+    throw new Error(`Invalid prefill chunk size: ${ctx.chunkSize}`);
+  }
+  const tailMergeMax = ctx.tailMergeMax ?? prefillTailMergeMaxSetting();
+  if (!Number.isSafeInteger(tailMergeMax) || tailMergeMax < 0) {
+    throw new Error(`Invalid prefill tail merge max: ${tailMergeMax}`);
+  }
+  let budget = ctx.chunkSize;
+  const takes: number[] = [];
+  for (let i = 0; i < inputLengths.length; i++) {
+    const length = inputLengths[i];
+    const overlapCost = i < overlapCosts.length ? overlapCosts[i] : 0;
+    let take = Math.min(length, Math.max(0, budget - overlapCost));
+    // Corrected bounded merge (verdict Q3a): positive take, an ACTUAL tail
+    // (0 < length - take <= T), and ONE global executed-row cap including the
+    // prepended overlap: Eused + length + overlapCost <= C + T with
+    // Eused = C - budget. No budget replenishment and no per-request T: a
+    // negative budget after an accepted merge simply clamps later ordinary
+    // takes to zero. take === 0 is deliberately NOT a merge shortcut — it
+    // would bypass the no-progress throw and rewind a formerly deferred row.
+    const remainder = length - take;
+    const mergedExecutionRows = length + overlapCost;
+    if (take > 0 && remainder > 0 && remainder <= tailMergeMax
+      && (ctx.chunkSize - budget) + mergedExecutionRows <= ctx.chunkSize + tailMergeMax
+      && prefillTailMergeOverflowEligible(ctx, mergedExecutionRows)) {
+      take = length;
+    }
+    takes.push(take);
+    budget -= take ? take + overlapCost : 0;
+  }
+  return takes;
+}
+
 export abstract class ChatModel extends WorkspaceBase {
   abstract readonly eosIds: Set<number>;
   abstract readonly cfg: CommonModelConfig;
@@ -275,19 +418,29 @@ export abstract class ChatModel extends WorkspaceBase {
   }
 
   protected selectPrefillChunk(inputIdsList: readonly number[][], chunkSize: number,
-    overlapTokens: readonly (number | undefined)[] = []): {
+    overlapTokens: readonly (number | undefined)[] = [],
+    tailMerge: PrefillTailMergeOptions = {}): {
       prefillInputIdsList: number[][];
       remainingInputIdsList: number[][];
     } {
-    if (!Number.isSafeInteger(chunkSize) || chunkSize < 1) {
-      throw new Error(`Invalid prefill chunk size: ${chunkSize}`);
-    }
+    const ctx: PrefillTailMergeContext = {
+      ...tailMerge,
+      chunkSize,
+      batchLength: tailMerge.batchLength ?? inputIdsList.length,
+    };
+    // The one shared pure policy (selectPrefillTakes) owns the greedy take and
+    // the corrected bounded overflow; this method only assembles slices. The
+    // overflow eligibility (caller-approved GLM single-request phased path,
+    // capacity guard) is decided HERE — before any MTP rewind in the caller —
+    // and is never retried on a mutated cache (verdict Q3a).
+    const takes = selectPrefillTakes(inputIdsList.map(ids => ids.length),
+      overlapTokens.map(overlap => overlap === undefined ? 0 : 1), ctx);
     let budget = chunkSize;
     const prefillInputIdsList: number[][] = [];
     const remainingInputIdsList: number[][] = [];
     for (const [index, ids] of inputIdsList.entries()) {
       const overlap = overlapTokens[index];
-      const take = Math.min(ids.length, Math.max(0, budget - (overlap === undefined ? 0 : 1)));
+      const take = takes[index];
       const input = ids.slice(0, take);
       if (take && overlap !== undefined) {
         input.unshift(overlap);
@@ -471,53 +624,94 @@ export abstract class ChatModel extends WorkspaceBase {
     };
   }
 
-  protected abstract loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void>;
+  protected abstract loadTensor(name: string, meta: TensorMeta, source: CheckpointTensor): Promise<void>;
 
-  protected async loadWeights(modelDir: string): Promise<void> {
-    const allFiles = fs.readdirSync(modelDir);
-    const shards: string[] = [];
-    if (allFiles.includes('model.safetensors')) {
-      shards.push(path.join(modelDir, 'model.safetensors'));
-    } else {
-      const indexFile = allFiles.find(f => f.endsWith('.index.json') || f.endsWith('.safetensors.json'));
-      if (indexFile) {
-        const idx = JSON.parse(fs.readFileSync(path.join(modelDir, indexFile), 'utf-8'));
-        const weightMap = idx.weight_map ?? idx;
-        for (const f of Object.values(weightMap)) {
-          if (typeof f === 'string' && f.endsWith('.safetensors') && !shards.includes(path.join(modelDir, f))) {
-            shards.push(path.join(modelDir, f));
-          }
-        }
-      } else {
-        shards.push(...allFiles.filter(f => f.endsWith('.safetensors')).map(f => path.join(modelDir, f)));
+  /**
+   * Executor replay (SLOPLLM_SKIP_MMAP_LOAD) reconstructs allocation
+   * layouts only: model loading must not read the checkpoint or move data.
+   * mmapLoad already skips its transfer at the tensor layer; staged uploads
+   * and source reads are guarded here (port plan §11.1). h2d itself is never
+   * disabled — executors upload tokens and planning data while serving.
+   */
+  protected get loadReplay(): boolean {
+    return !!process.env.SLOPLLM_SKIP_MMAP_LOAD;
+  }
+
+  /** h2d enqueues asynchronously; staging must survive until the next drain. */
+  private pendingLoadBuffers: Buffer[] = [];
+
+  protected uploadStaged(tensor: Tensor, bytes: Buffer): void {
+    if (this.loadReplay) return;
+    this.pendingLoadBuffers.push(bytes);
+    tensor.h2d(bytes);
+  }
+
+  /** One transfer window at a time (§11.2): complete queued copies before reuse. */
+  protected async drainLoadTransfers(): Promise<void> {
+    await this.ops.synchronizeAsync();
+    this.pendingLoadBuffers.length = 0;
+  }
+
+  /**
+   * Load one tensor's logical bytes into a device tensor: direct file
+   * mapping when the bytes are physically contiguous, bounded host staging
+   * otherwise (e.g. CSF scale expansion). Multiple strided specs fill
+   * disjoint destination regions of the same tensor.
+   */
+  protected async loadTensorBytes(tensor: Tensor, source: CheckpointTensor, strided?: StridedMmap): Promise<void> {
+    await this.loadTensorStrided(tensor, source, strided ? [strided] : []);
+  }
+
+  protected async loadTensorStrided(tensor: Tensor, source: CheckpointTensor, specs: StridedMmap[]): Promise<void> {
+    // Allocation-only replay: no source reads, no expansion, no transfers.
+    if (this.loadReplay) return;
+    const mapping = source.mapping();
+    if (mapping) {
+      for (const spec of specs) {
+        await tensor.mmapLoad(mapping.mmapPtr, mapping.offset, tensor.bytes, spec);
+      }
+      if (!specs.length) {
+        await tensor.mmapLoad(mapping.mmapPtr, mapping.offset, tensor.bytes);
+      }
+      return;
+    }
+    const bytes = source.read();
+    if (!specs.length) {
+      this.uploadStaged(tensor, bytes);
+      return;
+    }
+    const out = Buffer.alloc(tensor.bytes);
+    for (const spec of specs) {
+      for (let r = 0; r < spec.height; r++) {
+        const src = spec.srcOffset + r * spec.srcPitch;
+        bytes.copy(out, spec.dstOffset + r * spec.dstPitch, src, src + spec.width);
       }
     }
+    this.uploadStaged(tensor, out);
+  }
 
-    // Iterating the index's weight_map gives shards in first-mention order
-    // (arbitrary: lm_head/embed sort before model.layers.*, so the shard
-    // with the final layers loads first). Load in filename order so
-    // progress tracks the checkpoint layout.
-    shards.sort();
+  /** The checkpoint source opened by loadWeights (closed after loading). */
+  protected checkpointSource?: CheckpointSource;
 
-    const openShards = shards.map(stPath => {
-      const st = SafeTensorFile.open(stPath);
-      const mmapPtr = mmapOpen(stPath);
-      const fileSize = fs.statSync(stPath).size;
-      return { st, mmapPtr, fileSize };
-    });
+  protected async loadWeights(modelDir: string): Promise<void> {
+    // Shard discovery and physical plane handling live behind the
+    // checkpoint-source abstraction: safetensors roots and CSF containers
+    // both expose logical source names with dtype/shape and bounded reads.
+    const source = openCheckpointSource(modelDir, { open: mmapOpen, close: mmapClose });
+    this.checkpointSource = source;
+    const names = source.names();
 
     const loadBatchSize = parseInt(process.env.SLOPLLM_LOAD_BATCH_SIZE ?? "8", 10);
     const layerRe = /^model\.layers\.(\d+)\./;
     let totalTensors = 0;
     let totalBytes = 0;
     let maxLayer = -1;
-    for (const { st } of openShards) {
-      for (const name of st.tensorNames()) {
-        totalTensors++;
-        totalBytes += st.meta(name).dataOffsets[1] - st.meta(name).dataOffsets[0];
-        const layerMatch = layerRe.exec(name);
-        if (layerMatch) maxLayer = Math.max(maxLayer, Number(layerMatch[1]));
-      }
+    for (const name of names) {
+      const meta = source.meta(name);
+      totalTensors++;
+      totalBytes += meta.dataOffsets[1] - meta.dataOffsets[0];
+      const layerMatch = layerRe.exec(name);
+      if (layerMatch) maxLayer = Math.max(maxLayer, Number(layerMatch[1]));
     }
 
     let loadedTensors = 0;
@@ -557,46 +751,55 @@ export abstract class ChatModel extends WorkspaceBase {
 
     drawProgress(false);
 
-    for (const { st, mmapPtr } of openShards) {
-      const names = st.tensorNames();
+    try {
       for (let i = 0; i < names.length; i += loadBatchSize) {
         const batch = names.slice(i, i + loadBatchSize);
         await Promise.all(
           batch.map(name =>
-            this.loadTensor(name, st.meta(name), st, mmapPtr)
+            this.loadTensor(name, source.meta(name), source.tensor(name))
           )
         );
         for (const name of batch) {
-          loadedBytes += st.meta(name).dataOffsets[1] - st.meta(name).dataOffsets[0];
+          const meta = source.meta(name);
+          loadedBytes += meta.dataOffsets[1] - meta.dataOffsets[0];
         }
         loadedTensors += batch.length;
         const layerMatch = layerRe.exec(batch[batch.length - 1]);
         if (layerMatch) currentLayer = Math.max(currentLayer, Number(layerMatch[1]));
+        // Serialized completion (port plan §11.2): one transfer window at a
+        // time. With SLOPLLM_LOAD_BATCH_SIZE=1 this is exactly one logical
+        // tensor in flight; TP shard copies for that tensor may overlap.
+        await this.drainLoadTransfers();
         drawProgress(false);
       }
+    } finally {
+      // Drain pending transfers before closing/unmapping the source, on
+      // success and on failure (§11.2).
+      try {
+        await this.drainLoadTransfers();
+      } catch {
+        // the original load error wins
+      }
+      source.close();
     }
-
-    await this.ops.synchronizeAsync();
 
     drawProgress(true);
     if (isTty) process.stderr.write(`\r${" ".repeat(lastLineLength)}\r`);
     console.log(`Loaded ${totalTensors} weight tensors (${giB(totalBytes)}) in ${((performance.now() - startedMs) / 1000).toFixed(1)}s`);
-
-    for (const { st, mmapPtr, fileSize } of openShards) {
-      st.close();
-      mmapClose(mmapPtr, fileSize);
-    }
   }
 
   protected async fromPretrained(modelDir: string, tokenizerRepo: string): Promise<void> {
     await this.loadWeights(modelDir);
-    const tokenizerDir = fs.existsSync(path.join(modelDir, "tokenizer_config.json"))
-      ? modelDir
+    // CSF containers resolve model config, tokenizer, generation config and
+    // the chat template from their metadata/ directory.
+    const configDir = resolveCheckpointConfigDir(modelDir);
+    const tokenizerDir = fs.existsSync(path.join(configDir, "tokenizer_config.json"))
+      ? configDir
       : resolveModelPath(tokenizerRepo);
     this.tokenizer = await AutoTokenizer.from_pretrained(tokenizerDir, { local_files_only: true });
 
     // Served checkpoints may override the tokenizer repository's template.
-    const chatTemplatePath = [modelDir, tokenizerDir]
+    const chatTemplatePath = [configDir, tokenizerDir]
       .map(dir => path.join(dir, "chat_template.jinja"))
       .find(candidate => fs.existsSync(candidate));
     if (chatTemplatePath) {
@@ -605,8 +808,8 @@ export abstract class ChatModel extends WorkspaceBase {
       this.tokenizer.chat_template = fs.readFileSync(chatTemplatePath, "utf-8")
         .replace(/\.(\d+)\b/g, "[$1]");
     }
-    this.cfg.maxPositionEmbeddings = loadMaxPositionEmbeddings(modelDir);
-    this.cfg.generationConfig = loadGenerationConfig(modelDir);
+    this.cfg.maxPositionEmbeddings = loadMaxPositionEmbeddings(configDir);
+    this.cfg.generationConfig = loadGenerationConfig(configDir);
     this.freeze();
   }
 }

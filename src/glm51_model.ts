@@ -3,6 +3,7 @@ import path from "node:path";
 import { CaptureManager } from "./capture-manager";
 import type { ChatCache, ChatTemplateKwargs, ChunkedPrefillPlan, MtpDecodeStepResult, TokenSelector } from "./chat_model";
 import { ChatModel, CommonModelConfig, SamplingParams } from "./chat_model";
+import { validateCalibrationScalar, type CheckpointTensor, resolveCheckpointConfigDir } from "./checkpoint_source";
 import { DeviceOps, MaskMode, MlaQuery, TensorParallelism, type StreamResult } from "./device_ops";
 import { MemcpyKind } from "./enums";
 import { EagerExecution, type ExecutionManager } from "./execution-manager";
@@ -167,7 +168,8 @@ export class Glm51Model extends ChatModel {
 
   static async fromPretrained(ops: DeviceOps, repoIdOrDir: string = GLM51_MODEL_DIR, contextParallel = false, mtp = false): Promise<Glm51Model> {
     const modelDir = fs.existsSync(repoIdOrDir) ? repoIdOrDir : resolveModelPath(repoIdOrDir);
-    const config = loadConfig(modelDir);
+    // CSF containers keep config.json under metadata/.
+    const config = loadConfig(resolveCheckpointConfigDir(modelDir));
     const model = new Glm51Model(ops, config, contextParallel, mtp);
     await model.fromPretrained(modelDir, GLM51_REPO);
     return model;
@@ -229,12 +231,26 @@ export class Glm51Model extends ChatModel {
     return TensorParallelism.Replicated;
   }
 
-  protected async loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void> {
+  protected async loadTensor(name: string, meta: TensorMeta, source: CheckpointTensor): Promise<void> {
+    // NVFP4 calibration retention (port plan §9.4): A4 quantization needs the
+    // source FP32 activation scales. Retain them as F32 without the loader's
+    // general F32-to-BF16 conversion, validated as positive finite scalars.
+    // Values stay unreciprocated: the reference preparation reciprocates the
+    // gate/up max and down input scales into its packed bundle's
+    // input_scale/intermediate_scale fields at A4-preparation time; loading
+    // never applies that reciprocal itself.
+    if (name.endsWith(".input_scale")) {
+      // Replay reconstructs the allocation only; owner loading validates and
+      // uploads through the guarded helper (port plan §11.1).
+      const tensor = this.alloc(meta.shape, "F32", name, this.weightParallelism(name));
+      if (!this.loadReplay) {
+        validateCalibrationScalar(name, meta, source.read());
+        await this.loadTensorBytes(tensor, source);
+      }
+      return;
+    }
     // NVFP4 scale tensors: rename to match linear() lookup convention
     // e.g. "X.gate_proj.weight_scale" → "X.gate_proj.weight_weight_scale"
-    if (name.endsWith(".input_scale")) {
-      return; // not used by kernel
-    }
     let storeName = name;
     if (name.endsWith(".weight_scale_2")) {
       storeName = name.replace(/\.weight_scale_2$/, ".weight_weight_scale_2");
@@ -245,7 +261,7 @@ export class Glm51Model extends ChatModel {
     if (name.endsWith(".self_attn.q_b_proj.weight") ||
       name.endsWith(".self_attn.kv_b_proj.weight") ||
       name.endsWith(".self_attn.kv_a_proj_with_mqa.weight")) {
-      await this.loadMlaWeight(name, meta, st, mmapPtr);
+      await this.loadMlaWeight(name, meta, source);
       return;
     }
 
@@ -254,29 +270,29 @@ export class Glm51Model extends ChatModel {
     if (meta.dtype === "F32" && !name.endsWith(".weight_scale_2")) {
       const numElements = meta.shape.reduce((a, b) => a * b, 1);
       const tensor = this.alloc(meta.shape, "BF16", storeName, par);
-      const f32Bytes = st.readTensor(name);
-      const f32Arr = new Float32Array(f32Bytes.buffer, f32Bytes.byteOffset, numElements);
-      tensor.h2d(f32ToBf16Bytes(f32Arr));
+      if (!this.loadReplay) {
+        const f32Bytes = source.read();
+        const f32Arr = new Float32Array(f32Bytes.buffer, f32Bytes.byteOffset, numElements);
+        this.uploadStaged(tensor, f32ToBf16Bytes(f32Arr));
+      }
 
       if (this.cfg.tieWordEmbeddings && name === "model.embed_tokens.weight" && !this.tensors.has("lm_head.weight")) {
         const lmHead = this.alloc(meta.shape, "BF16", "lm_head.weight", TensorParallelism.Column);
-        const embedOffset = st.dataStart + meta.dataOffsets[0];
-        await lmHead.mmapLoad(mmapPtr, embedOffset, lmHead.bytes);
+        await this.loadTensorBytes(lmHead, source);
       }
     } else {
       const dtype = meta.dtype;
       const tensor = this.alloc(meta.shape, dtype, storeName, par);
-      const offset = st.dataStart + meta.dataOffsets[0];
-      await tensor.mmapLoad(mmapPtr, offset, tensor.bytes);
+      await this.loadTensorBytes(tensor, source);
 
       if (this.cfg.tieWordEmbeddings && name === "model.embed_tokens.weight" && !this.tensors.has("lm_head.weight")) {
         const lmHead = this.alloc(meta.shape, dtype, "lm_head.weight", TensorParallelism.Column);
-        await lmHead.mmapLoad(mmapPtr, offset, lmHead.bytes);
+        await this.loadTensorBytes(lmHead, source);
       }
     }
   }
 
-  private async loadMlaWeight(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void> {
+  private async loadMlaWeight(name: string, meta: TensorMeta, source: CheckpointTensor): Promise<void> {
     const cfg = this.cfg;
     const nHeads = cfg.numAttentionHeads;
     const qkNopeDim = cfg.qkNopeHeadDim;
@@ -286,7 +302,6 @@ export class Glm51Model extends ChatModel {
     const qLoraRank = cfg.qLoraRank;
     const qkHeadDim = cfg.qkHeadDim;
     const inDim = meta.shape[1];
-    const offset = st.dataStart + meta.dataOffsets[0];
     const layerPfx = name.replace(/\.(q_b_proj|kv_b_proj|kv_a_proj_with_mqa)\.weight$/, "");
 
     if (meta.dtype !== "BF16") {
@@ -303,8 +318,8 @@ export class Glm51Model extends ChatModel {
       const peName = name.replace(".q_b_proj.weight", ".q_pe_proj.weight");
       const tPe = this.alloc([nHeads * qkRopeDim, qLoraRank], "BF16", peName, nopeParallelism);
       await Promise.all([
-        tQNope.mmapLoad(mmapPtr, offset, tQNope.bytes, { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: qkNopeDim * inDim * eb, width: qkNopeDim * inDim * eb, height: nHeads }),
-        tPe.mmapLoad(mmapPtr, offset, tPe.bytes, { srcOffset: qkNopeDim * inDim * eb, dstOffset: 0, srcPitch, dstPitch: qkRopeDim * inDim * eb, width: qkRopeDim * inDim * eb, height: nHeads }),
+        this.loadTensorBytes(tQNope, source, { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: qkNopeDim * inDim * eb, width: qkNopeDim * inDim * eb, height: nHeads }),
+        this.loadTensorBytes(tPe, source, { srcOffset: qkNopeDim * inDim * eb, dstOffset: 0, srcPitch, dstPitch: qkRopeDim * inDim * eb, width: qkRopeDim * inDim * eb, height: nHeads }),
       ]);
     } else if (name.endsWith(".kv_b_proj.weight")) {
       const eb = 2;
@@ -314,8 +329,8 @@ export class Glm51Model extends ChatModel {
       const vPar = TensorParallelism.Replicated;
       using tVRaw = this.alloc([nHeads * vHeadDim, kvLoraRank], "BF16", undefined, vPar);
       await Promise.all([
-        tKNope.mmapLoad(mmapPtr, offset, tKNope.bytes, { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: qkNopeDim * inDim * eb, width: qkNopeDim * inDim * eb, height: nHeads }),
-        tVRaw.mmapLoad(mmapPtr, offset, tVRaw.bytes, { srcOffset: qkNopeDim * inDim * eb, dstOffset: 0, srcPitch, dstPitch: vHeadDim * inDim * eb, width: vHeadDim * inDim * eb, height: nHeads }),
+        this.loadTensorBytes(tKNope, source, { srcOffset: 0, dstOffset: 0, srcPitch, dstPitch: qkNopeDim * inDim * eb, width: qkNopeDim * inDim * eb, height: nHeads }),
+        this.loadTensorBytes(tVRaw, source, { srcOffset: qkNopeDim * inDim * eb, dstOffset: 0, srcPitch, dstPitch: vHeadDim * inDim * eb, width: vHeadDim * inDim * eb, height: nHeads }),
       ]);
       // Transpose v_proj: [nHeads, vHeadDim, kvLoraRank] -> [nHeads, kvLoraRank, vHeadDim]
       // The transposed layout enables coalesced reads in mla_v_expand_kernel.
@@ -332,8 +347,11 @@ export class Glm51Model extends ChatModel {
       const kpe = this.alloc([qkRopeDim, inDim], "BF16", kpeName, TensorParallelism.Replicated);
       const eb = 2;
       await Promise.all([
-        ckv.mmapLoad(mmapPtr, offset, ckv.bytes),
-        kpe.mmapLoad(mmapPtr, offset + kvLoraRank * inDim * eb, kpe.bytes),
+        this.loadTensorBytes(ckv, source),
+        this.loadTensorBytes(kpe, source, {
+          srcOffset: kvLoraRank * inDim * eb, dstOffset: 0,
+          srcPitch: kpe.bytes, dstPitch: kpe.bytes, width: kpe.bytes, height: 1,
+        }),
       ]);
     }
   }
@@ -1131,7 +1149,22 @@ export class Glm51Model extends ChatModel {
       }
       return sequence.getTokenIds().at(-1);
     });
-    const chunk = this.selectPrefillChunk(inputIdsList, chunkSize, overlaps);
+    // Fix A (CORRECTED per consult #8 verdict Q3a): the tail-merge overflow is
+    // a caller-approved option ONLY for this qualified GLM single-request
+    // phased path. Eligibility inputs are fixed HERE, before any MTP rewind
+    // below — no try/catch retry on a mutated cache. `inputIdsList.length` is
+    // the ORIGINAL batch length (empty rows count, so [8198, []] stays
+    // ineligible), ws.maxSeqLen is the real workspace capacity (planPrefill
+    // rejects totals above it; merged halves must fit), and `mtp` mirrors the
+    // planner that will plan the merged chunk (planPrefillChunk's phased
+    // branch below). Unphased/batched/other-model/unqualified-chunk calls use
+    // the base selector defaults and keep today's greedy slicing. The
+    // per-call tailMergeMax = 0 hook reproduces pre-Fix-A splitting exactly.
+    const chunk = this.selectPrefillChunk(inputIdsList, chunkSize, overlaps, {
+      maxSeqLen: ws.maxSeqLen,
+      batchLength: inputIdsList.length,
+      mtp: this.mtp,
+    });
     // Only selected rows rewind; deferred rows retain their cache and history.
     for (let i = 0; i < sequences.length; i++) {
       if (chunk.prefillInputIdsList[i].length && overlaps[i] !== undefined) {
