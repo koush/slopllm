@@ -116,9 +116,19 @@ RUN rm -rf .git \
     && find node_modules/.bin -xtype l -delete
 
 # ---------------------------------------------------------------------------
-# Runtime image: CUDA runtime libraries only (cudart, cublas, nccl are all in
-# the runtime flavor; no nvcc, Nsight, or dev headers).
-FROM nvidia/cuda:13.3.1-runtime-ubuntu24.04
+# Runtime image: the base (cudart-only) flavor plus exactly the libraries the
+# native addon links against (ldd: cudart, cublas/cublasLt, nccl). The runtime
+# flavor would add ~1.6GB of unused math libraries (cusolver, cufft, cusparse,
+# npp, curand, nvrtc, cuda-compat). Versions are pinned to match the devel
+# builder image's held packages.
+FROM nvidia/cuda:13.3.1-base-ubuntu24.04
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libcublas-13-3=13.6.0.2-1 \
+        libnccl2=2.30.7-1+cuda13.3 \
+    && apt-mark hold libcublas-13-3 libnccl2 \
+    && rm -rf /var/lib/apt/lists/*
 
 # Node.js and npm from the builder (the same binary the addon was built
 # against; the tarball layout ships npm alongside node).
