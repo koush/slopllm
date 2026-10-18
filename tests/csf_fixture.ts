@@ -216,7 +216,8 @@ export function buildCsfFixture(root: string): CsfFixture {
   const weightMap: Record<string, string> = {};
   for (const tensor of tensors) weightMap[tensor.name] = file;
   const metadataFiles: Record<string, string> = {
-    "config.json": JSON.stringify({ model_type: "glm53_fixture", hidden_size: 128 }),
+    "config.json": JSON.stringify({ model_type: "glm53_fixture", hidden_size: 128,
+      quantization_config: { quant_method: "modelopt", quant_algo: "NVFP4" } }),
     "generation_config.json": JSON.stringify({ temperature: 1.0 }),
     "tokenizer_config.json": JSON.stringify({ tokenizer_class: "FixtureTokenizer" }),
     "chat_template.jinja": "{{ messages }}",

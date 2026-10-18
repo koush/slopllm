@@ -1,5 +1,6 @@
 import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
 import fs from "node:fs";
+import { resolveWeightType, type WeightQuantizationConfig } from "./weight_type";
 import path from "node:path";
 import { ChatModelParser, DefaultChatModelParser } from "./chat-model-parser";
 import {
@@ -592,6 +593,12 @@ export abstract class ChatModel extends WorkspaceBase {
   /** The checkpoint source opened by loadWeights (closed after loading). */
   protected checkpointSource?: CheckpointSource;
 
+  private weightQuantizationConfig?: WeightQuantizationConfig;
+
+  protected resolveWeightType(name: string, meta: TensorMeta): string {
+    return resolveWeightType(name, meta, this.weightQuantizationConfig, name => this.checkpointSource!.meta(name));
+  }
+
   protected async loadWeights(modelDir: string): Promise<void> {
     // Shard discovery and physical plane handling live behind the
     // checkpoint-source abstraction: safetensors roots and CSF containers
@@ -655,6 +662,8 @@ export abstract class ChatModel extends WorkspaceBase {
     drawProgress(false);
 
     try {
+      const config = JSON.parse(fs.readFileSync(path.join(source.configDir(), "config.json"), "utf8"));
+      this.weightQuantizationConfig = config.text_config?.quantization_config ?? config.quantization_config;
       for (let i = 0; i < names.length; i += loadBatchSize) {
         const batch = names.slice(i, i + loadBatchSize);
         const results = await Promise.allSettled(

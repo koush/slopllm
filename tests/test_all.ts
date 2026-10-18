@@ -16,6 +16,8 @@ import "./test_prefix_resume";
 import "./test_generation_scheduler";
 import "./test_fp8";
 import "./test_quantize_fp8";
+import "./test_quantized_types";
+import "./test_weight_type";
 import "./test_no_graph";
 import "./test_graph";
 import "./test_cp_prefill";

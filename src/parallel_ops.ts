@@ -3164,6 +3164,9 @@ export class ParallelOps implements DeviceOps {
       case "F32": return NCCL_FLOAT32;
       case "I32": return NCCL_INT32;
       case "F8_E4M3":
+      case "U8_NVFP4":
+      case "U8_MXFP4":
+      case "F8_E8M0":
       case "U8": return NCCL_UINT8;
       default: throw new Error(`Unsupported NCCL datatype for type ${type}`);
     }

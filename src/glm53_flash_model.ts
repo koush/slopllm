@@ -138,7 +138,8 @@ export class Glm53FlashModel extends ChatModel {
     }
     // Retain F32 router/mHC/decay parameters and activation scales verbatim.
     const storeName = name.replace(/\.weight_scale(_2)?$/, ".weight_weight_scale$1");
-    const tensor = this.alloc(meta.shape, meta.dtype, storeName, this.weightParallelism(name));
+    const dtype = this.resolveWeightType(name, meta);
+    const tensor = this.alloc(meta.shape, dtype, storeName, this.weightParallelism(name));
     await this.loadTensorBytes(tensor, source);
   }
 

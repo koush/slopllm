@@ -9,9 +9,13 @@ export interface TensorMeta {
 const DTYPE_BYTES: Record<string, number> = {
   BOOL: 1,
   U8: 1,
+  // Runtime packed-weight types: shapes count bytes, each holding two E2M1 values.
+  U8_NVFP4: 1,
+  U8_MXFP4: 1,
   I8: 1,
   F8_E5M2: 1,
   F8_E4M3: 1,
+  F8_E8M0: 1,
   I16: 2,
   U16: 2,
   F16: 2,

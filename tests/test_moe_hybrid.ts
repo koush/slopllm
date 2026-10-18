@@ -42,7 +42,7 @@ for (const [count, N, K] of [[1, 130, 128], [2, 130, 128], [4, 130, 6144], [8, 1
       return data;
     });
     const weights = packed.map(data => {
-      const tensor = ws.alloc([N, K / 2], "U8");
+      const tensor = ws.alloc([N, K / 2], "U8_NVFP4");
       tensor.h2d(data);
       return tensor;
     });

@@ -31,7 +31,8 @@ function fixture(): { dir: string; [Symbol.dispose](): void } {
     swiglu_limit: 10, index_head_dim: 128, index_n_heads: 2,
     index_kpool: 4, index_kpool_always_select_tail: true, eos_token_id: [1], max_position_embeddings: 1048576,
   };
-  fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ model_type: "glm5_next", text_config: text }));
+  fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ model_type: "glm5_next", text_config: text,
+    quantization_config: { quant_method: "modelopt", quant_algo: "NVFP4" } }));
   fs.writeFileSync(path.join(dir, "tokenizer_config.json"), JSON.stringify({ tokenizer_class: "PreTrainedTokenizer", unk_token: "[UNK]" }));
   fs.writeFileSync(path.join(dir, "tokenizer.json"), JSON.stringify({
     version: "1.0", truncation: null, padding: null, added_tokens: [], normalizer: null,
@@ -148,6 +149,8 @@ it("Flash loader preserves precision/scales, skips vision/MTP, and shards KDA he
   assert.deepEqual((weights.qConv as ParallelTensor).shards[0].shape, [width / 2, 1, 4]);
   const expert = "model.language_model.layers.1.mlp.experts.287.gate_proj";
   assert.equal(model.tensors.get(`${expert}.weight_weight_scale`)!.type, "F8_E4M3");
+  assert.equal(model.tensors.get(`${expert}.weight`)!.type, "U8_NVFP4");
+  assert.equal((model.tensors.get(`${expert}.weight`)! as ParallelTensor).shards[0].type, "U8_NVFP4");
   close(values(model.tensors.get(`${expert}.weight_weight_scale_2`)!), [Math.fround(.1234567)], 0);
   close(values(model.tensors.get(`${expert}.input_scale`)!), [Math.fround(.9876543)], 0);
   assert.equal(model.tensors.get("model.language_model.layers.1.mlp.gate.weight")!.type, "F32");

@@ -267,7 +267,7 @@ export class Glm51Model extends ChatModel {
         await this.loadTensorBytes(lmHead, source);
       }
     } else {
-      const dtype = meta.dtype;
+      const dtype = this.resolveWeightType(name, meta);
       const tensor = this.alloc(meta.shape, dtype, storeName, par);
       await this.loadTensorBytes(tensor, source);
 

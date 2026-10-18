@@ -10,7 +10,7 @@ import { getNativeAddon } from "../src/native-addon";
 function nvfp4Weights(ws: WorkspaceBase, n: number, k: number, prefix: string, parallelism?: TensorParallelism) {
   return Array.from({ length: 8 }, (_, e) => {
     const name = `${prefix}.expert${e}.weight`;
-    const weight = ws.alloc([n, k / 2], "U8", name, parallelism);
+    const weight = ws.alloc([n, k / 2], "U8_NVFP4", name, parallelism);
     weight.h2d(Buffer.alloc(n * k / 2, 0x22));
     ws.alloc([n, k / 16], "F8_E4M3", `${name}_weight_scale`, parallelism).h2d(Buffer.alloc(n * k / 16, 0x38));
     const one = Buffer.alloc(4); one.writeFloatLE(1);

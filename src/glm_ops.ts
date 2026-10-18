@@ -181,7 +181,7 @@ export class GlmTensor extends Tensor {
     if (weight.type === "F8_E4M3") {
       const scale = weight.workspace.tensors.get(weight.name! + "_scale_inv")!;
       getNativeAddon().fp8LinearDecode(this.ops.ctx, out.data, this.data, weight.data, scale.data, batch, n, k);
-    } else if (weight.type === "U8") {
+    } else if (weight.type === "U8_NVFP4") {
       k = k * 2; // NVFP4: weight is [N, K/2] packed, kernel expects K
       const scale = weight.workspace.tensors.get(weight.name! + "_weight_scale")!;
       const scale2 = weight.workspace.tensors.get(weight.name! + "_weight_scale_2")!;
@@ -702,6 +702,9 @@ export class GlmTensor extends Tensor {
   }
 
   mulMatId(weights: Tensor[], expertIds: Tensor, topK: number, count: number, N: number, K: number, name: string): Tensor {
+    if (weights[0]?.type !== "BF16" && weights[0]?.type !== "U8_NVFP4") {
+      throw new Error(`mulMatId: unsupported weight type ${weights[0]?.type}`);
+    }
     const out = this.workspace.alloc([count, N], this.type);
     const ptrName = `__moe_ptrs.${name}`;
     let weightPtrs = this.workspace.tensors.get(ptrName);
@@ -709,7 +712,7 @@ export class GlmTensor extends Tensor {
       weightPtrs = this.workspace.alloc([weights.length], "I64", ptrName);
       weightPtrs.writePointers(weights);
     }
-    if (weights[0].type === "U8") {
+    if (weights[0].type === "U8_NVFP4") {
       const scalePtrName = ptrName + "_weight_scale";
       const scale2PtrName = ptrName + "_weight_scale_2";
       let scalePtrs = this.workspace.tensors.get(scalePtrName);
@@ -752,7 +755,7 @@ export class GlmTensor extends Tensor {
   ): Tensor {
     // 512 routed entries cover 64 tokens (batch 16 with four-position MTP verification).
     const fuseDown = FUSED_MOE_DOWN_REDUCE && this.type === "BF16" &&
-      inputs.down[0]?.type === "U8" && hs === 6144 && moeIntermediate === 256 &&
+      inputs.down[0]?.type === "U8_NVFP4" && hs === 6144 && moeIntermediate === 256 &&
       inputs.down[0].shape[0] === hs && inputs.down[0].shape[1] === moeIntermediate / 2 &&
       topK === 8 && count > 0 && count <= 512 && count % topK === 0;
     if (!fuseDown) {
@@ -768,7 +771,7 @@ export class GlmTensor extends Tensor {
     const ctx = this.ops.ctx;
     const hybrid = NVFP4_MOE_HYBRID_MIN_ROWS > 0 && count >= 256 &&
       inputs.gate.length <= 256 && inputs.up.length === inputs.gate.length &&
-      inputs.gate[0].type === "U8" && inputs.up[0].type === "U8";
+      inputs.gate[0].type === "U8_NVFP4" && inputs.up[0].type === "U8_NVFP4";
     using plan = hybrid ? this.workspace.allocRaw(addon.moeHybridWorkspaceSize(count, moeIntermediate)) : undefined;
     using activated = (() => {
       if (plan) {
@@ -879,7 +882,7 @@ export class GlmTensor extends Tensor {
   ): Tensor {
     super.swiGluMlpMoe(weights, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
 
-    if (count <= NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD || weights.gate[0].type !== "U8") {
+    if (count <= NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD || weights.gate[0].type !== "U8_NVFP4") {
       using gateOutStream = this.workspace.ops.withStream(() => this.mulMatId(weights.gate, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.gate_proj`));
       using upOut = this.mulMatId(weights.up, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.up_proj`);
       gateOutStream.streamWaitEvent();

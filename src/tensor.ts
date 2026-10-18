@@ -343,9 +343,11 @@ export abstract class Tensor implements Disposable {
   protected validateLinear(weight: Tensor): void {
     if (this.shape.length !== 2) throw new Error(`linear: input must be 2D, got shape [${this.shape}]`);
     if (weight.shape.length !== 2) throw new Error(`linear: weight must be 2D, got shape [${weight.shape}]`);
-    const weightK = weight.type === "U8" ? weight.shape[1] * 2 : weight.shape[1]; // NVFP4: packed K/2
+    const packed = weight.type === "U8_NVFP4" || weight.type === "U8_MXFP4";
+    const weightK = packed ? weight.shape[1] * 2 : weight.shape[1]; // FP4: packed K/2
     if (this.shape[1] !== weightK) throw new Error(`linear: input dim ${this.shape[1]} != weight dim ${weightK} (weight type ${weight.type}, shape [${weight.shape}])`);
-    if (weight.type !== "BF16" && weight.type !== "F8_E4M3" && weight.type !== "U8") throw new Error(`linear: weight type must be BF16, F8_E4M3, or U8, got ${weight.type}`);
+    if (weight.type !== "BF16" && weight.type !== "F8_E4M3" && !packed) throw new Error(`linear: weight type must be BF16, F8_E4M3, U8_NVFP4, or U8_MXFP4, got ${weight.type}`);
+    if (weight.type === "U8_MXFP4") throw new Error("linear: MXFP4 execution is not implemented");
   }
 
   protected validateGroupedLinear(weights: readonly Tensor[]): void {
