@@ -149,6 +149,9 @@ void glm_topk_to_slots(GlmCtx* ctx, int32_t* slots, int32_t* topk_length, const 
                        const int32_t* kv_token_indptr);
 
 cudaError_t glm_fill(GlmCtx* ctx, void* out, double value, int n, const char* dtype);
+cudaError_t glm_decode_csf(GlmCtx* ctx, uint8_t* out, const uint8_t* fixed,
+    const uint32_t* exceptions, int32_t* status, int rows, int columns,
+    int exception_count, int row_offset, int column_offset, int out_rows, int out_columns);
 // Up to eight device ranges, issued concurrently within one bounded grid.
 void glm_prefetch_l2(GlmCtx* ctx, const void* const* data, const size_t* bytes, int count);
 

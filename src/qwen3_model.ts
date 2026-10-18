@@ -4,8 +4,9 @@ import { PagedKVCache, PAGE_SIZE } from "../src/paged_kv";
 import type { ChatCache } from "./chat_model";
 import { ChatModel, CommonModelConfig } from "./chat_model";
 import { DeviceOps, TensorParallelism } from "./device_ops";
+import type { CheckpointTensor } from "./checkpoint_source";
 import { resolveModelPath } from "./model_path";
-import { SafeTensorFile, type TensorMeta } from "./safetensors";
+import type { TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { ExecutionState } from "./execution-workspace";
@@ -77,23 +78,21 @@ export class Qwen3Model extends ChatModel {
     return TensorParallelism.Replicated;
   }
 
-  protected async loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void> {
+  protected async loadTensor(name: string, meta: TensorMeta, source: CheckpointTensor): Promise<void> {
     const par = this.weightParallelism(name);
 
     if (name.endsWith("_scale_inv")) {
       const tensor = this.alloc(meta.shape, "BF16", name, par);
-      const offset = st.dataStart + meta.dataOffsets[0];
-      await tensor.mmapLoad(mmapPtr, offset, tensor.bytes);
+      await this.loadTensorBytes(tensor, source);
     } else {
       const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;
       const tensor = this.alloc(meta.shape, dtype, name, par);
-      const offset = st.dataStart + meta.dataOffsets[0];
       const lmHead = this.cfg.tieWordEmbeddings && name === "model.embed_tokens.weight" && !this.tensors.has("lm_head.weight")
         ? this.alloc(meta.shape, dtype, "lm_head.weight", TensorParallelism.Column)
         : undefined;
       await Promise.all([
-        tensor.mmapLoad(mmapPtr, offset, tensor.bytes),
-        lmHead?.mmapLoad(mmapPtr, offset, lmHead.bytes),
+        this.loadTensorBytes(tensor, source),
+        lmHead ? this.loadTensorBytes(lmHead, source) : undefined,
       ]);
     }
   }

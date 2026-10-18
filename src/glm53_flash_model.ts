@@ -1,10 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ChatModel, type ChatCache, type CommonModelConfig } from "./chat_model";
+import type { CheckpointTensor } from "./checkpoint_source";
 import { type DeviceOps, TensorParallelism } from "./device_ops";
 import type { ExecutionState } from "./execution-workspace";
 import { resolveModelPath } from "./model_path";
-import { type SafeTensorFile, type TensorMeta } from "./safetensors";
+import type { TensorMeta } from "./safetensors";
 import type { Tensor } from "./tensor";
 import type { KdaWeights } from "./kda";
 
@@ -125,7 +126,7 @@ export class Glm53FlashModel extends ChatModel {
     return TensorParallelism.Replicated;
   }
 
-  protected async loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void> {
+  protected async loadTensor(name: string, meta: TensorMeta, source: CheckpointTensor): Promise<void> {
     if (name.startsWith("model.visual.")) return;
     const layer = /^model\.language_model\.layers\.(\d+)\./.exec(name);
     if (layer && Number(layer[1]) >= this.cfg.numHiddenLayers) return; // MTP, including MXFP8 experts.
@@ -138,7 +139,7 @@ export class Glm53FlashModel extends ChatModel {
     // Retain F32 router/mHC/decay parameters and activation scales verbatim.
     const storeName = name.replace(/\.weight_scale(_2)?$/, ".weight_weight_scale$1");
     const tensor = this.alloc(meta.shape, meta.dtype, storeName, this.weightParallelism(name));
-    await tensor.mmapLoad(mmapPtr, st.dataStart + meta.dataOffsets[0], tensor.bytes);
+    await this.loadTensorBytes(tensor, source);
   }
 
   createChatCache(): ChatCache {

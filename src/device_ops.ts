@@ -86,6 +86,21 @@ export function notifyHostWorldSynchronization(workspaces: WeakRef<WorkspaceBase
   }
 }
 
+export function validateCsfScaleDecode(output: Tensor, fixed: Tensor, exceptions: Tensor, status: Tensor,
+  rows: number, columns: number, rowOffset: number, columnOffset: number, exceptionCount: number): void {
+  if (![rows, columns, rowOffset, columnOffset].every(Number.isSafeInteger)
+    || rows <= 0 || rows % 16 || columns <= 0 || columns % 2 || rows * columns > 0x1000000
+    || output.shape.length !== 2 || !["F8_E4M3", "U8"].includes(output.type)
+    || rowOffset < 0 || columnOffset < 0
+    || rowOffset + output.shape[0] > rows || columnOffset + output.shape[1] > columns
+    || fixed.type !== "U8" || fixed.bytes !== rows * (1 + columns / 2)
+    || exceptions.type !== "U8" || exceptions.bytes % 4
+    || !Number.isSafeInteger(exceptionCount) || exceptionCount < 0 || exceptionCount * 4 > exceptions.bytes
+    || status.type !== "I32" || status.numElements < 1) {
+    throw new Error("decodeCsfScales: invalid scale geometry, window, or plane buffers");
+  }
+}
+
 export interface DeviceOps extends Disposable {
   readonly worldSize: number;
   synchronizeListeners: WeakRef<WorkspaceBase>[];
@@ -112,6 +127,11 @@ export interface DeviceOps extends Disposable {
   withStream<T>(fn: () => T): StreamResult<T>;
   /** Best-effort L2 warming of up to eight local tensor ranges in one grid; batch enables decode column-narrow mirroring. */
   prefetchL2Linear(tensors: readonly Tensor[], batch?: number): void;
+  /** Expand byte-window4 CSF into an allocated row-major scale window.
+   * status is nonzero for invalid planes; resetStatus=false accumulates errors across decodes. */
+  decodeCsfScales(output: Tensor, fixed: Tensor, exceptions: Tensor, status: Tensor,
+    rows: number, columns: number, rowOffset?: number, columnOffset?: number,
+    exceptionCount?: number, resetStatus?: boolean): void;
 
   /**
    * Executes many flat copies in a single CUDA submission.

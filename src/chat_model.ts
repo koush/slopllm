@@ -2,14 +2,20 @@ import { AutoTokenizer } from "@huggingface/transformers/tokenizers";
 import fs from "node:fs";
 import path from "node:path";
 import { ChatModelParser, DefaultChatModelParser } from "./chat-model-parser";
-import { DeviceOps } from "./device_ops";
+import {
+  openCheckpointSource,
+  resolveCheckpointConfigDir,
+  type CheckpointSource,
+  type CheckpointTensor,
+} from "./checkpoint_source";
+import { DeviceOps, TensorParallelism, type StridedMmap } from "./device_ops";
 import { EagerExecution, type ExecutionManager } from "./execution-manager";
 import { ExecutionState, type ExecutionWorkspace } from "./execution-workspace";
 import { f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import { mmapClose, mmapOpen } from "./native-addon";
 import { PagedKVCache } from "./paged_kv";
-import { SafeTensorFile, type TensorMeta } from "./safetensors";
+import type { TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
@@ -471,53 +477,144 @@ export abstract class ChatModel extends WorkspaceBase {
     };
   }
 
-  protected abstract loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void>;
+  protected abstract loadTensor(name: string, meta: TensorMeta, source: CheckpointTensor): Promise<void>;
 
-  protected async loadWeights(modelDir: string): Promise<void> {
-    const allFiles = fs.readdirSync(modelDir);
-    const shards: string[] = [];
-    if (allFiles.includes('model.safetensors')) {
-      shards.push(path.join(modelDir, 'model.safetensors'));
-    } else {
-      const indexFile = allFiles.find(f => f.endsWith('.index.json') || f.endsWith('.safetensors.json'));
-      if (indexFile) {
-        const idx = JSON.parse(fs.readFileSync(path.join(modelDir, indexFile), 'utf-8'));
-        const weightMap = idx.weight_map ?? idx;
-        for (const f of Object.values(weightMap)) {
-          if (typeof f === 'string' && f.endsWith('.safetensors') && !shards.includes(path.join(modelDir, f))) {
-            shards.push(path.join(modelDir, f));
-          }
-        }
-      } else {
-        shards.push(...allFiles.filter(f => f.endsWith('.safetensors')).map(f => path.join(modelDir, f)));
+  /**
+   * Executor replay (SLOPLLM_SKIP_MMAP_LOAD) reconstructs allocation
+   * layouts only: model loading must not read the checkpoint or move data.
+   * mmapLoad already skips its transfer at the tensor layer; staged uploads
+   * and source reads are guarded here. h2d itself is never
+   * disabled — executors upload tokens and planning data while serving.
+   */
+  protected get loadReplay(): boolean {
+    return process.env.SLOPLLM_MODEL_LOAD_REPLAY === "1" || !!process.env.SLOPLLM_SKIP_MMAP_LOAD;
+  }
+
+  /** h2d enqueues asynchronously; staging must survive until the next drain. */
+  private pendingLoadBuffers: Buffer[] = [];
+  private pendingLoadTensors: Tensor[] = [];
+  private csfLoadStatus?: Tensor;
+
+  /** All batch uploads and decodes are enqueued before these ranges become reusable. */
+  private releaseLoadTensors(): void {
+    for (const tensor of this.pendingLoadTensors) tensor[Symbol.dispose]();
+    this.pendingLoadTensors.length = 0;
+  }
+
+  protected uploadStaged(tensor: Tensor, bytes: Buffer): void {
+    if (this.loadReplay) return;
+    this.pendingLoadBuffers.push(bytes);
+    tensor.h2d(bytes);
+  }
+
+  /** Complete queued copies before releasing host staging buffers. */
+  protected async drainLoadTransfers(): Promise<void> {
+    try {
+      await this.ops.synchronizeAsync();
+      if (!this.loadReplay && this.csfLoadStatus?.readInt32LEArray().some(value => value !== 0)) {
+        throw new Error("Invalid CSF scale planes detected during model loading");
+      }
+    } finally {
+      this.releaseLoadTensors();
+      this.pendingLoadBuffers.length = 0;
+      this.csfLoadStatus?.[Symbol.dispose]();
+      this.csfLoadStatus = undefined;
+    }
+  }
+
+  /**
+   * Load one tensor's logical bytes into a device tensor: direct file
+   * mapping when the bytes are physically contiguous, GPU expansion for CSF,
+   * and host staging otherwise. Multiple strided specs fill
+   * disjoint destination regions of the same tensor.
+   */
+  protected async loadTensorBytes(tensor: Tensor, source: CheckpointTensor, strided?: StridedMmap): Promise<void> {
+    await this.loadTensorStrided(tensor, source, strided ? [strided] : []);
+  }
+
+  protected async loadTensorStrided(tensor: Tensor, source: CheckpointTensor, specs: StridedMmap[]): Promise<void> {
+    if (source.csf) {
+      if (specs.length) throw new Error(`Strided CSF scale loading is unsupported: ${source.name}`);
+      const csf = source.csf;
+      // Replay these allocations as well as the named destination, preserving the arena layout.
+      const fixed = this.alloc([csf.fixedBytes], "U8");
+      this.pendingLoadTensors.push(fixed);
+      const exceptions = this.alloc([Math.max(4, csf.exceptionBytes)], "U8");
+      this.pendingLoadTensors.push(exceptions);
+      if (!this.csfLoadStatus) {
+        this.csfLoadStatus = this.alloc([this.ops.worldSize], "I32", undefined, TensorParallelism.Column);
+        if (!this.loadReplay) this.csfLoadStatus.fill(0, this.ops.worldSize);
+      }
+      if (!this.loadReplay) {
+        const planes = csf.mapping();
+        if (!planes) throw new Error(`CSF loading requires mapped planes: ${source.name}`);
+        // Wait for both native workers to enqueue their copies on the current
+        // stream, even if one fails, before closing mappings or releasing inputs.
+        const copies = await Promise.allSettled([
+          fixed.mmapLoad(planes.fixed.mmapPtr, planes.fixed.offset, csf.fixedBytes),
+          ...(csf.exceptionBytes ? [exceptions.mmapLoad(planes.exceptions.mmapPtr,
+            planes.exceptions.offset, csf.exceptionBytes)] : []),
+        ]);
+        const failure = copies.find(result => result.status === "rejected");
+        if (failure?.status === "rejected") throw failure.reason;
+        this.ops.decodeCsfScales(tensor, fixed, exceptions, this.csfLoadStatus, csf.rows, csf.columns,
+          0, 0, csf.exceptionBytes / 4, false);
+      }
+      return;
+    }
+    // Allocation-only replay: no source reads, no expansion, no transfers.
+    if (this.loadReplay) return;
+    const mapping = source.mapping();
+    if (mapping) {
+      for (const spec of specs) {
+        await tensor.mmapLoad(mapping.mmapPtr, mapping.offset, tensor.bytes, spec);
+      }
+      if (!specs.length) {
+        await tensor.mmapLoad(mapping.mmapPtr, mapping.offset, tensor.bytes);
+      }
+      return;
+    }
+    const bytes = source.read();
+    if (!specs.length) {
+      this.uploadStaged(tensor, bytes);
+      return;
+    }
+    const out = Buffer.alloc(tensor.bytes);
+    for (const spec of specs) {
+      for (let r = 0; r < spec.height; r++) {
+        const src = spec.srcOffset + r * spec.srcPitch;
+        bytes.copy(out, spec.dstOffset + r * spec.dstPitch, src, src + spec.width);
       }
     }
+    this.uploadStaged(tensor, out);
+  }
 
-    // Iterating the index's weight_map gives shards in first-mention order
-    // (arbitrary: lm_head/embed sort before model.layers.*, so the shard
-    // with the final layers loads first). Load in filename order so
-    // progress tracks the checkpoint layout.
-    shards.sort();
+  /** The checkpoint source opened by loadWeights (closed after loading). */
+  protected checkpointSource?: CheckpointSource;
 
-    const openShards = shards.map(stPath => {
-      const st = SafeTensorFile.open(stPath);
-      const mmapPtr = mmapOpen(stPath);
-      const fileSize = fs.statSync(stPath).size;
-      return { st, mmapPtr, fileSize };
-    });
+  protected async loadWeights(modelDir: string): Promise<void> {
+    // Shard discovery and physical plane handling live behind the
+    // checkpoint-source abstraction: safetensors roots and CSF containers
+    // both expose logical source names with dtype/shape and bounded reads.
+    const source = openCheckpointSource(modelDir, { open: mmapOpen, close: mmapClose });
+    this.checkpointSource = source;
+    const names = source.names();
 
-    const loadBatchSize = parseInt(process.env.SLOPLLM_LOAD_BATCH_SIZE ?? "8", 10);
+    const loadBatchSize = Number(process.env.SLOPLLM_LOAD_BATCH_SIZE ?? "8");
+    if (!Number.isSafeInteger(loadBatchSize) || loadBatchSize < 1) {
+      source.close();
+      throw new Error(`Invalid SLOPLLM_LOAD_BATCH_SIZE: ${loadBatchSize}`);
+    }
     const layerRe = /^model\.(?:language_model\.)?layers\.(\d+)\./;
     let totalTensors = 0;
     let totalBytes = 0;
     let maxLayer = -1;
-    for (const { st } of openShards) {
-      for (const name of st.tensorNames()) {
-        totalTensors++;
-        totalBytes += st.meta(name).dataOffsets[1] - st.meta(name).dataOffsets[0];
-        const layerMatch = layerRe.exec(name);
-        if (layerMatch) maxLayer = Math.max(maxLayer, Number(layerMatch[1]));
-      }
+    for (const name of names) {
+      const meta = source.meta(name);
+      totalTensors++;
+      totalBytes += meta.dataOffsets[1] - meta.dataOffsets[0];
+      const layerMatch = layerRe.exec(name);
+      if (layerMatch) maxLayer = Math.max(maxLayer, Number(layerMatch[1]));
     }
 
     let loadedTensors = 0;
@@ -557,46 +654,53 @@ export abstract class ChatModel extends WorkspaceBase {
 
     drawProgress(false);
 
-    for (const { st, mmapPtr } of openShards) {
-      const names = st.tensorNames();
+    try {
       for (let i = 0; i < names.length; i += loadBatchSize) {
         const batch = names.slice(i, i + loadBatchSize);
-        await Promise.all(
+        const results = await Promise.allSettled(
           batch.map(name =>
-            this.loadTensor(name, st.meta(name), st, mmapPtr)
+            this.loadTensor(name, source.meta(name), source.tensor(name))
           )
         );
+        const failure = results.find(result => result.status === "rejected");
+        if (failure?.status === "rejected") throw failure.reason;
         for (const name of batch) {
-          loadedBytes += st.meta(name).dataOffsets[1] - st.meta(name).dataOffsets[0];
+          const meta = source.meta(name);
+          loadedBytes += meta.dataOffsets[1] - meta.dataOffsets[0];
         }
         loadedTensors += batch.length;
         const layerMatch = layerRe.exec(batch[batch.length - 1]);
         if (layerMatch) currentLayer = Math.max(currentLayer, Number(layerMatch[1]));
+        this.releaseLoadTensors();
         drawProgress(false);
       }
+    } finally {
+      // One completion/validation boundary for the entire load. Mappings and
+      // staged host buffers stay alive until all queued copies have completed.
+      try {
+        await this.drainLoadTransfers();
+      } finally {
+        source.close();
+      }
     }
-
-    await this.ops.synchronizeAsync();
 
     drawProgress(true);
     if (isTty) process.stderr.write(`\r${" ".repeat(lastLineLength)}\r`);
     console.log(`Loaded ${totalTensors} weight tensors (${giB(totalBytes)}) in ${((performance.now() - startedMs) / 1000).toFixed(1)}s`);
-
-    for (const { st, mmapPtr, fileSize } of openShards) {
-      st.close();
-      mmapClose(mmapPtr, fileSize);
-    }
   }
 
   protected async fromPretrained(modelDir: string, tokenizerRepo: string): Promise<void> {
     await this.loadWeights(modelDir);
-    const tokenizerDir = fs.existsSync(path.join(modelDir, "tokenizer_config.json"))
-      ? modelDir
+    // CSF containers resolve model config, tokenizer, generation config and
+    // the chat template from their metadata/ directory.
+    const configDir = resolveCheckpointConfigDir(modelDir);
+    const tokenizerDir = fs.existsSync(path.join(configDir, "tokenizer_config.json"))
+      ? configDir
       : resolveModelPath(tokenizerRepo);
     this.tokenizer = await AutoTokenizer.from_pretrained(tokenizerDir, { local_files_only: true });
 
     // Served checkpoints may override the tokenizer repository's template.
-    const chatTemplatePath = [modelDir, tokenizerDir]
+    const chatTemplatePath = [configDir, tokenizerDir]
       .map(dir => path.join(dir, "chat_template.jinja"))
       .find(candidate => fs.existsSync(candidate));
     if (chatTemplatePath) {
@@ -605,8 +709,8 @@ export abstract class ChatModel extends WorkspaceBase {
       this.tokenizer.chat_template = fs.readFileSync(chatTemplatePath, "utf-8")
         .replace(/\.(\d+)\b/g, "[$1]");
     }
-    this.cfg.maxPositionEmbeddings = loadMaxPositionEmbeddings(modelDir);
-    this.cfg.generationConfig = loadGenerationConfig(modelDir);
+    this.cfg.maxPositionEmbeddings = loadMaxPositionEmbeddings(configDir);
+    this.cfg.generationConfig = loadGenerationConfig(configDir);
     this.freeze();
   }
 }

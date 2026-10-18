@@ -6,7 +6,7 @@ import { MemcpyKind } from "./sampling";
 import { Tensor } from "./tensor";
 import { WorkspaceBase } from "./workspace";
 import type { HeapKey } from "./heap";
-import type { MhcPreResult } from "./device_ops";
+import { validateCsfScaleDecode, type MhcPreResult } from "./device_ops";
 import { validateKdaScan, validateKdaNorm, validateMhcPre, validateMhcPost, validateMhcStreams } from "./flash_hybrid_validation";
 
 export class MetaTensor extends Tensor {
@@ -355,6 +355,12 @@ export class MetaOps implements DeviceOps {
 
     hostSynchronizeWorld(): void {
         notifyHostWorldSynchronization(this.synchronizeListeners);
+    }
+
+    decodeCsfScales(output: Tensor, fixed: Tensor, exceptions: Tensor, status: Tensor,
+        rows: number, columns: number, rowOffset = 0, columnOffset = 0,
+        exceptionCount = exceptions.bytes / 4, _resetStatus = true): void {
+        validateCsfScaleDecode(output, fixed, exceptions, status, rows, columns, rowOffset, columnOffset, exceptionCount);
     }
 
     prefetchL2Linear(_tensors: readonly Tensor[], _batch?: number): void {

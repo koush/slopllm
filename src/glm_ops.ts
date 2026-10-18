@@ -8,7 +8,7 @@ import type { WorkspaceBase } from "./workspace";
 import { MemcpyKind } from "./enums";
 import { getNativeAddon } from "./native-addon";
 import { sparseMlaChunksPerBlock } from "./sparse-mla-planner";
-import type { MhcPreResult } from "./device_ops";
+import { validateCsfScaleDecode, type MhcPreResult } from "./device_ops";
 import { validateKdaScan, validateKdaNorm, validateMhcPre, validateMhcPost, validateMhcStreams } from "./flash_hybrid_validation";
 
 // Above `count == topK` (single-token decode), mulMatId can either:
@@ -1158,6 +1158,15 @@ export class GlmOps implements DeviceOps {
     notifyHostWorldSynchronization(this.synchronizeListeners);
   }
 
+  decodeCsfScales(output: Tensor, fixed: Tensor, exceptions: Tensor, status: Tensor,
+    rows: number, columns: number, rowOffset = 0, columnOffset = 0,
+    exceptionCount = exceptions.bytes / 4, resetStatus = true): void {
+    validateCsfScaleDecode(output, fixed, exceptions, status, rows, columns, rowOffset, columnOffset, exceptionCount);
+    if (resetStatus) status.fill(0, 1);
+    getNativeAddon().decodeCsf(this.ctx, output.data, fixed.data, exceptions.data, status.data,
+      rows, columns, exceptionCount, rowOffset, columnOffset, output.shape[0], output.shape[1]);
+  }
+
   prefetchL2Linear(tensors: readonly Tensor[], _batch?: number): void {
     if (tensors.length > 8) throw new Error("prefetchL2 supports at most eight tensors");
     for (const tensor of tensors) {
@@ -2087,7 +2096,7 @@ const srcOps = (copies[0].src as GlmTensor).ops;
 }
 
 export function f32ToBf16Bytes(arr: Float32Array): Buffer {
-  const u32 = new Uint32Array(arr.buffer);
+  const u32 = new Uint32Array(arr.buffer, arr.byteOffset, arr.length);
   const u16 = new Uint16Array(u32.length);
   for (let i = 0; i < u32.length; i++) {
     u16[i] = u32[i] >>> 16;

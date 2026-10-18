@@ -6,7 +6,8 @@ import { ExecutionState, ExecutionWorkspace } from "./execution-workspace";
 import { f32ToBf16Bytes } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import { PagedKVCache, PAGE_SIZE } from "./paged_kv";
-import { SafeTensorFile, type TensorMeta } from "./safetensors";
+import type { CheckpointTensor } from "./checkpoint_source";
+import type { TensorMeta } from "./safetensors";
 import { Tensor } from "./tensor";
 import { UsingHolder } from "./using-holder";
 
@@ -153,7 +154,7 @@ export class Qwen35Model extends ChatModel {
     return TensorParallelism.Replicated;
   }
 
-  protected async loadTensor(name: string, meta: TensorMeta, st: SafeTensorFile, mmapPtr: number): Promise<void> {
+  protected async loadTensor(name: string, meta: TensorMeta, source: CheckpointTensor): Promise<void> {
     // This backend executes the text decoder only.
     if (name.startsWith("model.visual.")) return;
     const prefix = Qwen35Model.WEIGHT_PREFIX;
@@ -174,10 +175,9 @@ export class Qwen35Model extends ChatModel {
       const numElements = meta.shape.reduce((a, b) => a * b, 1);
       const tensor = this.alloc(meta.shape, "F32", name, par);
       if (meta.dtype === "F32") {
-        const offset = st.dataStart + meta.dataOffsets[0];
-        await tensor.mmapLoad(mmapPtr, offset, tensor.bytes);
+        await this.loadTensorBytes(tensor, source);
       } else {
-        const rawBytes = st.readTensor(name);
+        const rawBytes = source.read();
         const f32Arr = new Float32Array(numElements);
         for (let i = 0; i < numElements; i++) {
           const u16 = rawBytes.readUInt16LE(i * 2);
@@ -189,7 +189,6 @@ export class Qwen35Model extends ChatModel {
     } else if (isGdnQkv || isGdnConv1d) {
       const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;
       const tensor = this.alloc(meta.shape, dtype, name, par);
-      const offset = st.dataStart + meta.dataOffsets[0];
       const numHeads = this.cfg.linearNumKeyHeads;
       const dK = this.cfg.linearKeyHeadDim;
       const dV = this.cfg.linearValueHeadDim;
@@ -197,13 +196,15 @@ export class Qwen35Model extends ChatModel {
       const bpr = inner * (dtype === "F32" ? 4 : 2);
       const qRows = numHeads * dK;
       const strided: StridedMmap = { srcOffset: 0, dstOffset: 0, srcPitch: bpr, dstPitch: bpr, width: bpr, height: qRows };
-      await tensor.mmapLoad(mmapPtr, offset, tensor.bytes, strided);
-      await tensor.mmapLoad(mmapPtr, offset, tensor.bytes, { ...strided, srcOffset: qRows * bpr, dstOffset: qRows * bpr, height: numHeads * dK });
-      await tensor.mmapLoad(mmapPtr, offset, tensor.bytes, { ...strided, srcOffset: 2 * qRows * bpr, dstOffset: 2 * qRows * bpr, height: numHeads * dV });
+      await this.loadTensorStrided(tensor, source, [
+        strided,
+        { ...strided, srcOffset: qRows * bpr, dstOffset: qRows * bpr, height: numHeads * dK },
+        { ...strided, srcOffset: 2 * qRows * bpr, dstOffset: 2 * qRows * bpr, height: numHeads * dV },
+      ]);
     } else if (meta.dtype === "F32") {
       const numElements = meta.shape.reduce((a, b) => a * b, 1);
       const tensor = this.alloc(meta.shape, "BF16", name, par);
-      const f32Bytes = st.readTensor(name);
+      const f32Bytes = source.read();
       const f32Arr = new Float32Array(f32Bytes.buffer, f32Bytes.byteOffset, numElements);
       if (isGemmaNorm) {
         for (let i = 0; i < numElements; i++) f32Arr[i] += 1.0;
@@ -212,7 +213,7 @@ export class Qwen35Model extends ChatModel {
     } else if (isGemmaNorm) {
       const numElements = meta.shape.reduce((a, b) => a * b, 1);
       const tensor = this.alloc(meta.shape, "BF16", name, par);
-      const rawBytes = st.readTensor(name);
+      const rawBytes = source.read();
       const f32Arr = new Float32Array(numElements);
       for (let i = 0; i < numElements; i++) {
         const u16 = rawBytes.readUInt16LE(i * 2);
@@ -223,12 +224,11 @@ export class Qwen35Model extends ChatModel {
     } else {
       const dtype = meta.dtype === "F32" ? "F32" : meta.dtype;
       const tensor = this.alloc(meta.shape, dtype, name, par);
-      const offset = st.dataStart + meta.dataOffsets[0];
-      await tensor.mmapLoad(mmapPtr, offset, tensor.bytes);
+      await this.loadTensorBytes(tensor, source);
 
       if (this.cfg.tieWordEmbeddings && name === `${prefix}embed_tokens.weight` && !this.tensors.has("lm_head.weight")) {
         const lmHead = this.alloc(meta.shape, dtype, "lm_head.weight", TensorParallelism.Column);
-        await lmHead.mmapLoad(mmapPtr, offset, lmHead.bytes);
+        await this.loadTensorBytes(lmHead, source);
       }
     }
   }

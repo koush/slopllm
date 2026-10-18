@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { ChatModel } from "./chat_model";
+import { resolveCheckpointConfigDir } from "./checkpoint_source";
 import type { DeviceOps } from "./device_ops";
 import { Glm51Model } from "./glm51_model";
 import { Glm53FlashModel } from "./glm53_flash_model";
@@ -42,7 +43,7 @@ export const modelRegistry = {
 export type ModelType = keyof typeof modelRegistry;
 
 export function inspectModel(modelDir: string, options: ModelOptions) {
-  const configPath = path.join(modelDir, "config.json");
+  const configPath = path.join(resolveCheckpointConfigDir(modelDir), "config.json");
   const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
   const modelType = config?.model_type;
   if (typeof modelType !== "string" || !Object.hasOwn(modelRegistry, modelType)) {

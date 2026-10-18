@@ -9,7 +9,7 @@ import { SafeTensorFile } from "./safetensors";
 import { Tensor, type MoeRoutingOptions, type MoeRoutingResult } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
-import type { MhcPreResult } from "./device_ops";
+import { validateCsfScaleDecode, type MhcPreResult } from "./device_ops";
 import { validateKdaScan, validateKdaNorm, validateMhcPre, validateMhcPost, validateMhcStreams } from "./flash_hybrid_validation";
 
 // Fall back to the read-based (pull) CP merge; the push path is the default.
@@ -3480,6 +3480,25 @@ export class ParallelOps implements DeviceOps {
     for (const device of this.devices) {
       device.printHeap();
     }
+  }
+
+  decodeCsfScales(output: Tensor, fixed: Tensor, exceptions: Tensor, status: Tensor,
+    rows: number, columns: number, rowOffset = 0, columnOffset = 0,
+    exceptionCount = exceptions.bytes / 4, resetStatus = true): void {
+    validateCsfScaleDecode(output, fixed, exceptions, status, rows, columns, rowOffset, columnOffset, exceptionCount);
+    const out = this.cast(output);
+    const f = this.cast(fixed);
+    const e = this.cast(exceptions);
+    const s = this.cast(status);
+    if (f.parallelism !== TensorParallelism.Replicated || e.parallelism !== TensorParallelism.Replicated
+      || s.parallelism !== TensorParallelism.Column || s.numElements !== this.worldSize
+      || ![TensorParallelism.Replicated, TensorParallelism.Column, TensorParallelism.Row].includes(out.parallelism)) {
+      throw new Error("decodeCsfScales: expected replicated source planes and one status per GPU");
+    }
+    out.shards.forEach((shard, rank) => this.devices[rank].decodeCsfScales(shard,
+      f.shards[rank], e.shards[rank], s.shards[rank], rows, columns,
+      rowOffset + (out.parallelism === TensorParallelism.Column ? rank * shard.shape[0] : 0),
+      columnOffset + (out.parallelism === TensorParallelism.Row ? rank * shard.shape[1] : 0), exceptionCount, resetStatus));
   }
 
   prefetchL2Linear(tensors: readonly Tensor[], batch?: number): void {

@@ -85,6 +85,32 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 > **Note:** the server does not perform an exhaustive warmup across all context length and batch size combinations. When a new combination is first encountered, CUDA graphs must be captured for it, causing a momentary stall at these graph compile points. Subsequent requests with the same shape replay the captured graph without stalling.
 
+### CSF checkpoints
+
+`local-inference-lab/GLM-5.3-NVFP4-CSF` is supported through its
+`lil-nvfp4-csf-checkpoint/1` container and
+`byte-window4-fixed-stream-u24-exceptions/1` scale encoding. Download the
+complete repository, including `metadata/`, `receipts/`, and `tensors/`:
+
+```bash
+hf download local-inference-lab/GLM-5.3-NVFP4-CSF
+npx tsx src/run_model_loader.ts \
+  --model local-inference-lab/GLM-5.3-NVFP4-CSF \
+  --arena 92 --gpus 0,4,5,7,1,2,3,6 --cp --mtp \
+  src/openai-server.ts --port 8000 --max-pages 8192 --phased-prefill
+```
+
+Loading asynchronously mmap-uploads compressed scale planes to temporary GPU
+buffers and expands them directly into the normal named NVFP4 scale weights,
+respecting tensor parallelism and `SLOPLLM_LOAD_BATCH_SIZE`. Inputs are retained
+until the batch's copies and decodes are enqueued, then released for stream-ordered
+reuse. Validation is checked at the final load-completion boundary. Persistent-loader
+executors replay allocations without uploading or decoding the scales again.
+Inference uses the existing NVFP4 kernels and expanded weight memory footprint;
+CSF compression saves checkpoint storage, not resident GPU memory.
+
+Other CSF container versions and scale encodings are not supported by this reader.
+
 ## Building
 
 ```bash

@@ -673,6 +673,23 @@ static Napi::Value Fill(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value DecodeCsf(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() != 12) {
+        Napi::TypeError::New(env, "Expected (ctx, out, fixed, exceptions, status, rows, columns, exceptionCount, rowOffset, columnOffset, outRows, outColumns)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    auto ptr = [&](int i) { return info[i].As<Napi::Number>().Int64Value(); };
+    auto n = [&](int i) { return info[i].As<Napi::Number>().Int32Value(); };
+    cudaError_t err = glm_decode_csf(reinterpret_cast<GlmCtx*>(ptr(0)),
+        reinterpret_cast<uint8_t*>(ptr(1)), reinterpret_cast<const uint8_t*>(ptr(2)),
+        reinterpret_cast<const uint32_t*>(ptr(3)), reinterpret_cast<int32_t*>(ptr(4)),
+        n(5), n(6), n(7), n(8), n(9), n(10), n(11));
+    if (err != cudaSuccess)
+        Napi::Error::New(env, std::string("decodeCsf failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    return env.Undefined();
+}
+
 static Napi::Value Gather(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 8) {
@@ -4251,6 +4268,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "gather"), Napi::Function::New(env, Gather));
     exports.Set(Napi::String::New(env, "scatterScalar"), Napi::Function::New(env, ScatterScalar));
     exports.Set(Napi::String::New(env, "deinterleave"), Napi::Function::New(env, Deinterleave));
+    exports.Set(Napi::String::New(env, "decodeCsf"), Napi::Function::New(env, DecodeCsf));
     exports.Set(Napi::String::New(env, "gatherPages"), Napi::Function::New(env, GatherPages));
     exports.Set(Napi::String::New(env, "maskedFill"), Napi::Function::New(env, MaskedFill));
     exports.Set(Napi::String::New(env, "indexAdd"), Napi::Function::New(env, IndexAdd));

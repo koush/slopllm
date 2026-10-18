@@ -1341,6 +1341,69 @@ static cudaError_t launch_fill(GlmCtx* ctx, void* out, T value, int n) {
     return cudaGetLastError();
 }
 
+// Checkpoint byte-window4 scales: 16 row bases followed by packed row-major
+// nibble deltas per slab. Exceptions replace complete E4M3 bytes.
+__global__ void csf_expand_kernel(uint8_t* out, const uint8_t* fixed, int32_t* status,
+    int columns, int row_offset, int column_offset, int out_rows, int out_columns) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= int64_t(out_rows) * out_columns) return;
+    const int row = row_offset + i / out_columns;
+    const int col = column_offset + i % out_columns;
+    const int64_t slab = int64_t(row / 16) * (16 + 8 * columns);
+    const unsigned base = fixed[slab + row % 16];
+    const unsigned packed = fixed[slab + 16 + int64_t(row % 16) * (columns / 2) + col / 2];
+    if (base > 240) atomicOr(status, 1);
+    out[i] = base + ((packed >> (4 * (col % 2))) & 15);
+}
+
+__global__ void csf_exceptions_kernel(uint8_t* out, const uint32_t* exceptions, int32_t* status,
+    int rows, int columns, int count, int row_offset, int column_offset, int out_rows, int out_columns) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint32_t word = exceptions[i];
+    const int position = word & 0xffffff;
+    const unsigned value = word >> 24;
+    if (position >= int64_t(rows) * columns || value > 0x7e
+        || (i && position <= (exceptions[i - 1] & 0xffffff))) {
+        atomicOr(status, 2);
+        return;
+    }
+    const int row = position / columns - row_offset;
+    const int col = position % columns - column_offset;
+    if (row >= 0 && row < out_rows && col >= 0 && col < out_columns)
+        out[int64_t(row) * out_columns + col] = value;
+}
+
+__global__ void csf_validate_kernel(const uint8_t* out, int32_t* status, int64_t count) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count && out[i] > 0x7e) atomicOr(status, 4);
+}
+
+cudaError_t glm_decode_csf(GlmCtx* ctx, uint8_t* out, const uint8_t* fixed,
+    const uint32_t* exceptions, int32_t* status, int rows, int columns,
+    int exception_count, int row_offset, int column_offset, int out_rows, int out_columns) {
+    if (rows <= 0 || rows % 16 || columns <= 0 || columns % 2
+        || int64_t(rows) * columns > 0x1000000 || exception_count < 0
+        || exception_count > int64_t(rows) * columns || row_offset < 0 || column_offset < 0
+        || out_rows <= 0 || out_columns <= 0 || int64_t(row_offset) + out_rows > rows
+        || int64_t(column_offset) + out_columns > columns) return cudaErrorInvalidValue;
+    // Caller initializes status; multiple scale decodes may accumulate errors
+    // for one readback at the end of model loading.
+    cudaError_t err;
+    const int64_t count = int64_t(out_rows) * out_columns;
+    csf_expand_kernel<<<(count + 255) / 256, 256, 0, GLM_STREAM(ctx)>>>(
+        out, fixed, status, columns, row_offset, column_offset, out_rows, out_columns);
+    if ((err = cudaGetLastError()) != cudaSuccess) return err;
+    if (exception_count) {
+        csf_exceptions_kernel<<<(exception_count + 255) / 256, 256, 0, GLM_STREAM(ctx)>>>(
+            out, exceptions, status, rows, columns, exception_count,
+            row_offset, column_offset, out_rows, out_columns);
+        if ((err = cudaGetLastError()) != cudaSuccess) return err;
+    }
+    csf_validate_kernel<<<(count + 255) / 256, 256, 0, GLM_STREAM(ctx)>>>(out, status, count);
+    return cudaGetLastError();
+}
+
 cudaError_t glm_fill(GlmCtx* ctx, void* out, double value, int n, const char* dtype) {
     if (n < 0 || !dtype) return cudaErrorInvalidValue;
     if (n == 0) return cudaSuccess;
