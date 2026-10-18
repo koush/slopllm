@@ -111,8 +111,8 @@ function parseArgs(argv: string[]): Args {
   if (!Number.isInteger(args.maxPages) || args.maxPages < 1) {
     throw new Error(`Invalid --max-pages: ${args.maxPages}`);
   }
-  if (!args.useGlm51 || (args.mtp === 0 && !args.noMtp)) {
-    throw new Error("run_glm51_multiple_mtp requires --glm51 and either --mtp or --no-mtp");
+  if (args.mtp === 0 && !args.noMtp) {
+    throw new Error("run_glm51_multiple_mtp requires either --mtp or --no-mtp");
   }
   if (args.noMtp) {
     args.mtp = 0;
@@ -326,7 +326,8 @@ async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, cache: ChatCa
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   Error.stackTraceLimit = 20;
   const args = parseArgs(argv);
-  const { modelDir } = resolveModelSelection(args);
+  const { modelDir, modelType } = resolveModelSelection(args);
+  if (modelType !== "glm_moe_dsa") throw new Error("run_glm51_multiple_mtp requires a glm_moe_dsa checkpoint");
   const { ops, gpuDevices } = createDeviceOps(args);
   let model: Glm51Model | undefined;
   let cache: ChatCache | undefined;

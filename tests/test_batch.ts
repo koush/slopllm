@@ -618,7 +618,7 @@ describe("Qwen3.5-0.8B chunked prefill tests", () => {
   const PROMPT = [151643, 151644, 151645, 1, 2, 3, 4, 5, 6, 7];
 
   before(async () => {
-    ({ ops, gpuDevices } = createDeviceOps(parseModelArgs(["--qwen35"])));
+    ({ ops, gpuDevices } = createDeviceOps(parseModelArgs(["--model", "Qwen/Qwen3.5-0.8B"])));
     model = await Qwen35Model.fromPretrained(ops, "Qwen/Qwen3.5-0.8B");
     ws = new ExecutionWorkspace(ops, 1, 128);
   });

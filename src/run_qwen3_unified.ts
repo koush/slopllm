@@ -117,11 +117,6 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a === "--meta") args.meta = true;
   }
 
-  if (args.useQwen35 && args.temperature > 0 && args.topP === 0.95 && args.topK === 0 && args.repetitionPenalty === 1.0 && args.presencePenalty === 0) {
-    args.topK = 20;
-    args.repetitionPenalty = 1.1;
-  }
-
   return args;
 }
 
@@ -549,7 +544,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
   const args = parseArgs(argv);
 
-  const { modelDir } = resolveModelSelection(args);
+  const { modelDir, modelType } = resolveModelSelection(args);
+  if (modelType === "qwen3_5" && args.temperature > 0 && args.topP === 0.95 && args.topK === 0 && args.repetitionPenalty === 1.0 && args.presencePenalty === 0) {
+    args.topK = 20;
+    args.repetitionPenalty = 1.1;
+  }
 
   if (args.meta) {
     const metaOps = new MetaOps();

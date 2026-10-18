@@ -2,7 +2,7 @@ import http from "node:http";
 import path from "node:path";
 import util from "node:util";
 import { fork, spawn, type ChildProcess } from "node:child_process";
-import { freeModelRuntime, loadModelRuntime, modelArenaLayoutSignatures, modelLabel, parseModelArgs, type ModelCliArgs } from "./model_cli";
+import { freeModelRuntime, loadModelRuntime, modelArenaLayoutSignatures, modelLabel, parseModelArgs, resolveModelSelection, type ModelCliArgs } from "./model_cli";
 
 export interface LoaderArgs {
   controlHost: string;
@@ -162,8 +162,9 @@ async function main(): Promise<void> {
   const modelArgs = parseModelArgs(loaderArgs.sharedArgs);
   if (loaderArgs.initialCommand) validateWorkerModelArgs(loaderArgs.initialCommand.args, modelArgs);
   if (!modelArgs.arenaExplicit) throw new Error("run_model_loader requires --arena <GiB>");
-  if (modelArgs.useQwen35 || modelArgs.useFp8) {
-    throw new Error("The model loader currently supports Qwen3, GLM-5.1, and GLM-5.3-Flash");
+  const selection = resolveModelSelection(modelArgs);
+  if (!selection.registration.persistentLoader || selection.config.quantization_config?.quant_method === "fp8") {
+    throw new Error("The model loader currently supports non-FP8 Qwen3, GLM, and GLM-5.3-Flash checkpoints");
   }
 
   console.log(`Loading ${modelLabel(modelArgs)} for persistent worker execution...`);

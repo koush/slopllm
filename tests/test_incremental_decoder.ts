@@ -57,8 +57,7 @@ describe("incremental token history compaction (CPU)", () => {
     const modelDir = process.env.SLOPLLM_TOKENIZER_REPO
       ? resolveModelPath(process.env.SLOPLLM_TOKENIZER_REPO)
       : resolveModelSelection({
-        useGlm51: true, useGlm53Flash: false, useQwen35: false, useFp8: false, useNvfp4: true,
-        glm51Small: false, modelDir: undefined, gpus: [], arena: 0, arenaExplicit: false, cp: false, mtp: 0,
+        model: undefined, modelDir: undefined, gpus: [], arena: 0, arenaExplicit: false, cp: false, mtp: 0,
       }).modelDir;
     tokenizer = await AutoTokenizer.from_pretrained(modelDir, { local_files_only: true });
     const internal = tokenizer as unknown as {

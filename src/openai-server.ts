@@ -69,7 +69,6 @@ function parseArgs(argv: string[]): ServerArgs {
     noMtp: false,
     phasedPrefill: true,
   };
-  let phasedPrefillExplicit = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--port" && i + 1 < argv.length) args.port = parseInt(argv[++i], 10);
@@ -88,15 +87,11 @@ function parseArgs(argv: string[]): ServerArgs {
     else if (a === "--decode-latency" && i + 1 < argv.length) args.decodeLatency = parseInt(argv[++i], 10);
     else if (a === "--no-cuda-graph") args.noCudaGraph = true;
     else if (a === "--no-mtp") args.noMtp = true;
-    else if (a === "--phased-prefill") { args.phasedPrefill = true; phasedPrefillExplicit = true; }
+    else if (a === "--phased-prefill") args.phasedPrefill = true;
     else if (a === "--no-phased-prefill") args.phasedPrefill = false;
     else if (a === "--api-key" && i + 1 < argv.length) args.apiKey = argv[++i];
     else if (a === "--admin-api-key" && i + 1 < argv.length) args.adminApiKey = argv[++i];
     else if (a === "--help" || a === "-h") { printHelp(); process.exit(0); }
-  }
-  if (!args.useGlm51) {
-    if (phasedPrefillExplicit) throw new Error("--phased-prefill requires the GLM model");
-    args.phasedPrefill = false;
   }
   if (args.maxPages === 0) {
     args.maxPages = args.batchSize * Math.ceil(args.chunkSize / PAGE_SIZE);
@@ -117,8 +112,9 @@ Options:
   --host <string>               Server host (default: 127.0.0.1)
   --gpu <int>                   GPU device ID (default: 0)
   --gpus <list>                 GPU device IDs
-  --arena <int>                 Arena size in GiB per GPU (default: 92 with the GLM model)
-  --qwen3 / --qwen35            Serve a Qwen test model instead of the default GLM
+  --arena <int>                 Arena size in GiB per GPU (default: 92 for the production checkpoint, otherwise 0)
+  --model <owner/name>          HuggingFace checkpoint (default: local-inference-lab/GLM-5.3-NVFP4)
+  --model-dir <directory>       Local checkpoint directory; exclusive with --model
   --chunk-size <int>            Prefill execution-token budget including overlap (default: 8192)
   --batch-size <int>            Maximum concurrent requests (default: 8)
   --max-pages <int>             KV cache pages (default: batch-size * ceil(chunk-size / 64))
@@ -412,9 +408,13 @@ function sendMetrics(
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   const args = parseArgs(argv);
-  process.env.SLOPLLM_PHASED_PREFILL = args.phasedPrefill ? "1" : "0";
 
-  const { modelDir, repoId: modelName } = resolveModelSelection(args);
+  const { modelDir, repoId: modelName, registration } = resolveModelSelection(args);
+  if (!registration.phasedPrefill) {
+    if (argv.includes("--phased-prefill")) throw new Error("--phased-prefill is not supported by this model");
+    args.phasedPrefill = false;
+  }
+  process.env.SLOPLLM_PHASED_PREFILL = args.phasedPrefill ? "1" : "0";
 
   console.log(`Loading model from ${modelDir}...`);
   const { ops, gpuDevices } = createDeviceOps(args);

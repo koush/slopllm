@@ -1,6 +1,6 @@
 import type { ChatCache, ChatModel } from "./chat_model";
 import { ExecutionWorkspace } from "./execution-workspace";
-import { freeModelRuntime, loadModelRuntime, parseModelArgs } from "./model_cli";
+import { freeModelRuntime, loadModelRuntime, parseModelArgs, resolveModelSelection } from "./model_cli";
 
 interface BenchArgs {
   seqLen: number;
@@ -91,8 +91,8 @@ async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const args = parseArgs(argv);
   const modelArgs = parseModelArgs(argv);
-  if (!modelArgs.useGlm51) {
-    throw new Error("Prefill benchmark requires the GLM model (default; drop --qwen3/--qwen35/--fp8)");
+  if (resolveModelSelection(modelArgs).modelType !== "glm_moe_dsa") {
+    throw new Error("Prefill benchmark requires a glm_moe_dsa checkpoint");
   }
 
   const runtime = await loadModelRuntime(modelArgs);

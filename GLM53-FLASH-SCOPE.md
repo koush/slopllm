@@ -6,7 +6,7 @@ Investigated 2026-10-11. Scope: implementation assessment, without inference-eng
 
 ### Implementation status
 
-The first implementation adds `Glm53FlashModel` and `--glm53-flash` selection, text-only BF16/NVFP4 weight loading, TP weight layouts, and explicit forward/cache stubs. Vision and MTP tensors are skipped. The persistent loader uses the shared model-selection path.
+The first implementation adds `Glm53FlashModel`, text-only BF16/NVFP4 weight loading, TP weight layouts, and explicit forward/cache stubs. Select the checkpoint with `--model <owner/name>` or `--model-dir <directory>`; `model_type: "glm5_next"` selects this implementation. Vision and MTP tensors are skipped. The persistent loader uses the shared model-selection path.
 
 `src/kda.ts` provides per-layer convolution/recurrent state and the complete KDA attention sublayer. Native primitives in `csrc/glm_flash_hybrid.cu` implement the 128-dimensional channel-wise KDA recurrence, sigmoid-gated RMSNorm, mHC pre/Sinkhorn collapse, FP32 post mixing, and stream expansion/final mean. These specialized operations live in `DeviceOps`, with shared shape/dtype/backend validation and implementations in `GlmOps`, `ParallelOps`, and `MetaOps`. They cover single-GPU, head-sharded TP for KDA, replicated TP residual streams for mHC, and metadata-only allocation. Ordinary linear projections remain tensor operations.
 

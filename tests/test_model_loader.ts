@@ -11,12 +11,12 @@ describe("model loader arguments", () => {
       "--control-port", "9000",
       "--gpus", "0,1",
       "--arena", "48",
-      "--glm51",
+      "--model", "local-inference-lab/GLM-5.3-NVFP4",
     ]);
 
     assert.equal(args.controlHost, "0.0.0.0");
     assert.equal(args.controlPort, 9000);
-    assert.deepEqual(args.sharedArgs, ["--gpus", "0,1", "--arena", "48", "--glm51"]);
+    assert.deepEqual(args.sharedArgs, ["--gpus", "0,1", "--arena", "48", "--model", "local-inference-lab/GLM-5.3-NVFP4"]);
     assert.equal(args.initialCommand, null);
   });
 
@@ -37,13 +37,13 @@ describe("model loader arguments", () => {
   it("creates an executor command from a JSON array", () => {
     const command = parseWorkerCommand(
       ["src/run_qwen3_unified.ts", "--max-tokens", "32"],
-      ["--arena", "48", "--glm51"],
+      ["--arena", "48", "--model", "local-inference-lab/GLM-5.3-NVFP4"],
     );
 
     assert.deepEqual(command, {
       mode: "fork",
       entry: path.resolve("src/run_qwen3_unified.ts"),
-      args: ["--arena", "48", "--glm51", "--max-tokens", "32"],
+      args: ["--arena", "48", "--model", "local-inference-lab/GLM-5.3-NVFP4", "--max-tokens", "32"],
     });
   });
 
@@ -91,15 +91,15 @@ describe("model loader arguments", () => {
   });
 
   it("rejects executor overrides of the resident model layout", () => {
-    const expected = parseModelArgs(["--arena", "48", "--gpus", "0,1", "--glm51", "--cp"]);
-    validateWorkerModelArgs(["--arena", "48", "--gpus", "0,1", "--glm51", "--cp", "--port", "8000"], expected);
-    validateWorkerModelArgs(["--arena", "48", "--gpus", "0,1", "--glm51", "--port", "8000"], expected);
+    const expected = parseModelArgs(["--arena", "48", "--gpus", "0,1", "--model", "local-inference-lab/GLM-5.3-NVFP4", "--cp"]);
+    validateWorkerModelArgs(["--arena", "48", "--gpus", "0,1", "--model", "local-inference-lab/GLM-5.3-NVFP4", "--cp", "--port", "8000"], expected);
+    validateWorkerModelArgs(["--arena", "48", "--gpus", "0,1", "--model", "local-inference-lab/GLM-5.3-NVFP4", "--port", "8000"], expected);
     assert.throws(
-      () => validateWorkerModelArgs(["--arena", "48", "--gpus", "2,3", "--glm51", "--cp"], expected),
+      () => validateWorkerModelArgs(["--arena", "48", "--gpus", "2,3", "--model", "local-inference-lab/GLM-5.3-NVFP4", "--cp"], expected),
       /cannot override/,
     );
     assert.throws(
-      () => validateWorkerModelArgs(["--arena", "64", "--gpus", "0,1", "--glm51", "--cp"], expected),
+      () => validateWorkerModelArgs(["--arena", "64", "--gpus", "0,1", "--model", "local-inference-lab/GLM-5.3-NVFP4", "--cp"], expected),
       /cannot override/,
     );
   });

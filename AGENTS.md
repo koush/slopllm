@@ -2,7 +2,7 @@
 
 ## Overview
 
-TypeScript inference engine for GLM models on NVIDIA GPUs. The production default is `local-inference-lab/GLM-5.3-NVFP4`; the implementation and CLI retain the names `Glm51Model` and `--glm51`. Ships a native C++/CUDA addon (`glm.node`) wrapped by TypeScript operator classes. Supports tensor and context parallelism, CUDA graph capture for decode, eager chunked/phased prefill, paged KV caching with prefix sharing, and MTP speculative decoding. Qwen3 and Qwen3.5 are also implemented but serve primarily as broader correctness test targets, not production targets.
+TypeScript inference engine for GLM models on NVIDIA GPUs. The production default is `local-inference-lab/GLM-5.3-NVFP4`; its implementation retains the name `Glm51Model`. Select a cached HuggingFace repository with `--model <owner/name>` or a local checkpoint with `--model-dir <directory>` (mutually exclusive). The implementation is selected from `config.json`'s top-level `model_type` via `src/model_registry.ts`; quantization is inferred from checkpoint tensors. Ships a native C++/CUDA addon (`glm.node`) wrapped by TypeScript operator classes. Supports tensor and context parallelism, CUDA graph capture for decode, eager chunked/phased prefill, paged KV caching with prefix sharing, and MTP speculative decoding. Qwen3 and Qwen3.5 are also implemented but serve primarily as broader correctness test targets, not production targets.
 
 ## Core Abstractions
 
@@ -230,7 +230,7 @@ npx tsx --test tests/test_parallel.ts  # multi-GPU
 
 Executor CUDA contexts, streams, cuBLAS handles, NCCL communicators, graphs, and workspaces are process-local and are released by process teardown. The loader remains the sole owner of the exported arena allocations. For custom direct-P2P collectives, each executor GPU context opens every owner's arena handle and translates tensor pointers through the resulting per-reader/per-owner base table; process-local P2P metadata pointers do not require translation. NCCL collectives remain available as fallback.
 
-The loader supports Qwen3 and the GLM backend (including the default GLM-5.3 checkpoint via `--glm51`). It requires `--arena <GiB>` and rejects `--qwen35` and `--fp8`.
+The loader supports non-FP8 Qwen3, the GLM backend (including the default GLM-5.3 checkpoint), and GLM-5.3-Flash. It requires `--arena <GiB>` and rejects Qwen3.5 and FP8 checkpoints based on checkpoint metadata.
 
 ## Start the Loader
 
@@ -238,7 +238,7 @@ Start the loader and its initial executor in one command:
 
 ```bash
 NCCL_P2P_LEVEL=SYS NCCL_TOPO_FILE=/root/chat/vllm/topo_fixed.xml npx tsx src/run_model_loader.ts \
-  --arena 92 --gpus 0,4,5,7,1,2,3,6 --cp --glm51 --mtp \
+  --arena 92 --gpus 0,4,5,7,1,2,3,6 --cp --model local-inference-lab/GLM-5.3-NVFP4 --mtp \
   src/openai-server.ts --host 0.0.0.0 --port 8000 --max-pages 8192 --phased-prefill
 ```
 
@@ -318,7 +318,7 @@ For `/spawn`, obtain shared model arguments from `GET /model-args` and place the
 curl -X POST http://127.0.0.1:8099/stop
 curl -N -X POST 'http://127.0.0.1:8099/spawn?follow' \
   -H 'content-type: application/json' \
-  -d '["nsys","profile","--trace=cuda,nvtx","--cuda-graph-trace=node","--sample=none","--cpuctxsw=none","--output=/tmp/glm-mtp","node","--require","tsx/cjs","src/run_glm51_multiple_mtp.ts","--arena","92","--gpus","0,4,5,7,1,2,3,6","--cp","--glm51","--mtp","--batch-size","1","--max-new-tokens","128","--max-pages","512"]'
+  -d '["nsys","profile","--trace=cuda,nvtx","--cuda-graph-trace=node","--sample=none","--cpuctxsw=none","--output=/tmp/glm-mtp","node","--require","tsx/cjs","src/run_glm51_multiple_mtp.ts","--arena","92","--gpus","0,4,5,7,1,2,3,6","--cp","--model","local-inference-lab/GLM-5.3-NVFP4","--mtp","--batch-size","1","--max-new-tokens","128","--max-pages","512"]'
 ```
 
 Let the benchmark exit naturally to finish the Nsight report. `/stop` sends SIGTERM to a spawned command's process group and allows 30 seconds for shutdown/output draining before SIGKILL. Forked executors retain their Node IPC shutdown request and five-second fallback. Stop the current executor before launching another; the loader and resident weights remain alive throughout.
@@ -349,7 +349,7 @@ You must NEVER use "git stash pop" to reapply stashed changes. You MUST use "git
 Model Path:
 `$HF_HOME/hub/models--local-inference-lab--GLM-5.3-NVFP4/snapshots/<revision>`
 
-`src/model_cli.ts` selects this repository by default for `--glm51`. The cache's `refs/main` identifies the snapshot revision. Values below are from the checkpoint's `config.json`.
+`src/model_cli.ts` selects this repository when neither `--model` nor `--model-dir` is supplied. It can also be selected explicitly with `--model local-inference-lab/GLM-5.3-NVFP4`. This repository defaults to a 92-GiB arena; other explicit checkpoints default to no arena unless `--arena` is provided. The cache's `refs/main` identifies the snapshot revision. Values below are from the checkpoint's `config.json`.
 
 | Key | Value |
 |---|---|

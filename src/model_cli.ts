@@ -1,33 +1,24 @@
 import { createHash } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { ChatModel } from "./chat_model";
 import { DeviceOps } from "./device_ops";
-import { Glm51Model } from "./glm51_model";
-import { Glm53FlashModel, GLM53_FLASH_REPO } from "./glm53_flash_model";
 import { GlmOps } from "./glm_ops";
 import { resolveModelPath } from "./model_path";
 import { ParallelOps, ParallelTensor } from "./parallel_ops";
-import { Qwen35Model } from "./qwen35_model";
-import { Qwen3Model } from "./qwen3_model";
+import { inspectModel } from "./model_registry";
 
 export const QWEN3_REPO = "Qwen/Qwen3-0.6B";
 export const QWEN3_FP8_REPO = "Qwen/Qwen3-0.6B-FP8";
 export const QWEN35_REPO = "Qwen/Qwen3.5-0.8B";
 export const GLM51_REPO = "local-inference-lab/GLM-5.3-NVFP4";
 
-const GLM51_SMALL_BF16 = "tests/python/test_models/glm51_small/glm51_small_bf16";
-const GLM51_SMALL_NVFP4 = "tests/python/test_models/glm51_small/glm51_small_nvfp4";
-
 export interface ModelCliArgs {
   gpus: number[];
   arena: number;
   arenaExplicit: boolean;
   modelDir: string | undefined;
-  useQwen35: boolean;
-  useGlm51: boolean;
-  useGlm53Flash: boolean;
-  glm51Small: boolean;
-  useFp8: boolean;
-  useNvfp4: boolean;
+  model: string | undefined;
   cp: boolean;
   /** Number of MTP draft tokens per step; 0 disables MTP. */
   mtp: number;
@@ -48,32 +39,25 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
     arena: 0,
     arenaExplicit: false,
     modelDir: undefined,
-    useQwen35: false,
-    useGlm51: true,
-    useGlm53Flash: false,
-    glm51Small: false,
-    useFp8: false,
-    useNvfp4: false,
+    model: undefined,
     cp: false,
     mtp: 0,
   };
-  let glm51Explicit = false;
-  let qwen3Explicit = false;
-  let qwen35Explicit = false;
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--gpus" && i + 1 < argv.length) args.gpus = argv[++i].split(",").map(s => parseInt(s.trim(), 10));
     else if (a === "--gpu" && i + 1 < argv.length) args.gpus = [parseInt(argv[++i], 10)];
     else if (a === "--arena" && i + 1 < argv.length) { args.arena = parseInt(argv[++i], 10); args.arenaExplicit = true; }
-    else if (a === "--model-dir" && i + 1 < argv.length) args.modelDir = argv[++i];
-    else if (a === "--qwen3") { args.useGlm51 = false; qwen3Explicit = true; }
-    else if (a === "--qwen35") { args.useQwen35 = true; args.useGlm51 = false; qwen35Explicit = true; }
-    else if (a === "--glm51") { args.useGlm51 = true; glm51Explicit = true; }
-    else if (a === "--glm51-small") { args.useGlm51 = true; args.glm51Small = true; glm51Explicit = true; }
-    else if (a === "--glm53-flash") { args.useGlm53Flash = true; args.useGlm51 = false; }
-    else if (a === "--fp8") { args.useFp8 = true; args.useGlm51 = false; }
-    else if (a === "--nvfp4") args.useNvfp4 = true;
+    else if (a === "--model" || a === "--model-dir") {
+      const value = argv[++i];
+      if (!value || value.startsWith("--")) throw new Error(`${a} requires a value`);
+      if (a === "--model") args.model = value;
+      else args.modelDir = value;
+    }
+    else if (["--qwen3", "--qwen35", "--qwen25", "--glm51", "--glm51-small", "--glm53-flash", "--fp8", "--nvfp4"].includes(a)) {
+      throw new Error(`${a} has been removed. Use --model <HuggingFace repo ID> or --model-dir <local directory>; model type and weight format are detected from the checkpoint.`);
+    }
     else if (a === "--cp") args.cp = true;
     else if (a === "--mtp") {
       const next = argv[i + 1];
@@ -82,44 +66,28 @@ export function parseModelArgs(argv: string[]): ModelCliArgs {
     }
   }
 
-  if (!args.arenaExplicit && ((args.useGlm51 && !args.glm51Small) || args.useGlm53Flash)) args.arena = 92;
+  if (args.model && args.modelDir) throw new Error("--model and --model-dir are mutually exclusive");
+  if (args.model && !/^[\w.-]+\/[\w.-]+$/.test(args.model)) throw new Error("--model requires a HuggingFace repo ID (owner/name); use --model-dir for a local directory");
+  if (!args.arenaExplicit && !args.modelDir && (!args.model || args.model === GLM51_REPO)) args.arena = 92;
   if (args.gpus.length === 0 || args.gpus.some(gpu => !Number.isInteger(gpu) || gpu < 0)) {
     throw new Error(`Invalid GPU list: ${args.gpus.join(",")}`);
   }
   if (!Number.isInteger(args.arena) || args.arena < 0) {
     throw new Error(`Invalid arena size: ${args.arena}`);
   }
-  if (glm51Explicit && (qwen3Explicit || qwen35Explicit)) throw new Error("--glm51 cannot be combined with --qwen3 or --qwen35");
-  if (qwen3Explicit && qwen35Explicit) throw new Error("--qwen3 and --qwen35 are mutually exclusive");
-  if (qwen35Explicit && args.useFp8) throw new Error("--fp8 is not supported with --qwen35");
-  if (glm51Explicit && args.useFp8) throw new Error("--fp8 is not supported with --glm51 (use --qwen3 --fp8)");
-  if (args.useGlm53Flash && (glm51Explicit || qwen3Explicit || qwen35Explicit || args.useFp8)) {
-    throw new Error("--glm53-flash cannot be combined with another model selection");
-  }
-  if (args.useGlm53Flash && (args.cp || args.mtp > 0)) throw new Error("--glm53-flash does not support --cp or --mtp yet");
-  if (args.useNvfp4 && !args.useGlm51 && !args.useGlm53Flash) throw new Error("--nvfp4 requires the GLM model");
   if (!Number.isInteger(args.mtp) || args.mtp < 0) throw new Error(`Invalid --mtp draft depth: ${args.mtp}`);
   return args;
 }
 
 export function modelLabel(args: ModelCliArgs): string {
-  if (args.useGlm53Flash) return "GLM-5.3-Flash-NVFP4";
-  if (args.useQwen35) return "Qwen3.5-0.8B";
-  if (args.useGlm51) return args.glm51Small ? "GLM-5.1-small" : (args.useNvfp4 ? "GLM-5.1-NVFP4" : "GLM-5.1");
-  return args.useFp8 ? "Qwen3-0.6B-FP8" : "Qwen3-0.6B";
+  return args.modelDir ?? args.model ?? GLM51_REPO;
 }
 
-export function resolveModelSelection(args: ModelCliArgs): { modelDir: string, repoId: string } {
-  if (args.useGlm53Flash) return { modelDir: args.modelDir ?? GLM53_FLASH_REPO, repoId: GLM53_FLASH_REPO };
-  const repoId = args.useGlm51 ? GLM51_REPO
-    : args.useQwen35 ? QWEN35_REPO
-      : (args.useFp8 ? QWEN3_FP8_REPO : QWEN3_REPO);
-  const modelDir = args.modelDir ?? (args.useGlm51
-    ? (args.glm51Small
-      ? (args.useNvfp4 ? GLM51_SMALL_NVFP4 : GLM51_SMALL_BF16)
-      : GLM51_REPO)
-    : resolveModelPath(repoId));
-  return { modelDir, repoId };
+export function resolveModelSelection(args: ModelCliArgs) {
+  const repoId = modelLabel(args);
+  const modelDir = args.modelDir !== undefined ? path.resolve(args.modelDir) : resolveModelPath(args.model ?? GLM51_REPO);
+  if (!fs.statSync(modelDir).isDirectory()) throw new Error(`Model path is not a directory: ${modelDir}`);
+  return { modelDir, repoId, ...inspectModel(modelDir, args) };
 }
 
 export function createDeviceOps(args: ModelCliArgs): { ops: DeviceOps, gpuDevices: GlmOps[] } {
@@ -129,13 +97,8 @@ export function createDeviceOps(args: ModelCliArgs): { ops: DeviceOps, gpuDevice
 }
 
 export async function loadModel(ops: DeviceOps, args: ModelCliArgs, modelDir: string): Promise<ChatModel> {
-  const model = await (args.useGlm53Flash
-    ? Glm53FlashModel.fromPretrained(ops, modelDir)
-    : args.useGlm51
-    ? Glm51Model.fromPretrained(ops, modelDir, args.cp, args.mtp > 0)
-    : args.useQwen35
-      ? Qwen35Model.fromPretrained(ops, modelDir)
-      : Qwen3Model.fromPretrained(ops, modelDir));
+  const { registration } = inspectModel(modelDir, args);
+  const model = await registration.load(ops, modelDir, args);
   const devices = ops instanceof ParallelOps ? ops.devices : ops instanceof GlmOps ? [ops] : [];
   for (const device of devices) {
     const expected = process.env[`SLOPLLM_ARENA_LAYOUT_${device.device}`];

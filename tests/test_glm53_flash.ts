@@ -115,14 +115,14 @@ function close(a: number[], b: number[], atol: number, rtol = 0): void {
 }
 
 it("Flash CLI selects the text checkpoint and rejects unsupported modes/loader overrides", () => {
-  const args = parseModelArgs(["--glm53-flash", "--arena", "1"]);
-  assert.equal(args.useGlm51, false);
-  assert.equal(resolveModelSelection(args).repoId, GLM53_FLASH_REPO);
-  validateWorkerModelArgs(["--glm53-flash", "--arena", "1"], args);
-  assert.throws(() => validateWorkerModelArgs(["--glm51", "--arena", "1"], args), /cannot override/);
-  for (const flag of ["--mtp", "--cp", "--fp8", "--glm51", "--qwen3", "--qwen35"]) {
-    assert.throws(() => parseModelArgs(["--glm53-flash", flag]));
-    assert.throws(() => parseModelArgs([flag, "--glm53-flash"]));
+  using f = fixture();
+  const argv = ["--model-dir", f.dir, "--arena", "1"];
+  const args = parseModelArgs(argv);
+  assert.equal(resolveModelSelection(args).modelType, "glm5_next");
+  validateWorkerModelArgs(argv, args);
+  assert.throws(() => validateWorkerModelArgs(["--model", GLM53_FLASH_REPO, "--arena", "1"], args), /cannot override/);
+  for (const flag of ["--mtp", "--cp"]) {
+    assert.throws(() => resolveModelSelection(parseModelArgs([...argv, flag])), /does not support/);
   }
 });
 
