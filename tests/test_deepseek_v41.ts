@@ -12,7 +12,7 @@ import { WorkspaceBase } from "../src/workspace";
 import { loadDeepseekV41Config } from "../src/deepseek_v41_model";
 import { CompressorCarry } from "../src/deepseek_v41_cache";
 import { UsingHolder } from "../src/using-holder";
-import { bf16Round, dsv41IndexQuantize, dsv41IndexScores, dsv41Rope, engramHashes } from "./deepseek_v41_oracles";
+import { bf16Round, dsv41IndexQuantize, dsv41IndexScores, dsv41Rope, engramHashes, packDsv41Index } from "./deepseek_v41_oracles";
 
 for (const tp of [1, 2]) {
   it(`DSV4 native wrapper combines local/global caches and sinks on TP${tp}`, () => {
@@ -140,16 +140,16 @@ for (const tp of [1, 2]) {
       indexPosition.h2d(Buffer.from(Int32Array.of(129).buffer));
       using indexRotary = indexPosition.dsv41RotaryEmbedding();
       using rotatedIndex = indexInput.dsv41Rope(indexRotary, true, false, 128);
-      using quantizedIndex = ws.alloc([1, 4096], "F32", undefined, TensorParallelism.Row);
+      using quantizedIndex = ws.alloc([1, 32 * 132], "U8", undefined, TensorParallelism.Row);
       ops.dsv41IndexQuantize(quantizedIndex, rotatedIndex, indexPosition);
       using fullIndex = quantizedIndex.replicate();
       const indexBytes = Buffer.alloc(quantizedIndex.bytes);
       fullIndex.d2h(indexBytes);
       const expectedIndex = dsv41IndexQuantize(bf16BytesToF32(bf16Round(dsv41Rope(indexValues, 129, true, false, 128))));
-      assert.deepEqual(indexBytes, Buffer.from(expectedIndex.buffer));
-      using indexKeys = ws.alloc([1, 64, 128], "F32");
-      const keyValues = Float32Array.from({ length: 256 }, (_, i) => Math.cos(i * 0.23));
-      const keyBytes = Buffer.alloc(indexKeys.bytes); Buffer.from(keyValues.buffer).copy(keyBytes); indexKeys.h2d(keyBytes);
+      assert.deepEqual(indexBytes, packDsv41Index(bf16BytesToF32(bf16Round(dsv41Rope(indexValues, 129, true, false, 128)))));
+      using indexKeys = ws.alloc([1, 64, 132], "U8");
+      const keyValues = dsv41IndexQuantize(Float32Array.from({ length: 256 }, (_, i) => Math.cos(i * 0.23)));
+      const keyBytes = Buffer.alloc(indexKeys.bytes); packDsv41Index(keyValues).copy(keyBytes); indexKeys.h2d(keyBytes);
       using indexWeights = ws.alloc([1, 32], "BF16");
       const weightValues = bf16BytesToF32(bf16Round(Float32Array.from({ length: 32 }, (_, i) => Math.sin(i * 0.3))));
       indexWeights.h2d(bf16Round(weightValues));
@@ -159,7 +159,7 @@ for (const tp of [1, 2]) {
       const scoreBytes = Buffer.alloc(indexScores.bytes);
       indexScores.d2h(scoreBytes);
       const expectedScores = dsv41IndexScores(expectedIndex, [keyValues.subarray(0, 128), keyValues.subarray(128)], weightValues);
-      assert.deepEqual(scoreBytes, Buffer.from(expectedScores.buffer));
+      assert.deepEqual(scoreBytes, bf16Round(expectedScores));
       // DSpark's Markov codebook is vocabulary-sharded, without mHC expansion.
       using codebook = ws.alloc([16, 256], "BF16", undefined, TensorParallelism.Column);
       const codeValues = Float32Array.from({ length: 16 * 256 }, (_, i) => Math.floor(i / 256) + (i % 256) / 256);

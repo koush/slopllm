@@ -1148,32 +1148,32 @@ export class GlmOps implements DeviceOps {
   }
   dsv41IndexQuantize(output: Tensor, input: Tensor, positions: Tensor): void {
     this.checkDsv41Tensors(output, input, positions);
-    if (input.type !== "BF16" || output.type !== "F32" || positions.type !== "I32" || !positions.numElements
-      || input.numElements % (positions.numElements * 128) || output.numElements !== input.numElements) throw new Error("Invalid V4.1 index quantization");
+    if (input.type !== "BF16" || output.type !== "U8" || positions.type !== "I32" || !positions.numElements
+      || input.numElements % (positions.numElements * 128) || output.numElements !== input.numElements / 128 * 132) throw new Error("Invalid V4.1 index quantization");
     getNativeAddon().dsv41IndexQuantize(this.ctx, output.data, input.data, positions.data,
       input.numElements / positions.numElements / 128, 0, positions.numElements, 0);
   }
   dsv4IndexScores(query: Tensor, keys: Tensor, weights: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, capacity: number, batchIndices?: Tensor): Tensor {
     this.validateDsv4Pages(positions, pages, ratio, batchIndices);
     this.checkDsv41Tensors(query, keys, weights);
-    if (query.type !== "F32" || query.numElements !== positions.numElements * 32 * 128 || keys.type !== "F32"
-      || keys.shape.length !== 3 || keys.shape[1] !== 64 || keys.shape[2] !== 128 || weights.type !== "BF16"
+    if (query.type !== "U8" || query.numElements !== positions.numElements * 32 * 132 || keys.type !== "U8"
+      || keys.shape.length !== 3 || keys.shape[1] !== 64 || keys.shape[2] !== 132 || weights.type !== "BF16"
       || weights.numElements !== positions.numElements * 32 || !Number.isSafeInteger(capacity) || capacity < 1) throw new Error("Invalid DSV4 paged index scoring");
-    const output = query.workspace.alloc([positions.numElements, capacity], "F32");
+    const output = query.workspace.alloc([positions.numElements, capacity], "BF16");
     getNativeAddon().dsv41IndexScores(this.ctx, output.data, query.data, keys.data, weights.data, positions.data,
       output.shape[1], ratio, positions.numElements, pages.data, batchIndices?.data ?? 0, pages.shape[1] ?? 0);
     return output;
   }
   dsv41Candidates(scores: Tensor, positions: Tensor): Tensor {
     this.checkDsv41Tensors(scores, positions);
-    if (scores.type !== "F32" || scores.shape.length !== 2 || positions.type !== "I32" || positions.numElements !== scores.shape[0]) throw new Error("Invalid candidate scores");
+    if (scores.type !== "BF16" || scores.shape.length !== 2 || positions.type !== "I32" || positions.numElements !== scores.shape[0]) throw new Error("Invalid candidate scores");
     const output = scores.workspace.alloc([scores.shape[0], Math.ceil(scores.shape[1] / 8)], "I32");
     getNativeAddon().dsv41Candidates(this.ctx, output.data, scores.data, positions.data, scores.shape[1], scores.shape[0]);
     return output;
   }
   dsv41Select(scores: Tensor, positions: Tensor, ratio: number, candidates?: Tensor): Tensor {
     this.checkDsv41Tensors(scores, positions, candidates);
-    if (scores.type !== "F32" || scores.shape.length !== 2 || positions.type !== "I32" || positions.numElements !== scores.shape[0]
+    if (scores.type !== "BF16" || scores.shape.length !== 2 || positions.type !== "I32" || positions.numElements !== scores.shape[0]
       || ![1, 2].includes(ratio) || (candidates && (candidates.type !== "I32" || candidates.numElements !== scores.shape[0] * Math.ceil(scores.shape[1] / 8)))) throw new Error("Invalid index selection");
     const output = scores.workspace.alloc([scores.shape[0], 512], "I32");
     getNativeAddon().dsv41Select(this.ctx, output.data, scores.data, candidates?.data ?? 0, positions.data, scores.shape[1], ratio, scores.shape[0]);
@@ -1199,7 +1199,7 @@ export class GlmOps implements DeviceOps {
   private validateDsv4Append(cache: Tensor, input: Tensor, positions: Tensor, pages: Tensor, ratio: number, keys: boolean, batchIndices?: Tensor): void {
     this.validateDsv4Pages(positions, pages, ratio, batchIndices);
     this.checkDsv41Tensors(cache, input);
-    if (cache.type !== (keys ? "F32" : "U8") || cache.shape.length !== 3 || cache.shape[1] !== 64 || cache.shape[2] !== (keys ? 128 : 584)
+    if (cache.type !== "U8" || cache.shape.length !== 3 || cache.shape[1] !== 64 || cache.shape[2] !== (keys ? 132 : 584)
       || input.type !== "BF16" || input.shape.length !== 2 || input.shape[0] !== positions.numElements || input.shape[1] !== (keys ? 128 : 512)) throw new Error("Invalid DSV4 paged append tensors");
   }
   dsv4CacheAppend(cache: Tensor, input: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2 = 1, batchIndices?: Tensor): void {

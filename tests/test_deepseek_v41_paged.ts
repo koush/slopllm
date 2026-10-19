@@ -1,6 +1,6 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
-import { GlmOps } from "../src/glm_ops";
+import { GlmOps, bf16BytesToF32 } from "../src/glm_ops";
 import { ParallelOps } from "../src/parallel_ops";
 import { WorkspaceBase } from "../src/workspace";
 import { writeDsv4Cache } from "./deepseek_v41_oracles";
@@ -28,7 +28,8 @@ for (const world of [1, 2]) it(`DSV4 batches unequal sequences without cross-seq
     t.fill(1, t.numElements);
     using second = t.narrow(lengths[0], lengths[1]); second.fill(2, second.numElements);
   }
-  using query = ws.alloc([tokens, 32 * 128], "F32"); query.fill(1, query.numElements);
+  using rawQuery = ws.alloc([tokens, 32 * 128], "BF16"); rawQuery.fill(1, rawQuery.numElements);
+  using query = ws.alloc([tokens, 32 * 132], "U8"); ops.dsv41IndexQuantize(query, rawQuery, positions);
   using weights = ws.alloc([tokens, 32], "BF16"); weights.fill(1, weights.numElements);
   for (const ratio of [1, 2] as const) {
     using cache = ws.alloc([6, 64, 584], "U8"); cache.fill(0, cache.numElements);
@@ -42,13 +43,13 @@ for (const world of [1, 2]) it(`DSV4 batches unequal sequences without cross-seq
       offset += lengths[b];
     }
     assert.deepEqual(bytes(cache), bytes(expected));
-    using keyCache = ws.alloc([6, 64, 128], "F32"); keyCache.fill(0, keyCache.numElements);
+    using keyCache = ws.alloc([6, 64, 132], "U8"); keyCache.fill(0, keyCache.numElements);
     ops.dsv4IndexAppend(keyCache, keys, positions, pages, ratio, batches);
     using scores = ops.dsv4IndexScores(query, keyCache, weights, positions, pages, ratio, 130, batches);
-    const scored = bytes(scores);
+    const scored = bf16BytesToF32(bytes(scores));
     for (let t = 0; t < tokens; t++) for (let k = 0; k < 130; k++) {
       const b = t < lengths[0] ? 0 : 1, p = b ? t - lengths[0] : t;
-      assert.equal(scored.readFloatLE((t * 130 + k) * 4), k < Math.floor((p + 1) / ratio) ? 64 * (b + 1) : -Infinity);
+      assert.equal(scored[t * 130 + k], k < Math.floor((p + 1) / ratio) ? 64 * (b + 1) : -Infinity);
     }
   }
   using local = ops.dsv4LocalSlots(positions, pages, batches);
@@ -122,7 +123,8 @@ for (const world of [1, 2]) it(`DSV4 paged writes, slots and scores agree across
   using pages = ws.alloc([3], "I32"); pages.h2d(Buffer.from(Int32Array.from(pageIds).buffer));
   using input = ws.alloc([tokens, 512], "BF16"); input.fill(1, input.numElements);
   using keys = ws.alloc([tokens, 128], "BF16"); keys.fill(1, keys.numElements);
-  using query = ws.alloc([tokens, 32 * 128], "F32"); query.fill(1, query.numElements);
+  using rawQuery = ws.alloc([tokens, 32 * 128], "BF16"); rawQuery.fill(1, rawQuery.numElements);
+  using query = ws.alloc([tokens, 32 * 132], "U8"); ops.dsv41IndexQuantize(query, rawQuery, positions);
   using weights = ws.alloc([tokens, 32], "BF16"); weights.fill(1, weights.numElements);
   const slot = (ordinal: number, ratio: number) => pageIds[Math.floor(ordinal * ratio / 64)] * 64 + ordinal % (64 / ratio);
   for (const ratio of [1, 2] as const) {
@@ -147,12 +149,12 @@ for (const world of [1, 2]) it(`DSV4 paged writes, slots and scores agree across
       const ordinal = [-1, 0, 32, 64][j];
       assert.equal(indices[p * 4 + j], ordinal < 0 || ordinal >= Math.floor((p + 1) / ratio) ? -1 : slot(ordinal, ratio));
     }
-    using keyCache = ws.alloc([5, 64, 128], "F32"); keyCache.fill(0, keyCache.numElements);
+    using keyCache = ws.alloc([5, 64, 132], "U8"); keyCache.fill(0, keyCache.numElements);
     ops.dsv4IndexAppend(keyCache, keys, positions, pages, ratio);
     using scores = ops.dsv4IndexScores(query, keyCache, weights, positions, pages, ratio, tokens);
-    const scoreBytes = bytes(scores);
+    const scoreBytes = bf16BytesToF32(bytes(scores));
     for (let p = 0; p < tokens; p++) for (let k = 0; k < tokens; k++) {
-      assert.equal(scoreBytes.readFloatLE((p * tokens + k) * 4), k < Math.floor((p + 1) / ratio) ? 64 : -Infinity);
+      assert.equal(scoreBytes[p * tokens + k], k < Math.floor((p + 1) / ratio) ? 64 : -Infinity);
     }
   }
   using local = ops.dsv4LocalSlots(positions, pages);

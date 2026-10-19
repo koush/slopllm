@@ -2515,7 +2515,7 @@ export class ParallelOps implements DeviceOps {
     this.requireDsv4Replicated(keys, positions, pages, batchIndices);
     using q = query.replicate(); using w = weights.replicate();
     const shards = this.devices.map((ops, r) => ops.dsv4IndexScores(this.local(q, r), this.local(keys, r), this.local(w, r), this.local(positions, r), this.local(pages, r), ratio, capacity, this.optionalLocal(batchIndices, r)));
-    return this.wrapShards(query.workspace, shards, [positions.numElements, capacity], "F32", TensorParallelism.Replicated);
+    return this.wrapShards(query.workspace, shards, [positions.numElements, capacity], "BF16", TensorParallelism.Replicated);
   }
   dsv41Candidates(scores: Tensor, positions: Tensor): Tensor {
     this.requireDsv4Replicated(scores, positions);

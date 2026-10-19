@@ -110,6 +110,7 @@ export interface Dsv4CacheSelection {
 
 export interface DeviceOps extends Disposable {
   dsv41Hash(tokens: Tensor, lookback: Tensor, map: Tensor, primes: Tensor, offsets: Tensor, qoIndptr?: Tensor): Tensor;
+  /** Pack each 128-element head into 128 E4M3 bytes plus one F32 scale (132 bytes). */
   dsv41IndexQuantize(output: Tensor, input: Tensor, positions: Tensor): void;
   dsv4IndexScores(query: Tensor, keys: Tensor, weights: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, capacity: number, batchIndices?: Tensor): Tensor;
   dsv41Candidates(scores: Tensor, positions: Tensor): Tensor;

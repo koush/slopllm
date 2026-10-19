@@ -84,14 +84,29 @@ export function dsv41IndexQuantize(values: Float32Array): Float32Array {
   return result;
 }
 
-export function dsv41IndexScores(q: Float32Array, keys: readonly Float32Array[], weights: Float32Array): Float32Array {
+/** Independent packed representation; the scale is not folded into the bytes. */
+export function packDsv41Index(values: Float32Array): Buffer {
+  const out = Buffer.alloc(values.length / 128 * 132);
+  for (let offset = 0; offset < values.length; offset += 128) {
+    let maximum = 1e-4;
+    for (let d = 0; d < 128; d++) maximum = Math.max(maximum, Math.abs(values[offset + d]));
+    const scale = 2 ** Math.ceil(Math.log2(maximum / 448)), record = offset / 128 * 132;
+    for (let d = 0; d < 128; d++) out[record + d] = encodeE4M3(values[offset + d] / scale);
+    out.writeFloatLE(scale, record + 128);
+  }
+  return out;
+}
+
+/** Vendor-style FP32 arithmetic, or FP64 for an independent error reference. */
+export function dsv41IndexScores(q: Float32Array, keys: readonly Float32Array[], weights: Float32Array, precision: "F32" | "F64" = "F32"): Float32Array {
+  const round = precision === "F32" ? Math.fround : (value: number) => value;
   const scores = new Float32Array(keys.length);
   for (let token = 0; token < keys.length; token++) {
     let score = 0;
     for (let h = 0; h < 32; h++) {
       let dot = 0;
-      for (let d = 0; d < 128; d++) dot += q[h * 128 + d] * keys[token][d];
-      score += Math.max(0, dot) * weights[h] / 64;
+      for (let d = 0; d < 128; d++) dot = round(dot + round(q[h * 128 + d] * keys[token][d]));
+      score = round(score + round(Math.max(0, dot) * weights[h] / 64));
     }
     scores[token] = score;
   }

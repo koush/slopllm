@@ -158,5 +158,30 @@ it("DSpark resident draft/verify supports capture, accepted carry, restart and b
         assert(step.value.tokens[0].every(token => token >= 0 && token < model.cfg.vocabSize));
       }
     } finally { await stochastic.return(); }
+
+    // Both ratio-one and ratio-two indexers must actually discard keys. A
+    // short prompt alone cannot detect score-dependent verification errors.
+    using longCache = model.createChatCache(64, 1, 4096) as DeepseekV41Cache;
+    using longWs = new ExecutionWorkspace(runtime.ops, 1, 128);
+    using longManager = new CaptureManager(runtime.ops);
+    const longPrompt = model.tokenizer.encode("A short note about geography.\n".repeat(300)).slice(0, 1100);
+    assert.equal(longPrompt.length, 1100);
+    const longRun = async (captured: boolean) => {
+      longCache.reset(1);
+      let remaining = [longPrompt.slice()];
+      while (remaining[0].length) remaining = (await model.executePrefill(longWs, longCache, remaining, undefined, 128)).remainingInputIdsList;
+      const output: { tokens: number[][]; accepted: number[] }[] = [];
+      const generator = model.generateMtpDecode(longWs, longCache, 3, captured ? longManager : undefined);
+      try {
+        for (let step = 0; step < 20; ++step) {
+          const result = await generator.next(); assert(!result.done);
+          output.push({ tokens: result.value.tokens, accepted: result.value.numAccepted });
+        }
+      } finally { await generator.return(); }
+      return output;
+    };
+    const longCaptured = await longRun(true);
+    assert([...longManager.captured.values()].some(graph => graph.graphExec !== null));
+    assert.deepEqual(await longRun(false), longCaptured, "Captured verification must match eager after compressed index top-k becomes active");
   } finally { freeModelRuntime(runtime); }
 });

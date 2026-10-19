@@ -132,12 +132,21 @@ then completes the combined output before its final BF16 conversion. This uses
 3.5x fewer MoE output payload bytes than separately reducing six BF16 routed
 outputs and one BF16 shared output. Generic replicated shared inputs are included
 on rank zero only, avoiding multiplication by the TP world size.
-Routing uses parallel argmax reductions with lower-ID tie breaks; index scores
-use warp-parallel dot products. mHC's projection and squared norm use FP32 split-K
+Routing uses parallel argmax reductions with lower-ID tie breaks. Index scoring
+uses FP8 Tensor Core dot products with FP32 accumulation and weighted per-head
+ReLU, followed by BF16 score rounding before candidate selection and top-k.
+Small workloads use one query per CTA; larger workloads reuse a 64-key tile
+across four queries, with independent compressed causal bounds for each query.
+Mixed-sequence query tiles reload keys per query. Dispatch uses
+query count and compressed key capacity; `SLOPLLM_DSV41_INDEXER_QUERY_TILE=1|4`
+overrides it for kernel comparisons. mHC's projection and squared norm use FP32 split-K
 partials; inverse RMS is applied to the merged projection before coefficient
 activation. No BF16 intermediate is introduced in that coefficient computation.
-FP8-quantized indexer values are currently materialized in F32 storage. With
-2,048 pages, persistent replicated cache storage is approximately 3.39 GiB/GPU.
+Indexer queries and keys use 132-byte records: 128 E4M3 bytes followed by one
+power-of-two FP32 scale. With 2,048 pages, persistent replicated cache storage
+is approximately 3.20 GiB/GPU. Index-score tests compare FP32-reference scores
+after BF16 rounding, allowing reduction-order differences at rounding boundaries;
+they do not require byte equality with a JavaScript FP64 accumulation.
 
 ### CUDA graph execution
 

@@ -31,6 +31,7 @@ interface Args extends ModelCliArgs {
   warmupRuns: number;
   cooldownSeconds: number;
   profile: boolean;
+  chunkSize: number;
 }
 
 function parseLength(value: string): number {
@@ -57,6 +58,7 @@ function parseArgs(argv: string[]): Args {
     warmupRuns: 0,
     cooldownSeconds: 0,
     profile: false,
+    chunkSize: PREFILL_CHUNK_SIZE,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -75,11 +77,13 @@ function parseArgs(argv: string[]): Args {
     else if (arg === "--warmup-runs") args.warmupRuns = Number(argv[++i]);
     else if (arg === "--cooldown-seconds") args.cooldownSeconds = Number(argv[++i]);
     else if (arg === "--profile") args.profile = true;
+    else if (arg === "--chunk-size") args.chunkSize = Number(argv[++i]);
   }
 
   if (args.prompt && args.file) {
     throw new Error("--prompt and --file cannot be used together");
   }
+  if (!Number.isSafeInteger(args.chunkSize) || args.chunkSize < 1) throw new Error(`Invalid --chunk-size: ${args.chunkSize}`);
   if (!Number.isSafeInteger(args.warmupRuns) || args.warmupRuns < 0) {
     throw new Error(`Invalid --warmup-runs: ${args.warmupRuns}`);
   }
@@ -219,8 +223,8 @@ async function runBatch(model: ChatModel, ws: ExecutionWorkspace, cache: ChatCac
   if (args.file) {
     const prefillStarted = performance.now();
     let remaining = [inputIds[0]];
-    while (remaining[0].length > PREFILL_CHUNK_SIZE) {
-      const result = await model.executePrefill(ws, cache, remaining, captureManager, PREFILL_CHUNK_SIZE);
+    while (remaining[0].length > args.chunkSize) {
+      const result = await model.executePrefill(ws, cache, remaining, captureManager, args.chunkSize);
       remaining = result.remainingInputIdsList;
     }
     const offset = inputIds[0].length - remaining[0].length;
@@ -232,7 +236,7 @@ async function runBatch(model: ChatModel, ws: ExecutionWorkspace, cache: ChatCac
     : inputIds.map((ids, batch) => cache.prefixMatch(batch, ids));
   let remaining = suffixIds;
   while (remaining.some(ids => ids.length)) {
-    const result = await model.executePrefill(ws, cache, remaining, captureManager, PREFILL_CHUNK_SIZE);
+    const result = await model.executePrefill(ws, cache, remaining, captureManager, args.chunkSize);
     remaining = result.remainingInputIdsList;
   }
   const generated: number[][] = Array.from({ length: args.batchSize }, () => []);
@@ -335,7 +339,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   try {
     const loadedModel = await loadModel(ops, args, modelDir);
     model = loadedModel;
-    const workspaceSeqLen = args.file ? Math.min(args.maxSeqLen, PREFILL_CHUNK_SIZE + 1) : args.maxSeqLen;
+    const workspaceSeqLen = args.file ? Math.min(args.maxSeqLen, args.chunkSize + 1) : args.maxSeqLen;
     cache = model.createChatCache(args.maxPages, args.batchSize, workspaceSeqLen);
     ws = new ExecutionWorkspace(ops, args.batchSize, workspaceSeqLen);
     console.log(`${modelType} batched ${args.noMtp ? "decode" : "MTP"}: batch=${args.batchSize}, max_tokens=${args.maxNewTokens}, depth=${args.noMtp ? "off" : args.mtp}, cuda_graph=${args.noCudaGraph ? "off" : "on"}`);

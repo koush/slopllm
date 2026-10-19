@@ -98,7 +98,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
             this.kScaleData.push(undefined!);
           } else {
             const parallelism = contextParallel ? TensorParallelism.Row : undefined;
-            this.kData.push(alloc([maxPages, this.pageSize, indexHeadDim], packedFormat === "dsv4" ? "F32" : "U8", "k" + i, parallelism));
+            this.kData.push(alloc([maxPages, this.pageSize, packedFormat === "dsv4" ? indexHeadDim + 4 : indexHeadDim], "U8", "k" + i, parallelism));
             this.kScaleData.push(packedFormat === "dsv4" ? undefined! : alloc([maxPages, this.pageSize], "F32", "kScale" + i, parallelism));
           }
         }

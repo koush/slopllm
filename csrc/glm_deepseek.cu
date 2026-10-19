@@ -172,11 +172,11 @@ __global__ void hash_device(int32_t* out, const int32_t* lookback, const int32_t
     }
 }
 
-__global__ void index_quant_device(float* out, const __nv_bfloat16* input, const int32_t* position,
+__global__ void index_quant_device(uint8_t* out, const __nv_bfloat16* input, const int32_t* position,
                                     int heads, int ratio, const int32_t* slots = nullptr) {
     input += blockIdx.y * heads * 128;
     position += blockIdx.y;
-    if (!ratio) out += blockIdx.y * heads * 128;
+    if (!ratio) out += size_t(blockIdx.y) * heads * 132;
     if (ratio && (*position + 1) % ratio) return;
     const int h = blockIdx.x, d = threadIdx.x;
     __shared__ float maxima[128];
@@ -185,41 +185,12 @@ __global__ void index_quant_device(float* out, const __nv_bfloat16* input, const
     __syncthreads();
     for (int s = 64; s; s >>= 1) { if (d < s) maxima[d] = fmaxf(maxima[d], maxima[d+s]); __syncthreads(); }
     const int exponent = int(ceil(log2(double(maxima[0]) / 448.)));
-    const float quantized = fp8_e4m3_to_float(__nv_fp8_e4m3(ldexpf(value, -exponent)));
+    const uint8_t quantized = __nv_fp8_e4m3(ldexpf(value, -exponent)).__x;
     const int slot = slots ? slots[blockIdx.y] : 0;
     if (slot < 0) return;
-    const size_t offset = size_t(slot) * 128;
-    out[offset + h * 128 + d] = ldexpf(quantized, exponent);
-}
-
-__global__ void index_scores_device(float* scores, const float* q, const float* keys,
-                                     const __nv_bfloat16* weights, const int32_t* position, int ratio, int capacity, const int32_t* pages,
-                                     const int32_t* batch_indices, int page_stride) {
-    scores += size_t(blockIdx.y) * capacity;
-    q += blockIdx.y * 32 * 128;
-    weights += blockIdx.y * 32;
-    position += blockIdx.y;
-    if (batch_indices) pages += size_t(batch_indices[blockIdx.y]) * page_stride;
-    const int token = blockIdx.x, lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    const int count = (*position + 1) / ratio;
-    if (token >= count) { if (!threadIdx.x) scores[token] = -INFINITY; return; }
-    const int slot = pages[token * ratio / 64] * 64 + token % (64 / ratio);
-    __shared__ float key[128];
-    __shared__ double head_scores[32];
-    key[threadIdx.x] = keys[size_t(slot) * 128 + threadIdx.x];
-    __syncthreads();
-    for (int h = warp; h < 32; h += 4) {
-        double dot = 0.;
-        for (int d = lane; d < 128; d += 32) dot += double(q[h * 128 + d]) * key[d];
-        for (int d = 16; d; d /= 2) dot += __shfl_down_sync(0xffffffff, dot, d);
-        if (lane == 0) head_scores[h] = fmax(0., dot) * float(weights[h]) / 64.;
-    }
-    __syncthreads();
-    if (!threadIdx.x) {
-        double score = 0.;
-        for (int h = 0; h < 32; h++) score += head_scores[h];
-        scores[token] = float(score);
-    }
+    uint8_t* record = out + (size_t(slot) + h) * 132;
+    record[d] = quantized;
+    if (d == 0) *reinterpret_cast<float*>(record + 128) = ldexpf(1.f, exponent);
 }
 
 // Logical pages always span 64 original tokens. Ratio-2 uses the first 32
@@ -240,14 +211,14 @@ __global__ void paged_slots_device(int32_t* out, const int32_t* position, const 
 // Fixed launch geometry; selection sizes depend solely on the device position.
 // Rank selection is deliberately simple here, preserving deterministic oracle
 // ties. It can be replaced with a tiled top-k without changing graph state.
-__global__ void candidates_device(int32_t* candidates, const float* scores, const int32_t* position, int capacity) {
+__global__ void candidates_device(int32_t* candidates, const __nv_bfloat16* scores, const int32_t* position, int capacity) {
     candidates += size_t(blockIdx.y) * ((capacity + 7) / 8);
     scores += size_t(blockIdx.y) * capacity;
     position += blockIdx.y;
     const int block = blockIdx.x * blockDim.x + threadIdx.x;
     const int max_blocks = (capacity + 7) / 8;
     if (block >= max_blocks) return;
-    const int count = *position + 1, blocks = (count + 7) / 8;
+    const int count = min(*position + 1, capacity), blocks = (count + 7) / 8;
     if (block >= blocks) { candidates[block] = 0; return; }
     if (blocks <= 2048 || block == blocks - 1) { candidates[block] = 1; return; }
     float value = -INFINITY;
@@ -261,14 +232,14 @@ __global__ void candidates_device(int32_t* candidates, const float* scores, cons
     candidates[block] = rank < 2048;
 }
 
-__global__ void selection_device(int32_t* out, const float* scores, const int32_t* candidates,
+__global__ void selection_device(int32_t* out, const __nv_bfloat16* scores, const int32_t* candidates,
                                    const int32_t* position, int ratio, int capacity) {
     out += blockIdx.y * 512;
     scores += size_t(blockIdx.y) * capacity;
     if (candidates) candidates += size_t(blockIdx.y) * ((capacity + 7) / 8);
     position += blockIdx.y;
     const int token = blockIdx.x * blockDim.x + threadIdx.x;
-    const int count = (*position + 1) / ratio;
+    const int count = min((*position + 1) / ratio, capacity);
     if (token >= count || token >= capacity) return;
     if (count <= 512) { out[token] = token; return; }
     if (candidates && !candidates[token / 8]) return;
@@ -417,26 +388,20 @@ void glm_dsv41_hash(GlmCtx* ctx, int32_t* out, const int32_t* lookback, const in
     cudaSetDevice(ctx->device_id);
     if (count) hash_device<<<(count+127)/128,128,0,GLM_STREAM(ctx)>>>(out,lookback,tokens,map,primes,offsets,count,qo_indptr,batch_size);
 }
-void glm_dsv41_index_quantize(GlmCtx* ctx, float* out, const void* input, const int32_t* positions,
+void glm_dsv41_index_quantize(GlmCtx* ctx, uint8_t* out, const void* input, const int32_t* positions,
     int heads, int ratio, int tokens, const int32_t* slots) {
     cudaSetDevice(ctx->device_id);
     index_quant_device<<<dim3(heads,tokens),128,0,GLM_STREAM(ctx)>>>(out,(const __nv_bfloat16*)input,positions,heads,ratio,slots);
 }
-void glm_dsv41_index_scores(GlmCtx* ctx, float* out, const float* query, const float* keys,
-    const void* weights, const int32_t* positions, int capacity, int ratio, int tokens, const int32_t* pages,
-    const int32_t* batch_indices, int page_stride) {
+void glm_dsv41_candidates(GlmCtx* ctx, int32_t* out, const void* scores, const int32_t* positions, int capacity, int tokens) {
     cudaSetDevice(ctx->device_id);
-    index_scores_device<<<dim3(capacity,tokens),128,0,GLM_STREAM(ctx)>>>(out,query,keys,(const __nv_bfloat16*)weights,positions,ratio,capacity,pages,batch_indices,page_stride);
+    candidates_device<<<dim3(((capacity+7)/8+127)/128,tokens),128,0,GLM_STREAM(ctx)>>>(out,(const __nv_bfloat16*)scores,positions,capacity);
 }
-void glm_dsv41_candidates(GlmCtx* ctx, int32_t* out, const float* scores, const int32_t* positions, int capacity, int tokens) {
-    cudaSetDevice(ctx->device_id);
-    candidates_device<<<dim3(((capacity+7)/8+127)/128,tokens),128,0,GLM_STREAM(ctx)>>>(out,scores,positions,capacity);
-}
-void glm_dsv41_select(GlmCtx* ctx, int32_t* out, const float* scores, const int32_t* candidates,
+void glm_dsv41_select(GlmCtx* ctx, int32_t* out, const void* scores, const int32_t* candidates,
     const int32_t* positions, int capacity, int ratio, int tokens) {
     cudaSetDevice(ctx->device_id);
     cudaMemsetAsync(out,255,size_t(tokens)*512*sizeof(int32_t),GLM_STREAM(ctx));
-    selection_device<<<dim3((capacity+127)/128,tokens),128,0,GLM_STREAM(ctx)>>>(out,scores,candidates,positions,ratio,capacity);
+    selection_device<<<dim3((capacity+127)/128,tokens),128,0,GLM_STREAM(ctx)>>>(out,(const __nv_bfloat16*)scores,candidates,positions,ratio,capacity);
 }
 void glm_dsv41_to_bf16(GlmCtx* ctx, void* out, const float* input, int count) {
     cudaSetDevice(ctx->device_id);

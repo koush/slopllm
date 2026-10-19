@@ -477,6 +477,12 @@ export class DeepseekV41Model extends ChatModel {
     using idxWeightsStream = indexSource === layer ? ops.withStream(() =>
       normed.linear(this.weight(p + ".indexer.weights_proj.weight"))) : undefined;
     using qr = this.linear(normed, p + ".wq_a");
+    // Data dependencies allow this join to wait until sparse attention consumes
+    // the KV cache. Keep it here because overlapping the alternate-stream KV
+    // normalization gather with the query normalization gather can stall large
+    // prefills with custom P2P. This is an ordering workaround; the collective
+    // root cause is unresolved. Query projection above still overlaps KV work.
+    kvcache.streamWaitEvent();
     using qNorm = qr.rmsnorm(this.weight(p + ".q_norm.weight"), 1e-20);
     const projectQuery = () => {
       using projectedQ = this.linear(qNorm, p + ".wq_b");
@@ -492,7 +498,7 @@ export class DeepseekV41Model extends ChatModel {
     if (indexSource === layer) {
       using indexQ = this.linear(qNorm, p + ".indexer.wq_b");
       using rotatedQ = indexQ.dsv41Rope(rotary, true, false, 128);
-      using quantizedQ = ws.alloc(rotatedQ.shape, "F32", undefined, rotatedQ.parallelism);
+      using quantizedQ = ws.alloc([tokens, 32 * 132], "U8", undefined, rotatedQ.parallelism);
       ops.dsv41IndexQuantize(quantizedQ, rotatedQ, position);
       const capacity = Math.min(cache.maxContext, state.isDecode || state.extras.get("dsv41.retainCompressorRows")
         ? state.getGraphVariantPaddedKvLen() : Math.max(...state.seqKvLens));
@@ -507,7 +513,6 @@ export class DeepseekV41Model extends ChatModel {
     if (!localSlots.value) localSlots.replace(ops.dsv4LocalSlots(position, pages, batchIndices));
     const global = ratio ? sharedSlots.value : undefined;
     if (ratio && !global) throw new Error(`Missing shared MLA slots at layer ${layer}`);
-    kvcache.streamWaitEvent();
     if (indexSource !== layer) kvcacheIndex?.streamWaitEvent();
     qStream?.streamWaitEvent();
     const result = ops.dsv4SparseAttention((streamedQuery ?? directQuery)!, { cache: cache.ckvData[layer], indices: localSlots.value },
