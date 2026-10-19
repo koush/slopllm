@@ -868,7 +868,12 @@ bool glm_dsv4_sparse_attention(
 
 void glm_dsv41_mhc_pre(GlmCtx* ctx, void* out, float* pre, float* post, float* comb,
     const void* x, const float* fn, const float* base, const float* scale,
-    const float* previous_pre, int rows, int dim, float norm_eps, float hc_eps, int iters, float* partials);
+    const float* previous_pre, int rows, int dim, float norm_eps, float hc_eps, int iters, float* partials, const void* norm_weight);
+void glm_dsv41_mhc_post_pre(GlmCtx* ctx, void* out, float* pre, float* post, float* comb,
+    void* residual_out, const void* residual, const void* block, const float* previous_post,
+    const float* previous_comb, const float* fn, const float* base, const float* scale,
+    const float* previous_pre, int rows, int dim, float norm_eps, float hc_eps, int iters,
+    float* partials, const void* norm_weight);
 
 void glm_dsv41_rotary_embedding(GlmCtx*, float*, const int32_t*, int);
 void glm_dsv41_rope(GlmCtx*, void*, const void*, const float*, int, int, int, int, int, int);

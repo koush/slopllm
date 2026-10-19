@@ -151,14 +151,44 @@ activation. Below 128 tokens the projection uses FP32 multiply/accumulate.
 Larger batches use Tensor Cores with TF32-exact BF16 activations and FP32 weights
 split into TF32 high and residual terms. Separate FP32 high/low accumulators are
 merged every 32 K elements. Tiles cover 16 tokens below 2,048 tokens and 32 tokens
-at larger sizes. `SLOPLLM_DSV41_MHC_PROJECTION=fp32|tf32` overrides the arithmetic
-path for comparisons. Mixing coefficients, Sinkhorn, and four-stream collapse
+at larger sizes. `SLOPLLM_DSV41_MHC_PROJECTION=fp32|tf32` overrides the standalone
+projection arithmetic for comparisons. Mixing coefficients, Sinkhorn, and four-stream collapse
 use FP32 arithmetic; collapsed hidden states are rounded to BF16 only at output.
 Tensor Core tiles use double-buffered 16-byte `cp.async` global-to-shared copies,
 overlapping the next tile's transfer with current-tile computation. Unaligned
 inputs or row widths use synchronous loads. `SLOPLLM_DSV41_MHC_PIPELINE=0|1`
 controls asynchronous loading for comparisons without changing the arithmetic.
+For fewer than 128 tokens, the native projection groups four coefficients per
+CTA to reuse residual loads. When a following RMSNorm weight is supplied, this
+stage also prepares the BF16-rounded collapse and its FP32 squared-norm partials;
+the finalizer normalizes that prepared input while producing mixing coefficients.
+The model enables this fused RMSNorm for small target and DSpark batches.
+The decode Sinkhorn path uses butterfly row/column reductions and approximate
+FP32 reciprocals, following b12x's native finalizer. This changes reduction and
+rounding order and can change generated tokens and speculative acceptance.
+`SLOPLLM_DSV41_MHC_DECODE_GROUPED=0|1`,
+`SLOPLLM_DSV41_MHC_DECODE_NORM=0|1`, and
+`SLOPLLM_DSV41_MHC_SINKHORN=0|1` independently control these paths.
+For at most 32 tokens, `SLOPLLM_DSV41_MHC_POST_PRE=0|1` enables (default) or
+disables fused post/pre preparation. Its 128-channel tiles compute all four
+post-mixed residual streams, round each to BF16, and reuse them for four
+projection coefficients plus collapse/norm preparation. Scratch uses one K
+partial per 128 hidden channels. The finalizer produces the next coefficients
+and normalizes the prepared input. The materialized residual remains available
+for DSpark feature taps. Partial-sum block outputs are all-reduced before local
+fusion, preserving the original communication and BF16 boundaries.
+Prepared mixes are owned across phased yields. Target decode fuses 77 of 80
+post operations; the two Engram boundaries and final output retain standalone
+post-mixing. DSpark fuses five of six post operations. Larger batches use the
+separate path because the fine-grained fused tiles regress at 64 rows.
+Set all four mHC overrides to zero for the preceding unfused decode arithmetic
+and organization (the fast-exponential policy below still applies).
 No BF16 intermediate is introduced in the coefficient computation.
+Project-owned CUDA exponential evaluations use fast single-precision intrinsics
+(`__expf`, or approximate base-two exponentiation for CP correction), including
+the clipped SwiGLU exponential. Other arithmetic in clipped SwiGLU retains its
+existing precision. Fast exponentials can change routing and generation near
+rounding/selection boundaries.
 Indexer queries and keys use 132-byte records: 128 E4M3 bytes followed by one
 power-of-two FP32 scale. With 2,048 pages, persistent replicated cache storage
 is approximately 3.20 GiB/GPU. Index-score tests compare FP32-reference scores

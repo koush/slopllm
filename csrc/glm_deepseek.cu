@@ -45,7 +45,7 @@ __global__ void swiglu_device(__nv_bfloat16* out, const __nv_bfloat16* gate,
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const double g = fmin(double(float(gate[i])), 10.);
-    out[i] = __float2bfloat16(float(g / (1. + exp(-g)) * fmin(10., fmax(-10., double(float(up[i]))))));
+    out[i] = __float2bfloat16(float(g / (1. + __expf(float(-g))) * fmin(10., fmax(-10., double(float(up[i]))))));
 }
 
 // GLM-style register-resident scores and warp-local top-k. Each warp owns
@@ -61,7 +61,7 @@ __global__ void route_warp_device(int32_t* ids, float* weights, const float* log
     if constexpr (ComputeThreads > 0) {
         for (int e = threadIdx.x; e < Experts; e += ComputeThreads) {
             const float x = logits[size_t(row) * Experts + e];
-            transformed[e] = sqrtf(fmaxf(x, 0.f) + log1pf(expf(-fabsf(x))));
+            transformed[e] = sqrtf(fmaxf(x, 0.f) + log1pf(__expf(-fabsf(x))));
         }
         __syncthreads();
         if (threadIdx.x >= 32) return;
@@ -74,7 +74,7 @@ __global__ void route_warp_device(int32_t* ids, float* weights, const float* log
         if constexpr (ComputeThreads > 0) original[j] = transformed[expert];
         else {
             const float x = logits[size_t(row) * Experts + expert];
-            original[j] = sqrtf(fmaxf(x, 0.f) + log1pf(expf(-fabsf(x))));
+            original[j] = sqrtf(fmaxf(x, 0.f) + log1pf(__expf(-fabsf(x))));
         }
         scores[j] = original[j] + bias[expert];
     }
@@ -317,7 +317,7 @@ __global__ void engram_gate(__nv_bfloat16* out, const __nv_bfloat16* x, const __
     const float score = sums[2][0] * rsqrtf(sums[0][0] / dim + eps)
         * rsqrtf(sums[1][0] / dim + eps) * rsqrtf(float(dim));
     const float gate_input = sqrtf(fmaxf(fabsf(score), 1e-6f)) * (score < 0.f ? -1.f : 1.f);
-    const float gate = 1.f / (1.f + expf(-gate_input));
+    const float gate = 1.f / (1.f + __expf(-gate_input));
     for (int d = tid; d < dim; d += 256) {
         out[offset + d] = __float2bfloat16(float(x[offset + d]) + gate * float(kv[(size_t(token) * 5 + 4) * dim + d]));
     }
@@ -345,7 +345,7 @@ __global__ void compress_latent(__nv_bfloat16* out, int32_t* valid, const float*
             } else {
                 emit = saved_position == position - 1;
                 const float peak = fmaxf(saved_gate, gate);
-                const float a = expf(saved_gate - peak), b = expf(gate - peak);
+                const float a = __expf(saved_gate - peak), b = __expf(gate - peak);
                 pooled = saved_value * (a / (a + b)) + value * (b / (a + b));
             }
         }

@@ -150,7 +150,8 @@ export interface NativeAddon {
     extraTopk: number, extraPageSize: number, splits: number, scale: number): void;
   dsv41MhcPre(ctx: number, output: number, pre: number, post: number, comb: number,
     x: number, fn: number, base: number, scale: number, previousPre: number,
-    rows: number, dim: number, normEps: number, hcEps: number, iters: number, partials: number): void;
+    rows: number, dim: number, normEps: number, hcEps: number, iters: number, partials: number, normWeight: number,
+    residualOutput?: number, block?: number, previousPost?: number, previousComb?: number): void;
   dsv41EngramLookup(ctx: number, output: number, ids: number, table: number, scales: number,
     count: number, rowStart: number, rowEnd: number): void;
   dsv41EngramGate(ctx: number, output: number, x: number, kv: number, qw: number, kw: number,

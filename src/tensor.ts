@@ -502,7 +502,9 @@ export abstract class Tensor implements Disposable {
   dsv41RotaryEmbedding(): Tensor { throw new Error("V4.1 rotary requires CUDA"); }
   dsv41Rope(rotary: Tensor, compressed: boolean, inverse = false, dim = 512, ratio = 0): Tensor { throw new Error("V4.1 rotary requires CUDA"); }
   dsv41Collapse(pre: Tensor): Tensor { throw new Error("V4.1 collapse requires CUDA"); }
-  dsv41MhcPre(fn: Tensor, base: Tensor, scale: Tensor, previousPre?: Tensor, normEps = 1e-20, hcEps = 1e-6, iters = 20): { input: Tensor; pre: Tensor; post: Tensor; comb: Tensor } { throw new Error("V4.1 mHC requires CUDA"); }
+  /** Optional postMix fuses the preceding post operation; caller also owns the returned residual. */
+  dsv41MhcPre(fn: Tensor, base: Tensor, scale: Tensor, previousPre?: Tensor, normEps = 1e-20, hcEps = 1e-6, iters = 20, normWeight?: Tensor,
+    postMix?: { block: Tensor; post: Tensor; comb: Tensor }): { input: Tensor; pre: Tensor; post: Tensor; comb: Tensor; residual?: Tensor } { throw new Error("V4.1 mHC requires CUDA"); }
   /** Previous carry is read-only. A planned carry must be a fresh allocation, never an input alias. */
   dsv41Compress(positions: Tensor, cu: Tensor, weight: Tensor, ratio: 1 | 2, pending?: Tensor, pendingPosition?: Tensor, eps = 1e-20,
     next?: { pending: Tensor; pendingPosition: Tensor }): { latent: Tensor; valid: Tensor; pending?: Tensor; pendingPosition?: Tensor } { throw new Error("V4.1 compression requires CUDA"); }

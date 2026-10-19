@@ -745,12 +745,20 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, shards, [this.shape[0], this.shape[2]], "BF16", TensorParallelism.Replicated);
   }
 
-  dsv41MhcPre(fn: Tensor, base: Tensor, scale: Tensor, previousPre?: Tensor, normEps = 1e-20, hcEps = 1e-6, iters = 20): { input: Tensor; pre: Tensor; post: Tensor; comb: Tensor } {
-    this.requireDsv4Replicated(this, fn, base, scale, previousPre);
-    const result = this.shards.map((x, r) => x.dsv41MhcPre(this.cast(fn).shards[r], this.cast(base).shards[r], this.cast(scale).shards[r], previousPre ? this.cast(previousPre).shards[r] : undefined, normEps, hcEps, iters));
+  dsv41MhcPre(fn: Tensor, base: Tensor, scale: Tensor, previousPre?: Tensor, normEps = 1e-20, hcEps = 1e-6, iters = 20, normWeight?: Tensor,
+    postMix?: { block: Tensor; post: Tensor; comb: Tensor }): { input: Tensor; pre: Tensor; post: Tensor; comb: Tensor; residual?: Tensor } {
+    // Match mhcPost's collective and BF16 rounding boundary before local fusion.
+    if (postMix) {
+      const block = this.cast(postMix.block);
+      if (block.parallelism === TensorParallelism.PartialSum) block.allReduce();
+    }
+    this.requireDsv4Replicated(this, fn, base, scale, previousPre, normWeight, postMix?.block, postMix?.post, postMix?.comb);
+    const result = this.shards.map((x, r) => x.dsv41MhcPre(this.cast(fn).shards[r], this.cast(base).shards[r], this.cast(scale).shards[r], previousPre ? this.cast(previousPre).shards[r] : undefined, normEps, hcEps, iters, normWeight ? this.cast(normWeight).shards[r] : undefined,
+      postMix ? { block: this.cast(postMix.block).shards[r], post: this.cast(postMix.post).shards[r], comb: this.cast(postMix.comb).shards[r] } : undefined));
     const wrap = (shards: Tensor[], shape: number[], type: string) => this.parallelOps.wrapShards(this.workspace, shards, shape, type, TensorParallelism.Replicated);
     return { input: wrap(result.map(r => r.input), [this.shape[0], this.shape[2]], "BF16"), pre: wrap(result.map(r => r.pre), [this.shape[0], 4], "F32"),
-      post: wrap(result.map(r => r.post), [this.shape[0], 4], "F32"), comb: wrap(result.map(r => r.comb), [this.shape[0], 4, 4], "F32") };
+      post: wrap(result.map(r => r.post), [this.shape[0], 4], "F32"), comb: wrap(result.map(r => r.comb), [this.shape[0], 4, 4], "F32"),
+      ...(postMix ? { residual: wrap(result.map(r => r.residual!), this.shape, "BF16") } : {}) };
   }
 
   dsv41Compress(positions: Tensor, cu: Tensor, weight: Tensor, ratio: 1 | 2, pending?: Tensor, pendingPosition?: Tensor, eps = 1e-20,

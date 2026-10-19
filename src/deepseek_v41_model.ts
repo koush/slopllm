@@ -6,7 +6,7 @@ import { type DeviceOps, TensorParallelism } from "./device_ops";
 import type { ExecutionState, ExecutionWorkspace } from "./execution-workspace";
 import { DeepseekV41Cache, DSV41_KV_SOURCES as KV_SOURCES, DSV41_INDEX_SOURCES as INDEX_SOURCES } from "./deepseek_v41_cache";
 import { DeepseekV41EngramHasher } from "./deepseek_v41_engram";
-import { UsingHolder, DisposableSet } from "./using-holder";
+import { UsingHolder, UsingHolderBase, DisposableSet } from "./using-holder";
 import { EagerExecution, type ExecutionManager } from "./execution-manager";
 import { PagedKVCache } from "./paged_kv";
 import { MemcpyKind } from "./enums";
@@ -34,6 +34,15 @@ interface DsparkPlan {
   pages: Tensor;
   slots?: Tensor;
   rows?: Tensor[];
+}
+
+// Own a precomputed next-sublayer mix across phased yields. Its residual has
+// already transferred to the hidden holder; only these four outputs remain.
+type MhcMix = Omit<ReturnType<Tensor["dsv41MhcPre"]>, "residual">;
+class MhcMixHolder extends UsingHolderBase<MhcMix> {
+  dispose(value: MhcMix) {
+    for (const tensor of Object.values(value)) tensor[Symbol.dispose]();
+  }
 }
 
 export function loadDeepseekV41Config(dir: string): DeepseekV41Config {
@@ -328,6 +337,7 @@ export class DeepseekV41Model extends ChatModel {
       using hashes = ops.dsv41Hash(state.input!, state.extras.get("dsv41.lookback") as Tensor,
         constants.map, constants.primes, constants.offsets, state.qoIndptrD);
       using previous = new UsingHolder<Tensor>(undefined!);
+      using preparedMix = new MhcMixHolder(undefined!);
       using features = new DisposableSet();
       const taps: Tensor[] = [];
       const draftContext = state.extras.get("dsv41.dsparkContext") as DsparkPlan | undefined;
@@ -348,7 +358,7 @@ export class DeepseekV41Model extends ChatModel {
           const feature = hidden.value.dsv41Collapse(mean!);
           features.add(feature); taps.push(feature);
         }
-        yield* self.mlaLayerPhased(hidden, previous, layer, state, layerHolders, rotary);
+        yield* self.mlaLayerPhased(hidden, previous, preparedMix, layer, state, layerHolders, rotary);
       }
       if (draftContext) self.prepareDsparkContext(state, taps, draftContext, rotary);
       using collapsed = hidden.value.dsv41Collapse(previous.value);
@@ -407,35 +417,58 @@ export class DeepseekV41Model extends ChatModel {
     if (!this.loadReplay) await this.ops.synchronizeAsync();
   }
 
-  private *mlaLayerPhased(hidden: UsingHolder<Tensor>, previous: UsingHolder<Tensor>,
+  private prepareMhc(hidden: UsingHolder<Tensor>, previous: UsingHolder<Tensor>, layer: number,
+    sublayer: "attn" | "ffn", fuseNorm: boolean, postMix?: { block: Tensor; post: Tensor; comb: Tensor }): MhcMix {
+    const pfx = this.layerPrefix(layer);
+    const { residual, ...mix } = hidden.value.dsv41MhcPre(this.weight(`${pfx}.hc_${sublayer}_fn`),
+      this.weight(`${pfx}.hc_${sublayer}_base`), this.weight(`${pfx}.hc_${sublayer}_scale`), previous.value,
+      1e-20, 1e-6, 20, fuseNorm ? this.weight(`${pfx}.${sublayer}_norm.weight`) : undefined, postMix);
+    if (residual) hidden.replace(residual);
+    return mix;
+  }
+
+  private *mlaLayerPhased(hidden: UsingHolder<Tensor>, previous: UsingHolder<Tensor>, preparedMix: MhcMixHolder,
     layer: number, state: ExecutionState, layerHolders: Required<LayerHolders>, rotary: Tensor, draft?: DsparkPlan): Generator<void, void, void> {
     const pfx = this.layerPrefix(layer);
+    const normMode = process.env.SLOPLLM_DSV41_MHC_DECODE_NORM;
+    if (normMode !== undefined && normMode !== "0" && normMode !== "1") throw new Error("SLOPLLM_DSV41_MHC_DECODE_NORM must be 0 or 1");
+    const fuseNorm = state.totalTokens < 128 && normMode !== "0";
+    const postMode = process.env.SLOPLLM_DSV41_MHC_POST_PRE;
+    if (postMode !== undefined && postMode !== "0" && postMode !== "1") throw new Error("SLOPLLM_DSV41_MHC_POST_PRE must be 0 or 1");
+    const fusePost = state.totalTokens <= 32 && postMode !== "0";
     using oProjBuf = new UsingHolder<Tensor>(undefined!);
-    const attnMix = hidden.value.dsv41MhcPre(this.weight(pfx + ".hc_attn_fn"),
-      this.weight(pfx + ".hc_attn_base"), this.weight(pfx + ".hc_attn_scale"), previous.value);
+    using preparedMlp = new MhcMixHolder(undefined!);
+    const attnMix = preparedMix.detach() ?? this.prepareMhc(hidden, previous, layer, "attn", fuseNorm);
     using attnInput = attnMix.input;
     using attnPost = attnMix.post;
     using attnComb = attnMix.comb;
     previous.replace(attnMix.pre);
-    using normed = attnInput.rmsnorm(this.weight(pfx + ".attn_norm.weight"), 1e-20);
+    using normed = fuseNorm ? attnInput.viewClone() : attnInput.rmsnorm(this.weight(pfx + ".attn_norm.weight"), 1e-20);
     oProjBuf.replace(draft ? this.dsparkAttention(normed, layer, state, draft, rotary) : this.attention(normed, layer, state, layerHolders, rotary));
 
     yield;
-    hidden.replace(this.ops.mhcPost(hidden.value, oProjBuf.value, attnPost, attnComb));
+    if (fusePost) preparedMlp.replace(this.prepareMhc(hidden, previous, layer, "ffn", fuseNorm,
+      { block: oProjBuf.value, post: attnPost, comb: attnComb }));
+    else hidden.replace(this.ops.mhcPost(hidden.value, oProjBuf.value, attnPost, attnComb));
     oProjBuf.release();
     yield;
 
-    const mlpMix = hidden.value.dsv41MhcPre(this.weight(pfx + ".hc_ffn_fn"),
-      this.weight(pfx + ".hc_ffn_base"), this.weight(pfx + ".hc_ffn_scale"), previous.value);
+    const mlpMix = preparedMlp.detach() ?? this.prepareMhc(hidden, previous, layer, "ffn", fuseNorm);
     using mlpInput = mlpMix.input;
     using mlpPost = mlpMix.post;
     using mlpComb = mlpMix.comb;
     previous.replace(mlpMix.pre);
-    using mlpNormed = mlpInput.rmsnorm(this.weight(pfx + ".ffn_norm.weight"), 1e-20);
+    using mlpNormed = fuseNorm ? mlpInput.viewClone() : mlpInput.rmsnorm(this.weight(pfx + ".ffn_norm.weight"), 1e-20);
     using downBuf = this.mlpSparse(mlpNormed, layer);
     yield;
     using rounded = downBuf.toType("BF16");
-    hidden.replace(this.ops.mhcPost(hidden.value, rounded, mlpPost, mlpComb));
+    // Engram changes the next layer's residual before attention pre-mixing.
+    // Feature taps only read it, so they can use the materialized fused result.
+    const nextLayer = layer + 1;
+    if (fusePost && nextLayer < (draft ? 43 : 40) && nextLayer !== 1 && nextLayer !== 14)
+      preparedMix.replace(this.prepareMhc(hidden, previous, nextLayer, "attn", fuseNorm,
+        { block: rounded, post: mlpPost, comb: mlpComb }));
+    else hidden.replace(this.ops.mhcPost(hidden.value, rounded, mlpPost, mlpComb));
     yield;
   }
 
@@ -625,9 +658,10 @@ export class DeepseekV41Model extends ChatModel {
     using rotary = rotaryStream.result;
     using hidden = new UsingHolder(this.weight("embed.weight").embedding(state.input!, { streams: 4 }));
     using previous = new UsingHolder<Tensor>(undefined!);
+    using preparedMix = new MhcMixHolder(undefined!);
     rotaryStream.streamWaitEvent();
     for (let layer = 40; layer < 43; layer++) {
-      this.runPhased(this.mlaLayerPhased(hidden, previous, layer, state, {} as Required<LayerHolders>, rotary, plan));
+      this.runPhased(this.mlaLayerPhased(hidden, previous, preparedMix, layer, state, {} as Required<LayerHolders>, rotary, plan));
     }
     using collapsed = hidden.value.dsv41Collapse(previous.value);
     using normed = collapsed.rmsnorm(this.weight("mtp.2.norm.weight"), 1e-20);

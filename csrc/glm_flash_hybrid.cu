@@ -9,7 +9,7 @@
 namespace {
 using bf16 = __nv_bfloat16;
 
-__device__ float sigmoid(float x) { return 1.f / (1.f + expf(-x)); }
+__device__ float sigmoid(float x) { return 1.f / (1.f + __expf(-x)); }
 
 // All callers use complete warps. The returned sum is broadcast to the block.
 __device__ float block_sum(float x, float* scratch) {
@@ -42,7 +42,7 @@ __global__ void kda_scan(bf16* out, float* state, const bf16* q, const bf16* k,
     float s[128];
     for (int i = 0; i < 128; ++i) s[i] = sh[i * 128 + j];
     __shared__ float sq[128], sk[128], decay[128], scratch[4];
-    const float rate = expf(a_log[h]);
+    const float rate = __expf(a_log[h]);
     for (int t = begin; t < end; ++t) {
         const size_t offset = (static_cast<size_t>(t) * heads + h) * 128;
         const float qv = __bfloat162float(q[offset + j]);
@@ -51,7 +51,7 @@ __global__ void kda_scan(bf16* out, float* state, const bf16* q, const bf16* k,
         const float knorm = sqrtf(block_sum(kv * kv, scratch) + 1e-6f);
         sq[j] = qv / qnorm * rsqrtf(128.f);
         sk[j] = kv / knorm;
-        decay[j] = expf(lower_bound * sigmoid(rate *
+        decay[j] = __expf(lower_bound * sigmoid(rate *
             (__bfloat162float(forget[offset + j]) + dt_bias[h * 128 + j])));
         // PyTorch's sigmoid of BF16 beta logits produces BF16 before the FP32 scan.
         const float bet = __bfloat162float(__float2bfloat16(sigmoid(__bfloat162float(beta[t * heads + h]))));
@@ -89,21 +89,115 @@ constexpr int MHC_PARTS = 8;
 
 // Parallelize both the 24 coefficients and K. Scratch is [rows,25,8]:
 // 24 dot-product partials plus squared-norm partials, all FP32.
-__global__ void mhc_projection_partials(float* partials, const bf16* x, const float* fn, int width) {
-    const int c = blockIdx.x, row = blockIdx.y, part = blockIdx.z, tid = threadIdx.x;
+template<int Outputs = 1>
+__global__ void mhc_projection_partials(float* partials, const bf16* x, const float* fn, int width,
+                                       bf16* collapsed, const float* previous, float* collapsed_norm) {
+    const int c = blockIdx.x * Outputs, row = blockIdx.y, part = blockIdx.z, tid = threadIdx.x;
     const bf16* xr = x + size_t(row) * width;
-    float dot = 0.f, norm = 0.f;
+    float dot[Outputs] = {}, norm = 0.f;
     for (int i = part * blockDim.x + tid; i < width; i += MHC_PARTS * blockDim.x) {
         const float value = float(xr[i]);
-        dot += value * fn[size_t(c) * width + i];
+        // Reuse each residual load across coefficients, as in b12x's native
+        // decode partial kernel. Keep the existing per-coefficient sum order.
+        #pragma unroll
+        for (int j = 0; j < Outputs; ++j) dot[j] += value * fn[size_t(c + j) * width + i];
         if (c == 0) norm += value * value;
     }
-    __shared__ float scratch[8];
-    const float result = block_sum(dot, scratch);
-    if (tid == 0) partials[(size_t(row) * 25 + c) * MHC_PARTS + part] = result;
+    __shared__ float scratch[8], sums[Outputs][8];
+    #pragma unroll
+    for (int j = 0; j < Outputs; ++j) {
+        for (int d = 16; d; d /= 2) dot[j] += __shfl_down_sync(0xffffffff, dot[j], d);
+        if (tid % 32 == 0) sums[j][tid / 32] = dot[j];
+    }
+    __syncthreads();
+    if (tid < 32) {
+        #pragma unroll
+        for (int j = 0; j < Outputs; ++j) {
+            float result = tid < 8 ? sums[j][tid] : 0.f;
+            for (int d = 16; d; d /= 2) result += __shfl_down_sync(0xffffffff, result, d);
+            if (tid == 0) partials[(size_t(row) * 25 + c + j) * MHC_PARTS + part] = result;
+        }
+    }
     if (c == 0) {
         const float squared = block_sum(norm, scratch);
         if (tid == 0) partials[(size_t(row) * 25 + 24) * MHC_PARTS + part] = squared;
+        if (collapsed_norm) {
+            const int dim = width / 4;
+            float sum = 0.f;
+            for (int i = part * blockDim.x + tid; i < dim; i += MHC_PARTS * blockDim.x) {
+                float value = 0.f;
+                #pragma unroll
+                for (int s = 0; s < 4; ++s)
+                    value += (previous ? previous[row * 4 + s] : float(s == 0)) * float(xr[s * dim + i]);
+                const bf16 rounded = __float2bfloat16(value);
+                collapsed[size_t(row) * dim + i] = rounded;
+                sum += float(rounded) * float(rounded);
+            }
+            const float squared = block_sum(sum, scratch);
+            if (tid == 0) collapsed_norm[row * MHC_PARTS + part] = squared;
+        }
+    }
+}
+
+// Native b12x-style post/pre: one hidden-channel tile owns all four streams.
+// Every coefficient group reuses its rounded post result for four projections;
+// group zero also writes the residual, collapsed input and both norm partials.
+__global__ void mhc_post_pre_partials(float* partials, bf16* residual_out, bf16* collapsed,
+    const bf16* residual, const bf16* block, const float* post, const float* comb,
+    const float* fn, const float* previous, int dim, int parts, float* collapsed_norm) {
+    const int c = blockIdx.x * 4, row = blockIdx.y, part = blockIdx.z;
+    const int tid = threadIdx.x, h = part * 128 + tid;
+    float values[4] = {}, dots[4] = {}, squared = 0.f, collapsed_squared = 0.f;
+    if (h < dim) {
+        float r[4];
+        #pragma unroll
+        for (int s = 0; s < 4; ++s) r[s] = float(residual[(size_t(row) * 4 + s) * dim + h]);
+        const float x = float(block[size_t(row) * dim + h]);
+        #pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            float value = post[row * 4 + s] * x;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) value += comb[row * 16 + j * 4 + s] * r[j];
+            const bf16 rounded = __float2bfloat16(value);
+            values[s] = float(rounded);
+            if (c == 0) residual_out[(size_t(row) * 4 + s) * dim + h] = rounded;
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            #pragma unroll
+            for (int s = 0; s < 4; ++s) dots[j] += values[s] * fn[(size_t(c + j) * 4 + s) * dim + h];
+        }
+        if (c == 0) {
+            float value = 0.f;
+            #pragma unroll
+            for (int s = 0; s < 4; ++s) {
+                squared += values[s] * values[s];
+                value += (previous ? previous[row * 4 + s] : float(s == 0)) * values[s];
+            }
+            const bf16 rounded = __float2bfloat16(value);
+            collapsed[size_t(row) * dim + h] = rounded;
+            collapsed_squared = float(rounded) * float(rounded);
+        }
+    }
+    __shared__ float sums[6][4];
+    #pragma unroll
+    for (int j = 0; j < 6; ++j) {
+        float value = j < 4 ? dots[j] : j == 4 ? squared : collapsed_squared;
+        for (int d = 16; d; d /= 2) value += __shfl_down_sync(0xffffffff, value, d);
+        if (tid % 32 == 0) sums[j][tid / 32] = value;
+    }
+    __syncthreads();
+    if (tid < 32) {
+        #pragma unroll
+        for (int j = 0; j < 6; ++j) {
+            float value = tid < 4 ? sums[j][tid] : 0.f;
+            for (int d = 16; d; d /= 2) value += __shfl_down_sync(0xffffffff, value, d);
+            if (tid == 0) {
+                if (j < 4) partials[(size_t(row) * 25 + c + j) * parts + part] = value;
+                else if (c == 0 && j == 4) partials[(size_t(row) * 25 + 24) * parts + part] = value;
+                else if (c == 0) collapsed_norm[size_t(row) * parts + part] = value;
+            }
+        }
     }
 }
 
@@ -251,20 +345,60 @@ __global__ void mhc_projection_tf32(float* partials, const bf16* x, const float*
     }
 }
 
-template <typename Weight, bool DELAYED = false>
+__device__ __forceinline__ float mhc_reciprocal(float x) {
+    float result;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(x));
+    return result;
+}
+
+// b12x's native finalizer uses butterfly row/column reductions and an
+// approximate FP32 reciprocal for each Sinkhorn normalization.
+__device__ float mhc_sinkhorn_fast(float value, float eps, int iters) {
+    constexpr unsigned mask = 0xffff;
+    float maximum = fmaxf(value, __shfl_xor_sync(mask, value, 1));
+    maximum = fmaxf(maximum, __shfl_xor_sync(mask, maximum, 2));
+    value = __expf(value - maximum);
+    float sum = value + __shfl_xor_sync(mask, value, 1);
+    sum += __shfl_xor_sync(mask, sum, 2);
+    value = value * mhc_reciprocal(sum) + eps;
+    for (int iter = 0; iter < iters; ++iter) {
+        if (iter > 0) {
+            sum = value + __shfl_xor_sync(mask, value, 1);
+            sum += __shfl_xor_sync(mask, sum, 2);
+            value *= mhc_reciprocal(sum + eps);
+        }
+        sum = value + __shfl_xor_sync(mask, value, 4);
+        sum += __shfl_xor_sync(mask, sum, 8);
+        value *= mhc_reciprocal(sum + eps);
+    }
+    return value;
+}
+
+template <typename Weight, bool DELAYED = false, bool VARIABLE_PARTS = false>
 __global__ void mhc_pre(bf16* collapsed, float* post, float* comb,
                         const bf16* x, const Weight* fn, const float* base,
                         const float* scale, int dim, float norm_eps, float hc_eps, int iters,
-                        const float* previous_pre, float* next_pre, const float* partials) {
+                        const float* previous_pre, float* next_pre, const float* partials, const bf16* norm_weight = nullptr,
+                        const float* collapsed_norm = nullptr, bool fast_sinkhorn = false, int split_parts = MHC_PARTS) {
+    const int parts = VARIABLE_PARTS ? split_parts : MHC_PARTS;
     const int row = blockIdx.x, tid = threadIdx.x, width = 4 * dim;
     const bf16* xr = x + static_cast<size_t>(row) * width;
     __shared__ float scratch[8], logits[24], pre[4], p[4], mix[16];
+    if (collapsed_norm && norm_weight) {
+        float squared = 0.f;
+        for (int p = 0; p < parts; ++p) squared += collapsed_norm[size_t(row) * parts + p];
+        const float inv = rsqrtf(squared / dim + norm_eps);
+        for (int i = tid; i < dim; i += blockDim.x) {
+            const size_t offset = size_t(row) * dim + i;
+            collapsed[offset] = __float2bfloat16(float(collapsed[offset]) * inv * float(norm_weight[i]));
+        }
+    }
     if constexpr (DELAYED) {
         if (tid < 24) {
             float dot = 0.f, squared = 0.f;
-            for (int p = 0; p < MHC_PARTS; p++) {
-                dot += partials[(size_t(row) * 25 + tid) * MHC_PARTS + p];
-                squared += partials[(size_t(row) * 25 + 24) * MHC_PARTS + p];
+            for (int p = 0; p < parts; p++) {
+                dot += partials[(size_t(row) * 25 + tid) * parts + p];
+                squared += partials[(size_t(row) * 25 + 24) * parts + p];
             }
             logits[tid] = dot * rsqrtf(squared / width + norm_eps);
         }
@@ -295,9 +429,12 @@ __global__ void mhc_pre(bf16* collapsed, float* post, float* comb,
             constexpr unsigned mask = 0xffff;
             const int first = (tid / 4) * 4, col = tid % 4;
             float value = logits[8 + tid] * scale[2] + base[8 + tid];
+            if (fast_sinkhorn) {
+                comb[row * 16 + tid] = mhc_sinkhorn_fast(value, hc_eps, iters);
+            } else {
             float maxval = -INFINITY;
             for (int j = 0; j < 4; j++) maxval = fmaxf(maxval, __shfl_sync(mask, value, first + j));
-            value = expf(value - maxval);
+            value = __expf(value - maxval);
             float denom = 0.f;
             for (int j = 0; j < 4; j++) denom += __shfl_sync(mask, value, first + j);
             value = value / denom + hc_eps;
@@ -312,6 +449,7 @@ __global__ void mhc_pre(bf16* collapsed, float* post, float* comb,
                 value /= denom;
             }
             comb[row * 16 + tid] = value;
+            }
         }
     } else if (tid == 0) {
         for (int i = 0; i < 4; ++i) {
@@ -327,7 +465,7 @@ __global__ void mhc_pre(bf16* collapsed, float* post, float* comb,
                 mix[idx] = logits[8 + idx] * scale[2] + base[8 + idx];
                 maxval = fmaxf(maxval, mix[idx]);
             }
-            for (int j = 0; j < 4; ++j) { mix[i * 4 + j] = expf(mix[i * 4 + j] - maxval); denom += mix[i * 4 + j]; }
+            for (int j = 0; j < 4; ++j) { mix[i * 4 + j] = __expf(mix[i * 4 + j] - maxval); denom += mix[i * 4 + j]; }
             for (int j = 0; j < 4; ++j) mix[i * 4 + j] = mix[i * 4 + j] / denom + hc_eps;
         }
         for (int iter = 0; iter < iters; ++iter) {
@@ -346,14 +484,26 @@ __global__ void mhc_pre(bf16* collapsed, float* post, float* comb,
         }
         for (int i = 0; i < 16; ++i) comb[row * 16 + i] = mix[i];
     }
+    if (collapsed_norm) return;
     __syncthreads();
+    float collapsed_squared = 0.f;
     for (int i = tid; i < dim; i += blockDim.x) {
         float value = 0.f;
         for (int s = 0; s < 4; ++s) {
             const float coefficient = DELAYED ? (previous_pre ? previous_pre[row * 4 + s] : float(s == 0)) : pre[s];
             value += coefficient * __bfloat162float(xr[s * dim + i]);
         }
-        collapsed[static_cast<size_t>(row) * dim + i] = __float2bfloat16(value);
+        const bf16 rounded = __float2bfloat16(value);
+        collapsed[static_cast<size_t>(row) * dim + i] = rounded;
+        if (norm_weight) collapsed_squared += float(rounded) * float(rounded);
+    }
+    if (norm_weight) {
+        // Preserve the BF16 collapse boundary before the following RMSNorm.
+        const float inv = rsqrtf(block_sum(collapsed_squared, scratch) / dim + norm_eps);
+        for (int i = tid; i < dim; i += blockDim.x) {
+            const size_t offset = static_cast<size_t>(row) * dim + i;
+            collapsed[offset] = __float2bfloat16(float(collapsed[offset]) * inv * float(norm_weight[i]));
+        }
     }
 }
 
@@ -385,6 +535,28 @@ __global__ void mhc_streams(bf16* out, const bf16* x, int dim, bool expand) {
 } // namespace
 
 extern "C" {
+void glm_dsv41_mhc_post_pre(GlmCtx* ctx, void* out, float* pre, float* post, float* comb,
+    void* residual_out, const void* residual, const void* block, const float* previous_post,
+    const float* previous_comb, const float* fn, const float* base, const float* scale,
+    const float* previous_pre, int rows, int dim, float norm_eps, float hc_eps, int iters,
+    float* partials, const void* norm_weight) {
+    cudaSetDevice(ctx->device_id);
+    if (rows == 0) return;
+    const int parts = (dim + 127) / 128;
+    float* collapsed_norm = partials + size_t(rows) * 25 * parts;
+    const char* mode = getenv("SLOPLLM_DSV41_MHC_SINKHORN");
+    if (mode && strcmp(mode, "0") && strcmp(mode, "1")) {
+        fprintf(stderr, "SLOPLLM_DSV41_MHC_SINKHORN must be 0 or 1\n"); abort();
+    }
+    mhc_post_pre_partials<<<dim3(6, rows, parts), 128, 0, GLM_STREAM(ctx)>>>(partials,
+        (bf16*)residual_out, (bf16*)out, (const bf16*)residual, (const bf16*)block,
+        previous_post, previous_comb, fn, previous_pre, dim, parts, collapsed_norm);
+    mhc_pre<float, true, true><<<rows, 256, 0, GLM_STREAM(ctx)>>>((bf16*)out, post, comb,
+        (const bf16*)residual_out, fn, base, scale, dim, norm_eps, hc_eps, iters,
+        previous_pre, pre, partials, (const bf16*)norm_weight, collapsed_norm,
+        mode ? !strcmp(mode, "1") : rows < 128, parts);
+}
+
 void glm_kda_scan(GlmCtx* ctx, void* out, float* state, const void* q, const void* k,
                   const void* v, const void* forget, const void* beta, const float* a_log,
                   const float* dt_bias, const int* cu, int heads, int batch, float lower_bound) {
@@ -405,7 +577,7 @@ void glm_mhc_pre(GlmCtx* ctx, void* out, float* post, float* comb, const void* x
 }
 void glm_dsv41_mhc_pre(GlmCtx* ctx, void* out, float* pre, float* post, float* comb,
                        const void* x, const float* fn, const float* base, const float* scale,
-                       const float* previous_pre, int rows, int dim, float norm_eps, float hc_eps, int iters, float* partials) {
+                       const float* previous_pre, int rows, int dim, float norm_eps, float hc_eps, int iters, float* partials, const void* norm_weight) {
     cudaSetDevice(ctx->device_id);
     if (rows > 0) {
         const char* mode = getenv("SLOPLLM_DSV41_MHC_PROJECTION");
@@ -414,6 +586,12 @@ void glm_dsv41_mhc_pre(GlmCtx* ctx, void* out, float* pre, float* post, float* c
             abort();
         }
         const bool tensor_core = mode ? !strcmp(mode, "tf32") : rows >= 128;
+        const char* sinkhorn_mode = getenv("SLOPLLM_DSV41_MHC_SINKHORN");
+        if (sinkhorn_mode && strcmp(sinkhorn_mode, "0") && strcmp(sinkhorn_mode, "1")) {
+            fprintf(stderr, "SLOPLLM_DSV41_MHC_SINKHORN must be 0 or 1\n"); abort();
+        }
+        const bool fast_sinkhorn = sinkhorn_mode ? !strcmp(sinkhorn_mode, "1") : rows < 128;
+        float* collapsed_norm = norm_weight && !tensor_core ? partials + size_t(rows) * 25 * MHC_PARTS : nullptr;
         const char* pipeline_mode = getenv("SLOPLLM_DSV41_MHC_PIPELINE");
         if (pipeline_mode && strcmp(pipeline_mode, "0") && strcmp(pipeline_mode, "1")) {
             fprintf(stderr, "SLOPLLM_DSV41_MHC_PIPELINE must be 0 or 1\n"); abort();
@@ -423,7 +601,15 @@ void glm_dsv41_mhc_pre(GlmCtx* ctx, void* out, float* pre, float* post, float* c
             && (!pipeline_mode || !strcmp(pipeline_mode, "1"));
         // Decode favors the FP32 split-K reduction. Medium batches parallelize
         // K within the CTA; large batches favor more rows and weight reuse.
-        if (!tensor_core) mhc_projection_partials<<<dim3(24, rows, MHC_PARTS), 256, 0, GLM_STREAM(ctx)>>>(partials, (const bf16*)x, fn, 4 * dim);
+        if (!tensor_core) {
+            const char* grouped = getenv("SLOPLLM_DSV41_MHC_DECODE_GROUPED");
+            if (grouped && strcmp(grouped, "0") && strcmp(grouped, "1")) {
+                fprintf(stderr, "SLOPLLM_DSV41_MHC_DECODE_GROUPED must be 0 or 1\n"); abort();
+            }
+            if (!grouped || !strcmp(grouped, "1"))
+                mhc_projection_partials<4><<<dim3(6, rows, MHC_PARTS), 256, 0, GLM_STREAM(ctx)>>>(partials, (const bf16*)x, fn, 4 * dim, (bf16*)out, previous_pre, collapsed_norm);
+            else mhc_projection_partials<1><<<dim3(24, rows, MHC_PARTS), 256, 0, GLM_STREAM(ctx)>>>(partials, (const bf16*)x, fn, 4 * dim, (bf16*)out, previous_pre, collapsed_norm);
+        }
         else if (rows < 2048) {
             if (pipeline) mhc_projection_tf32<16,4,true><<<dim3((rows+15)/16, MHC_PARTS), 384, 0, GLM_STREAM(ctx)>>>(partials, (const bf16*)x, fn, 4 * dim, rows);
             else mhc_projection_tf32<16,4><<<dim3((rows+15)/16, MHC_PARTS), 384, 0, GLM_STREAM(ctx)>>>(partials, (const bf16*)x, fn, 4 * dim, rows);
@@ -432,7 +618,7 @@ void glm_dsv41_mhc_pre(GlmCtx* ctx, void* out, float* pre, float* post, float* c
             else mhc_projection_tf32<32,1><<<dim3((rows+31)/32, MHC_PARTS), 128, 0, GLM_STREAM(ctx)>>>(partials, (const bf16*)x, fn, 4 * dim, rows);
         }
         mhc_pre<float, true><<<rows, 256, 0, GLM_STREAM(ctx)>>>(
-            (bf16*)out, post, comb, (const bf16*)x, fn, base, scale, dim, norm_eps, hc_eps, iters, previous_pre, pre, partials);
+            (bf16*)out, post, comb, (const bf16*)x, fn, base, scale, dim, norm_eps, hc_eps, iters, previous_pre, pre, partials, (const bf16*)norm_weight, collapsed_norm, fast_sinkhorn);
     }
 }
 void glm_mhc_post(GlmCtx* ctx, void* out, const void* residual, const void* block,

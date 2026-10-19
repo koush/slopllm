@@ -134,7 +134,7 @@ __global__ void __launch_bounds__(128, 4) gdn_recurrent_step_kernel(
         float al = A_log[h];
         float dtb = dt_bias[h];
         s_partial[0] = sigmoid_f(bv);
-        s_partial[1] = __expf(-expf(al) * softplus_f(a + dtb));
+        s_partial[1] = __expf(-__expf(al) * softplus_f(a + dtb));
     }
     __syncthreads();
     beta = s_partial[0];
@@ -235,7 +235,7 @@ __global__ void __launch_bounds__(128, 4) gdn_prefill_kernel(
     float* state_h = state + b * state_stride + h * d_k * d_v;
     float al = A_log[h];
     float dtb = dt_bias[h];
-    float neg_exp_al = -expf(al);
+    float neg_exp_al = -__expf(al);
 
     int q_channel_base = h * d_k;
     int k_channel_base = num_heads * d_k + h * d_k;
@@ -545,4 +545,3 @@ void glm_rmsnorm_gated(
         eps, dim, batch
     );
 }
-

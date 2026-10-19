@@ -17,7 +17,7 @@ def glm():
         "glm_mhc_pre": [ct.c_void_p] * 8 + [ct.c_int, ct.c_int, ct.c_float, ct.c_float, ct.c_int],
         "glm_mhc_post": [ct.c_void_p] * 6 + [ct.c_int, ct.c_int],
         "glm_mhc_streams": [ct.c_void_p] * 3 + [ct.c_int] * 3,
-        "glm_dsv41_mhc_pre": [ct.c_void_p] * 10 + [ct.c_int, ct.c_int, ct.c_float, ct.c_float, ct.c_int, ct.c_void_p],
+        "glm_dsv41_mhc_pre": [ct.c_void_p] * 10 + [ct.c_int, ct.c_int, ct.c_float, ct.c_float, ct.c_int, ct.c_void_p, ct.c_void_p],
     }
     for name, args in signatures.items():
         fn = getattr(ops.lib, name)
@@ -150,7 +150,8 @@ def test_kda_sigmoid_norm(glm, buffers):
 
 
 @pytest.mark.parametrize("delayed", [False, True])
-def test_dsv41_mhc_preserves_fp32_projection_and_previous_mix(glm, buffers, delayed):
+@pytest.mark.parametrize("fused_norm", [False, True])
+def test_dsv41_mhc_preserves_fp32_projection_and_previous_mix(glm, buffers, delayed, fused_norm):
     torch.manual_seed(412)
     rows, dim = 2, 5120
     x = torch.randn(rows, 4, dim).bfloat16()
@@ -167,12 +168,16 @@ def test_dsv41_mhc_preserves_fp32_projection_and_previous_mix(glm, buffers, dela
         expected_comb /= expected_comb.sum(-1, keepdim=True) + 1e-6
         expected_comb /= expected_comb.sum(-2, keepdim=True) + 1e-6
     expected_x = ((x.float() * previous[:, :, None]).sum(1) if delayed else x[:, 0]).bfloat16().float()
+    norm_weight = torch.randn(dim).bfloat16()
+    if fused_norm:
+        expected_x = (expected_x * torch.rsqrt(expected_x.square().mean(-1, keepdim=True) + 1e-20)
+                      * norm_weight.float()).bfloat16().float()
     out, pre, post, comb = [buffers(t) for t in [torch.empty(rows, dim, dtype=torch.bfloat16),
         torch.empty(rows, 4), torch.empty(rows, 4), torch.empty(rows, 4, 4)]]
     inputs = [buffers(t) for t in [x, fn, base, scale]]
     glm.lib.glm_dsv41_mhc_pre(glm.ctx, out, pre, post, comb, *inputs,
                             buffers(previous) if delayed else 0, rows, dim, 1e-20, 1e-6, 20,
-                            buffers(torch.empty(rows, 25, 8)))
+                            buffers(torch.empty(rows, 26 if fused_norm else 25, 8)), buffers(norm_weight) if fused_norm else 0)
     torch.testing.assert_close(download(glm, out, expected_x.shape, torch.bfloat16), expected_x, atol=.008, rtol=.008)
     for pointer, expected in [(pre, expected_pre), (post, expected_post), (comb, expected_comb)]:
         torch.testing.assert_close(download(glm, pointer, expected.shape, torch.float32), expected, atol=2e-6, rtol=2e-5)

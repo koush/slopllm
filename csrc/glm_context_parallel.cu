@@ -525,6 +525,12 @@ void glm_cp_merge_local(
 } // extern "C"
 
 // ---------------------------------------------------------------------------
+__device__ __forceinline__ float fast_exp2(float x) {
+    float result;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(x));
+    return result;
+}
+
 // CP Correction Kernel: rescale local v_out by exp2(lse_local - global_lse)
 //
 // After AllGathering all N ranks' LSEs, each GPU computes the global LSE
@@ -582,7 +588,7 @@ cp_correct_attn_out_kernel(
         if (i < world_size) {
             float v = local_lses[i] - lse_max;
             if (v > -20.0f)  // exp2(-20) ~ 1e-6, skip very small
-                sum_exp2 += exp2f(v);
+                sum_exp2 += fast_exp2(v);
         }
     }
     float glse = log2f(sum_exp2) + lse_max;
@@ -591,7 +597,7 @@ cp_correct_attn_out_kernel(
         global_lse[lse_base] = glse;
 
     // Compute rescale factor for this rank
-    float factor = exp2f(local_lses[rank] - glse);
+    float factor = fast_exp2(local_lses[rank] - glse);
 
     // Rescale v_out in-place
     int64_t v_offset = (int64_t)(b * num_heads + h) * head_dim;

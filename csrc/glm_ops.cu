@@ -1264,11 +1264,11 @@ __global__ void __launch_bounds__(256, 4) softmax_kernel(
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         float val;
         if constexpr (UseCache) {
-            val = expf(s_cache[i] - max_val) * inv_sum;
+            val = __expf(s_cache[i] - max_val) * inv_sum;
         } else {
             val = __bfloat162float(x[i]);
             if (m) val += __bfloat162float(m[i]);
-            val = expf(val - max_val) * inv_sum;
+            val = __expf(val - max_val) * inv_sum;
         }
         o[i] = __float2bfloat16(val);
     }

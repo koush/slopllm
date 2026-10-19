@@ -1056,21 +1056,30 @@ export class GlmTensor extends Tensor {
   }
 
 
-  dsv41MhcPre(fn: Tensor, base: Tensor, scale: Tensor, previousPre?: Tensor, normEps = 1e-20, hcEps = 1e-6, iters = 20): { input: Tensor; pre: Tensor; post: Tensor; comb: Tensor } {
+  dsv41MhcPre(fn: Tensor, base: Tensor, scale: Tensor, previousPre?: Tensor, normEps = 1e-20, hcEps = 1e-6, iters = 20, normWeight?: Tensor,
+    postMix?: { block: Tensor; post: Tensor; comb: Tensor }): { input: Tensor; pre: Tensor; post: Tensor; comb: Tensor; residual?: Tensor } {
     const x = this;
-    this.checkDsv41Tensors(fn, base, scale, previousPre);
+    this.checkDsv41Tensors(fn, base, scale, previousPre, normWeight, postMix?.block, postMix?.post, postMix?.comb);
     if (x.type !== "BF16" || x.shape.length !== 3 || x.shape[1] !== 4 || x.shape[2] < 1 || !Number.isFinite(normEps)
       || normEps <= 0 || !Number.isFinite(hcEps) || hcEps <= 0 || !Number.isSafeInteger(iters) || iters < 1) throw new Error("Invalid V4.1 mHC inputs");
     const [rows, , dim] = x.shape;
+    if (normWeight && (normWeight.type !== "BF16" || normWeight.shape.length !== 1 || normWeight.numElements !== dim)) throw new Error("V4.1 mHC norm requires BF16 [dim]");
+    if (postMix) for (const [tensor, shape, type] of [
+      [postMix.block, [rows, dim], "BF16"], [postMix.post, [rows, 4], "F32"], [postMix.comb, [rows, 4, 4], "F32"],
+    ] as [Tensor, number[], string][]) {
+      if (tensor.type !== type || JSON.stringify(tensor.shape) !== JSON.stringify(shape)) throw new Error(`V4.1 mHC post requires ${type} [${shape}]`);
+    }
     for (const [t, shape] of [[fn, [24, 4 * dim]], [base, [24]], [scale, [3]], ...(previousPre ? [[previousPre, [rows, 4]]] : [])] as [Tensor, number[]][]) {
       if (t.type !== "F32" || JSON.stringify(t.shape) !== JSON.stringify(shape)) throw new Error(`V4.1 mHC requires F32 [${shape}]`);
     }
     const input = x.workspace.alloc([rows, dim], "BF16"), pre = x.workspace.alloc([rows, 4], "F32");
     const post = x.workspace.alloc([rows, 4], "F32"), comb = x.workspace.alloc([rows, 4, 4], "F32");
-    using partials = x.workspace.alloc([rows, 25, 8], "F32");
+    const residual = postMix ? x.workspace.alloc(x.shape, "BF16") : undefined;
+    using partials = x.workspace.alloc([rows, normWeight || postMix ? 26 : 25, postMix ? Math.ceil(dim / 128) : 8], "F32");
     getNativeAddon().dsv41MhcPre(this.ops.ctx, input.data, pre.data, post.data, comb.data, x.data, fn.data, base.data, scale.data,
-      previousPre?.data ?? 0, x.shape[0], x.shape[2], normEps, hcEps, iters, partials.data);
-    return { input, pre, post, comb };
+      previousPre?.data ?? 0, x.shape[0], x.shape[2], normEps, hcEps, iters, partials.data, normWeight?.data ?? 0,
+      residual?.data ?? 0, postMix?.block.data ?? 0, postMix?.post.data ?? 0, postMix?.comb.data ?? 0);
+    return { input, pre, post, comb, ...(residual ? { residual } : {}) };
   }
 
   dsv41Compress(positions: Tensor, cu: Tensor, weight: Tensor, ratio: 1 | 2, pending?: Tensor, pendingPosition?: Tensor, eps = 1e-20,

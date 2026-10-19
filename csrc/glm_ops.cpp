@@ -2886,16 +2886,23 @@ static Napi::Value Dsv4SparseAttention(const Napi::CallbackInfo& info) {
 
 static Napi::Value Dsv41MhcPre(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() != 16) {
-        Napi::TypeError::New(env, "dsv41MhcPre expects 16 arguments").ThrowAsJavaScriptException();
+    if (info.Length() != 17 && info.Length() != 21) {
+        Napi::TypeError::New(env, "dsv41MhcPre expects 17 or 21 arguments").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     auto ptr = [&](int i) { return info[i].As<Napi::Number>().Int64Value(); };
-    glm_dsv41_mhc_pre((GlmCtx*)ptr(0), (void*)ptr(1), (float*)ptr(2), (float*)ptr(3),
+    if (info.Length() == 21 && ptr(17)) {
+        glm_dsv41_mhc_post_pre((GlmCtx*)ptr(0), (void*)ptr(1), (float*)ptr(2), (float*)ptr(3),
+            (float*)ptr(4), (void*)ptr(17), (void*)ptr(5), (void*)ptr(18), (float*)ptr(19), (float*)ptr(20),
+            (float*)ptr(6), (float*)ptr(7), (float*)ptr(8), (float*)ptr(9),
+            info[10].As<Napi::Number>().Int32Value(), info[11].As<Napi::Number>().Int32Value(),
+            info[12].As<Napi::Number>().FloatValue(), info[13].As<Napi::Number>().FloatValue(),
+            info[14].As<Napi::Number>().Int32Value(), (float*)ptr(15), (void*)ptr(16));
+    } else glm_dsv41_mhc_pre((GlmCtx*)ptr(0), (void*)ptr(1), (float*)ptr(2), (float*)ptr(3),
         (float*)ptr(4), (void*)ptr(5), (float*)ptr(6), (float*)ptr(7), (float*)ptr(8),
         (float*)ptr(9), info[10].As<Napi::Number>().Int32Value(), info[11].As<Napi::Number>().Int32Value(),
         info[12].As<Napi::Number>().FloatValue(), info[13].As<Napi::Number>().FloatValue(),
-        info[14].As<Napi::Number>().Int32Value(), (float*)ptr(15));
+        info[14].As<Napi::Number>().Int32Value(), (float*)ptr(15), (void*)ptr(16));
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) Napi::Error::New(env, cudaGetErrorString(err)).ThrowAsJavaScriptException();
     return env.Undefined();

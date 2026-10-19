@@ -87,7 +87,11 @@ it("V4.1 resident generation supports batched chunks, captured decode, and rollb
             return step.value;
           }
           phases++;
-          assert.equal(posts, Math.floor(phases / 2), "Yield before and after each mHC post/reduction");
+          const fusedPost = state.totalTokens <= 32 && process.env.SLOPLLM_DSV41_MHC_POST_PRE !== "0";
+          // Fused post/pre still yields at each communication boundary. Only
+          // the two Engram boundaries and final output need standalone post.
+          const expectedPosts = fusedPost ? [4, 14 * 4, 40 * 4].filter(boundary => phases >= boundary).length : Math.floor(phases / 2);
+          assert.equal(posts, expectedPosts, "Yield before and after each standalone or fused mHC post/reduction");
           yield;
         }
       } finally { forward.return(undefined!); }

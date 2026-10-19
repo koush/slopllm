@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
 import { GlmOps, bf16BytesToF32 } from "../src/glm_ops";
+import { ParallelOps, ParallelTensor } from "../src/parallel_ops";
+import { TensorParallelism } from "../src/device_ops";
 import { getNativeAddon } from "../src/native-addon";
 import { WorkspaceBase } from "../src/workspace";
 import { CaptureManager } from "../src/capture-manager";
@@ -11,6 +13,67 @@ function floats(tensor: Tensor): Float32Array {
   const bytes = Buffer.alloc(tensor.bytes); tensor.d2h(bytes);
   return new Float32Array(bytes.buffer, bytes.byteOffset, bytes.length / 4);
 }
+
+for (const world of [1, 2]) it(`DeepSeek fused post/pre preserves rounded residuals and graph ownership TP${world}`, () => {
+  using gpu0 = new GlmOps(0); using gpu1 = world === 2 ? new GlmOps(1) : undefined;
+  using parallel = gpu1 ? new ParallelOps([gpu0, gpu1]) : undefined;
+  const ops = parallel ?? gpu0;
+  const bytes = (tensor: Tensor) => { const out = Buffer.alloc(tensor.bytes); tensor.d2h(out); return out; };
+  for (const [rows, dim] of [[1, 73], [4, 5120], [5, 5120], [3, 520]]) {
+    using ws = new WorkspaceBase(ops), refWs = new WorkspaceBase(ops), manager = new CaptureManager(ops);
+    using x = ws.alloc([rows, 4, dim], "BF16"), referenceX = refWs.alloc(x.shape, "BF16");
+    using block = ws.alloc([rows, dim], "BF16"), oldPost = ws.alloc([rows, 4], "F32"), oldComb = ws.alloc([rows, 4, 4], "F32");
+    using fn = ws.alloc([24, 4 * dim], "F32"), base = ws.alloc([24], "F32"), scale = ws.alloc([3], "F32");
+    using previous = ws.alloc([rows, 4], "F32"), norm = ws.alloc([dim], "BF16");
+    for (const tensor of [oldPost, oldComb, fn, base, scale, previous]) {
+      const factor = tensor === fn ? .01 : .4;
+      tensor.h2d(Buffer.from(Float32Array.from({ length: tensor.numElements }, (_, i) => Math.cos(i * .31) * factor).buffer));
+    }
+    norm.h2d(bf16Round(Float32Array.from({ length: dim }, (_, i) => .7 + Math.sin(i * .07))));
+    for (let pass = 0; pass < 10; ++pass) {
+      const values = bf16Round(Float32Array.from({ length: x.numElements }, (_, i) => Math.sin(i * .13 + pass) * 3));
+      const blockValues = bf16Round(Float32Array.from({ length: block.numElements }, (_, i) => Math.cos(i * .17 + pass)));
+      x.h2d(values); referenceX.h2d(values); block.h2d(blockValues);
+      const withNorm = pass % 2 === 0;
+      const expected = (() => {
+        using residual = ops.mhcPost(referenceX, block, oldPost, oldComb);
+        const result = residual.dsv41MhcPre(fn, base, scale, withNorm ? previous : undefined);
+        using input = result.input; using pre = result.pre; using post = result.post; using comb = result.comb;
+        using normalized = withNorm ? input.rmsnorm(norm, 1e-20) : input.viewClone();
+        return { residual: bytes(residual), input: bytes(normalized), pre: floats(pre), post: floats(post), comb: floats(comb) };
+      })();
+      const result = manager.run({ x, block, oldPost, oldComb, fn, base, scale, previous, norm }, (_capture, a) =>
+        a.x.dsv41MhcPre(a.fn, a.base, a.scale, withNorm ? a.previous : undefined, 1e-20, 1e-6, 20,
+          withNorm ? a.norm : undefined, { block: a.block, post: a.oldPost, comb: a.oldComb }), ["post-pre", withNorm]) as ReturnType<Tensor["dsv41MhcPre"]>;
+      using input = result.input; using pre = result.pre; using post = result.post; using comb = result.comb; using residual = result.residual!;
+      assert.deepEqual(bytes(residual), expected.residual, "post residual BF16 rounding must be exact");
+      assert.deepEqual(bytes(x), values, "fused preparation must not mutate its residual input");
+      assert.deepEqual(bytes(block), blockValues, "fused preparation must not mutate its block input");
+      for (const [actual, reference] of [[floats(pre), expected.pre], [floats(post), expected.post], [floats(comb), expected.comb]])
+        for (let i = 0; i < actual.length; ++i) assert(Math.abs(actual[i] - reference[i]) < 3e-6);
+      const actual = bf16BytesToF32(bytes(input)), reference = bf16BytesToF32(expected.input);
+      for (let i = 0; i < actual.length; ++i) assert(Math.abs(actual[i] - reference[i]) <= Math.max(1e-7, Math.abs(reference[i]) / 128));
+    }
+    assert([...manager.captured.values()].some(graph => graph.graphExec));
+  }
+});
+
+it("DeepSeek fused post/pre reduces partial-sum block inputs before BF16 mixing", () => {
+  using gpu0 = new GlmOps(0), gpu1 = new GlmOps(1), ops = new ParallelOps([gpu0, gpu1]);
+  using ws = new WorkspaceBase(ops);
+  using x = ws.alloc([4, 4, 64], "BF16"), block = ws.alloc([4, 64], "BF16") as ParallelTensor;
+  using post = ws.alloc([4, 4], "F32"), comb = ws.alloc([4, 4, 4], "F32");
+  using fn = ws.alloc([24, 256], "F32"), base = ws.alloc([24], "F32"), scale = ws.alloc([3], "F32");
+  x.fill(.5, x.numElements); post.fill(.75, post.numElements); comb.fill(.25, comb.numElements);
+  fn.fill(0, fn.numElements); base.fill(0, 24); scale.fill(.1, 3);
+  block.shards[0].fill(.125, block.numElements); block.shards[1].fill(.375, block.numElements);
+  block.parallelism = TensorParallelism.PartialSum;
+  const result = x.dsv41MhcPre(fn, base, scale, undefined, 1e-20, 1e-6, 20, undefined, { block, post, comb });
+  using input = result.input; using nextPre = result.pre; using nextPost = result.post; using nextComb = result.comb; using residual = result.residual!;
+  assert.equal(block.parallelism, TensorParallelism.Replicated);
+  const bytes = Buffer.alloc(residual.bytes); residual.d2h(bytes);
+  assert(bf16BytesToF32(bytes).every(value => value === .875));
+});
 
 it("DeepSeek mHC projection preserves FP32 weight residuals and captured row tails", () => {
   using ops = new GlmOps(0);
@@ -33,7 +96,7 @@ it("DeepSeek mHC projection preserves FP32 weight residuals and captured row tai
         const partials = ws.alloc([rows, 25, 8], "F32");
         getNativeAddon().dsv41MhcPre(ops.ctx, output.data, pre.data, post.data, comb.data,
           input.x.data, input.fn.data, input.base.data, input.scale.data, input.previous.data,
-          rows, dim, 1e-20, 1e-6, 20, partials.data);
+          rows, dim, 1e-20, 1e-6, 20, partials.data, 0);
         return { output, pre, post, comb, partials };
       }, ["mhc"]) as Record<"output" | "pre" | "post" | "comb" | "partials", Tensor>;
       using output = result.output; using pre = result.pre; using post = result.post;
@@ -65,6 +128,54 @@ it("DeepSeek mHC projection preserves FP32 weight residuals and captured row tai
       }
     }
     assert([...manager.captured.values()].some(graph => graph.graphExec));
+  }
+});
+
+it("DeepSeek decode mHC prepares rounded collapse and RMSNorm under graph replay", () => {
+  const saved = process.env.SLOPLLM_DSV41_MHC_DECODE_GROUPED;
+  using ops = new GlmOps(0);
+  try {
+    for (const [rows, dim] of [[1, 73], [4, 5120], [5, 5120], [17, 520]]) {
+      using ws = new WorkspaceBase(ops); using manager = new CaptureManager(ops);
+      using referenceWs = new WorkspaceBase(ops);
+      using referenceX = referenceWs.alloc([rows, 4, dim], "BF16");
+      using x = ws.alloc([rows, 4, dim], "BF16"), fn = ws.alloc([24, 4 * dim], "F32");
+      using base = ws.alloc([24], "F32"), scale = ws.alloc([3], "F32");
+      using previous = ws.alloc([rows, 4], "F32"), norm = ws.alloc([dim], "BF16");
+      fn.h2d(Buffer.from(Float32Array.from({ length: fn.numElements }, (_, i) => Math.sin(i * .17) * .01).buffer));
+      previous.h2d(Buffer.from(Float32Array.from({ length: previous.numElements }, (_, i) => Math.cos(i * .3) * .7).buffer));
+      norm.h2d(bf16Round(Float32Array.from({ length: dim }, (_, i) => .5 + Math.sin(i * .11))));
+      base.fill(.01, 24); scale.fill(.1, 3);
+      for (let pass = 0; pass < 10; ++pass) {
+        const values = bf16Round(Float32Array.from({ length: x.numElements }, (_, i) => Math.sin(i * .13 + pass) * 2));
+        x.h2d(values); referenceX.h2d(values);
+        process.env.SLOPLLM_DSV41_MHC_DECODE_GROUPED = "0";
+        const baseline = (() => {
+          const result = referenceX.dsv41MhcPre(fn, base, scale, pass % 2 ? undefined : previous);
+          using input = result.input; using pre = result.pre; using post = result.post; using comb = result.comb;
+          using expected = input.rmsnorm(norm, 1e-20);
+          const bytes = Buffer.alloc(expected.bytes); expected.d2h(bytes);
+          return { pre: floats(pre), post: floats(post), comb: floats(comb), bytes };
+        })();
+        process.env.SLOPLLM_DSV41_MHC_DECODE_GROUPED = "1";
+        const fused = manager.run({ x, fn, base, scale, previous, norm }, (_capture, args) =>
+          args.x.dsv41MhcPre(args.fn, args.base, args.scale, pass % 2 ? undefined : args.previous,
+            1e-20, 1e-6, 20, args.norm), ["decode-mhc", pass % 2]) as ReturnType<Tensor["dsv41MhcPre"]>;
+        using actual = fused.input; using actualPre = fused.pre; using actualPost = fused.post; using actualComb = fused.comb;
+        assert.deepEqual(floats(actualPre), baseline.pre);
+        assert.deepEqual(floats(actualPost), baseline.post);
+        assert.deepEqual(floats(actualComb), baseline.comb);
+        const a = Buffer.alloc(actual.bytes), b = baseline.bytes;
+        actual.d2h(a);
+        const av = bf16BytesToF32(a), bv = bf16BytesToF32(b);
+        for (let i = 0; i < av.length; ++i) assert(Math.abs(av[i] - bv[i]) <= Math.max(1e-7, Math.abs(bv[i]) / 128),
+          `rows=${rows}, dim=${dim}, index=${i}: ${av[i]} vs ${bv[i]}`);
+      }
+      assert([...manager.captured.values()].some(graph => graph.graphExec));
+    }
+  } finally {
+    if (saved === undefined) delete process.env.SLOPLLM_DSV41_MHC_DECODE_GROUPED;
+    else process.env.SLOPLLM_DSV41_MHC_DECODE_GROUPED = saved;
   }
 });
 
