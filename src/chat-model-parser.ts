@@ -165,7 +165,7 @@ export function resolveControlToken(tokenizer: Tokenizer, marker: string): numbe
   return encoded[0];
 }
 
-class IncrementalTokenDecoder {
+export class IncrementalTokenDecoder {
   private tokenIds: number[] = [];
   private emittedText = "";
   private readonly canCompactHistory: boolean;

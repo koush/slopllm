@@ -8,7 +8,7 @@ revision `9c60bcbf1670e06f154b5d61080e50c9b3b7b4a3`.
 End-to-end text generation uses a GPU-resident forward pass with the resident TP
 weights. `DeepseekV41Model` supports the ordinary `ChatModel` prefill/decode
 interfaces, including batched and chunked inputs and CUDA-graph-captured decode.
-Prefill runs eagerly. CP, MTP/DSpark, vision, tool calls, and pinned-host cache
+Prefill runs eagerly. CP, MTP/DSpark, vision, and pinned-host cache
 offload are not enabled. Independent test-side numerical oracles check the
 production kernels; there is no separate reference executor or CLI.
 
@@ -63,7 +63,7 @@ hash history, routing, quantization, and per-token expert selection.
 | Text decoder | `src/deepseek_v41_model.ts`: complete batched forward and layer helpers, composing tensor and paged execution operations |
 | Cache and selection | `src/deepseek_v41_cache.ts`: storage and prefix sharing; `GlmOps`/`ParallelOps`: paged appends, physical slot mapping and index scoring |
 | Generation | Standard `ChatModel` interfaces and `src/openai-server.ts` |
-| Chat formatting | `src/deepseek_v41_chat.ts`: text-only V4.1 role markers, reasoning-effort prefix, thinking toggle, and reasoning/content output parsing; supplies the template absent from checkpoint metadata |
+| Chat formatting | `src/deepseek_v41_chat.ts`: V4.1 role markers, reasoning-effort prefix, thinking toggle, spaced-DSML function calls, tool-result history, and reasoning/content/tool output parsing; supplies the template absent from checkpoint metadata |
 
 The FP8 kernel supports compile-time 32x32/E8M0 and 128x128/BF16 scale contracts,
 vector loads, configurable rows per warp and small-output split-K. It replaces
