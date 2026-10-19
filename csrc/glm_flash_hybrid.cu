@@ -394,9 +394,21 @@ __global__ void mhc_pre(bf16* collapsed, float* post, float* comb,
         const float inv = rsqrtf(squared / dim + norm_eps);
         const int first = overlap_norm ? tid - 32 : tid;
         const int stride = overlap_norm ? blockDim.x - 32 : blockDim.x;
-        for (int i = first; i < dim; i += stride) {
-            const size_t offset = size_t(row) * dim + i;
-            collapsed[offset] = __float2bfloat16(float(collapsed[offset]) * inv * float(norm_weight[i]));
+        bf16* output = collapsed + size_t(row) * dim;
+        if (dim % 2 == 0 && ((reinterpret_cast<uintptr_t>(output) |
+                             reinterpret_cast<uintptr_t>(norm_weight)) & 3) == 0) {
+            auto* packed_output = reinterpret_cast<__nv_bfloat162*>(output);
+            const auto* packed_weight = reinterpret_cast<const __nv_bfloat162*>(norm_weight);
+            for (int i = first; i < dim / 2; i += stride) {
+                const float2 value = __bfloat1622float2(packed_output[i]);
+                const float2 weight = __bfloat1622float2(packed_weight[i]);
+                // Keep both multiplies in FP32 and round only the final result.
+                packed_output[i] = __floats2bfloat162_rn(value.x * inv * weight.x,
+                                                       value.y * inv * weight.y);
+            }
+        } else {
+            for (int i = first; i < dim; i += stride)
+                output[i] = __float2bfloat16(float(output[i]) * inv * float(norm_weight[i]));
         }
         if (overlap_norm) return;
     }
