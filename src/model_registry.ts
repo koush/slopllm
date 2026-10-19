@@ -24,8 +24,8 @@ export interface ModelRegistration {
 
 export const modelRegistry = {
   deepseek_v41: {
-    phasedPrefill: false, contextParallel: false, mtp: false, persistentLoader: true,
-    load: (ops, dir) => DeepseekV41Model.fromPretrained(ops, dir),
+    phasedPrefill: false, contextParallel: false, mtp: true, persistentLoader: true,
+    load: (ops, dir, options) => DeepseekV41Model.fromPretrained(ops, dir, options.mtp > 0),
   },
   glm_moe_dsa: {
     phasedPrefill: true, contextParallel: true, mtp: true, persistentLoader: true,
@@ -57,5 +57,6 @@ export function inspectModel(modelDir: string, options: ModelOptions) {
   const registration: ModelRegistration = modelRegistry[modelType as ModelType];
   if (options.cp && !registration.contextParallel) throw new Error(`${modelType} does not support --cp`);
   if (options.mtp > 0 && !registration.mtp) throw new Error(`${modelType} does not support --mtp`);
+  if (modelType === "deepseek_v41" && options.mtp > 5) throw new Error("DeepSeek DSpark supports --mtp verification depths 1..5");
   return { modelType: modelType as ModelType, registration, config };
 }

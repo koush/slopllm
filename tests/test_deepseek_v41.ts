@@ -159,6 +159,22 @@ for (const tp of [1, 2]) {
       indexScores.d2h(scoreBytes);
       const expectedScores = dsv41IndexScores(expectedIndex, [keyValues.subarray(0, 128), keyValues.subarray(128)], weightValues);
       assert.deepEqual(scoreBytes, Buffer.from(expectedScores.buffer));
+      // DSpark's Markov codebook is vocabulary-sharded, without mHC expansion.
+      using codebook = ws.alloc([16, 256], "BF16", undefined, TensorParallelism.Column);
+      const codeValues = Float32Array.from({ length: 16 * 256 }, (_, i) => Math.floor(i / 256) + (i % 256) / 256);
+      codebook.h2d(bf16Round(codeValues));
+      using codeIds = ws.alloc([4], "I32"); codeIds.h2d(Buffer.from(Int32Array.of(0, 7, 8, 15).buffer));
+      using codes = codebook.embedding(codeIds);
+      const codeBytes = Buffer.alloc(codes.bytes); codes.d2h(codeBytes);
+      assert.deepEqual(codeBytes, bf16Round(Float32Array.from([0, 7, 8, 15].flatMap(row => Array.from(codeValues.slice(row * 256, (row + 1) * 256))))));
+      using scoresF32 = ws.alloc([2, 16], "F32", undefined, TensorParallelism.Row);
+      using biasF32 = ws.alloc([2, 16], "F32", undefined, TensorParallelism.Row);
+      const scoresHost = new Float32Array(32); scoresHost[7] = 1; scoresHost[8] = 1.0001; scoresHost[31] = 3;
+      const biasHost = new Float32Array(32); biasHost[8] = -0.0002;
+      scoresF32.h2d(Buffer.from(scoresHost.buffer)); biasF32.h2d(Buffer.from(biasHost.buffer));
+      using adjustedF32 = scoresF32.add(biasF32);
+      using selectedF32 = adjustedF32.argmax();
+      assert.deepEqual(selectedF32.readInt32LEArray(), [7, 15]);
       using carry = new UsingHolder<CompressorCarry>(undefined!);
       using retained = new UsingHolder<CompressorCarry>(undefined!);
       using raw = ws.alloc([2, 1024], "F32");

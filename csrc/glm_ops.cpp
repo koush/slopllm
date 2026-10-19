@@ -1831,7 +1831,8 @@ static Napi::Value Max(const Napi::CallbackInfo& info) {
     int dim = info[4].As<Napi::Number>().Int32Value();
     int batch = info[5].As<Napi::Number>().Int32Value();
     int offset = info.Length() > 6 ? info[6].As<Napi::Number>().Int32Value() : 0;
-    glm_max(reinterpret_cast<GlmCtx*>(ctx_ptr),
+    auto max_fn = info.Length() > 7 && info[7].As<Napi::Boolean>().Value() ? glm_max_f32 : glm_max;
+    max_fn(reinterpret_cast<GlmCtx*>(ctx_ptr),
             reinterpret_cast<void*>(out_vals_ptr),
             reinterpret_cast<int*>(out_idxs_ptr),
             reinterpret_cast<const void*>(in_ptr), dim, batch, offset);

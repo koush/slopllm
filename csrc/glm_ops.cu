@@ -3090,17 +3090,18 @@ void glm_index_select(GlmCtx* ctx, void* out, const void* src,
 }
 
 // ---------------------------------------------------------------------------
-// Max kernel (find max value and index per row in BF16 input)
+// Max kernel (find max value and index per row in BF16 or F32 input)
 //   out_values[row] = max(input[row * dim : (row+1) * dim])
 //   out_indices[row] = argmax(input[row * dim : (row+1) * dim])
 // ---------------------------------------------------------------------------
 
-__global__ void __launch_bounds__(256, 4) max_kernel(__nv_bfloat16* out_values, int* out_indices,
-                              const __nv_bfloat16* input, int dim, int batch, int offset) {
+template<typename T>
+__global__ void __launch_bounds__(256, 4) max_kernel(T* out_values, int* out_indices,
+                              const T* input, int dim, int batch, int offset) {
     int row = blockIdx.x;
     if (row >= batch) return;
 
-    const __nv_bfloat16* row_in = input + row * dim;
+    const T* row_in = input + row * dim;
 
     extern __shared__ char smem[];
     float* s_vals = reinterpret_cast<float*>(smem);
@@ -3109,12 +3110,14 @@ __global__ void __launch_bounds__(256, 4) max_kernel(__nv_bfloat16* out_values, 
     float my_max = -INFINITY;
     int my_idx = -1;
     for (int i = threadIdx.x * 2; i + 1 < dim; i += blockDim.x * 2) {
-        float2 v = load_bf16x2(row_in + i);
+        float2 v;
+        if constexpr (std::is_same_v<T, __nv_bfloat16>) v = load_bf16x2(row_in + i);
+        else v = make_float2(row_in[i], row_in[i + 1]);
         if (v.x > my_max || (v.x == my_max && i < my_idx)) { my_max = v.x; my_idx = i; }
         if (v.y > my_max || (v.y == my_max && (i + 1) < my_idx)) { my_max = v.y; my_idx = i + 1; }
     }
     if ((dim & 1) && threadIdx.x == (dim / 2) % blockDim.x) {
-        float val = __bfloat162float(row_in[dim - 1]);
+        float val = float(row_in[dim - 1]);
         if (val > my_max || (val == my_max && (dim - 1) < my_idx)) { my_max = val; my_idx = dim - 1; }
     }
     s_vals[threadIdx.x] = my_max;
@@ -3124,7 +3127,7 @@ __global__ void __launch_bounds__(256, 4) max_kernel(__nv_bfloat16* out_values, 
     block_reduce_max_idx(s_vals, s_idxs, threadIdx.x);
 
     if (threadIdx.x == 0) {
-        out_values[row] = __float2bfloat16(s_vals[0]);
+        out_values[row] = T(s_vals[0]);
         out_indices[row] = s_idxs[0] + offset;
     }
 }
@@ -3136,6 +3139,12 @@ void glm_max(GlmCtx* ctx, void* out_values, int* out_indices, const void* input,
     size_t shared_mem = block_size * sizeof(float) + block_size * sizeof(int);
     max_kernel<<<grid, block_size, shared_mem, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out_values, out_indices, (const __nv_bfloat16*)input, dim, batch, offset);
+}
+
+void glm_max_f32(GlmCtx* ctx, void* out_values, int* out_indices, const void* input, int dim, int batch, int offset) {
+    cudaSetDevice(ctx->device_id);
+    max_kernel<<<batch, 256, 256 * (sizeof(float) + sizeof(int)), GLM_STREAM(ctx)>>>(
+        (float*)out_values, out_indices, (const float*)input, dim, batch, offset);
 }
 
 // ---------------------------------------------------------------------------

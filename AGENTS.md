@@ -234,6 +234,14 @@ The loader supports non-FP8 Qwen3, the GLM backend (including the default GLM-5.
 
 ## Start the Loader
 
+DeepSeek V4.1 supports its built-in three-layer DSpark drafter via `--mtp 4`.
+The five-position draft block is fixed; `--mtp` selects verification depth 1–5.
+Its target feature taps are mHC-mean inputs to layers 37–39. Draft context is
+bounded paged KV; verification updates it and selects immutable compressor
+carry at the accepted boundary. Captured verification uses padded KV-length
+buckets. Compare captured and eager verification at identical batch/depth
+geometry rather than requiring equality with single-token decode.
+
 Start the loader and its initial executor in one command:
 
 ```bash

@@ -67,6 +67,9 @@ describe("checkpoint-based model selection", () => {
     }
     fs.writeFileSync(path.join(f.dir, "config.json"), JSON.stringify({ model_type: "glm_moe_dsa" }));
     assert.equal(resolveModelSelection(parseModelArgs(["--model-dir", f.dir, "--cp", "--mtp", "2"])).modelType, "glm_moe_dsa");
+    fs.writeFileSync(path.join(f.dir, "config.json"), JSON.stringify({ model_type: "deepseek_v41" }));
+    for (const depth of [1, 4, 5]) assert.equal(resolveModelSelection(parseModelArgs(["--model-dir", f.dir, "--mtp", String(depth)])).modelType, "deepseek_v41");
+    assert.throws(() => resolveModelSelection(parseModelArgs(["--model-dir", f.dir, "--mtp", "6"])), /verification depths 1..5/);
   });
 
   it("validates selectors and preserves the production default", () => {

@@ -8,9 +8,28 @@ revision `9c60bcbf1670e06f154b5d61080e50c9b3b7b4a3`.
 End-to-end text generation uses a GPU-resident forward pass with the resident TP
 weights. `DeepseekV41Model` supports the ordinary `ChatModel` prefill/decode
 interfaces, including batched and chunked inputs and CUDA-graph-captured decode.
-Prefill runs eagerly. CP, MTP/DSpark, vision, and pinned-host cache
+Prefill runs eagerly. CP, vision, and pinned-host cache
 offload are not enabled. Independent test-side numerical oracles check the
 production kernels; there is no separate reference executor or CLI.
+
+DSpark speculative decoding is available with `--mtp 4` (verification depths
+1–5 are supported). The checkpoint's three draft layers always process all five
+positions; only the requested proposal prefix is verified. Drafting is greedy
+after the full-vocabulary rank-256 Markov correction. Sampled targets use exact
+point-mass rejection sampling under the existing MTP sampling constraints.
+Confidence-based adaptation and sampled drafting are not enabled.
+
+The model collects mHC-mean inputs to backbone layers 37–39, projects their
+concatenation, and writes context KV for all three draft layers. Every draft
+query sees the same recent 128-token context plus the complete five-position
+block. Draft context uses a bounded paged cache with absolute RoPE positions.
+Generator startup replays at most 129 committed target tokens (the start is
+aligned to a compressor pair); subsequent verification forwards update context
+incrementally. Acceptance truncates both KV caches and selects immutable
+compressor projection rows at the accepted boundary, without target replay.
+Drafting, target verification and context updates share a CUDA graph; verification
+indexer scratch uses padded KV-length buckets. Tests compare eager/captured
+verification at identical batch/depth geometry, not single-token decode parity.
 
 ### Batched forward execution
 
@@ -189,7 +208,9 @@ belong in `scratchpad/`.
 TP8 loading produced 93,418 resident text tensors and **59.249 GiB of logical
 weight payload per GPU**, including expanded MXFP4 scales and replicated weights.
 The 85-GiB arena reserves additional runtime space; `nvidia-smi` reports the arena
-reservation rather than logical weight usage. Vision and draft tensors are skipped.
+reservation rather than logical weight usage. Vision tensors are skipped; draft
+tensors are loaded only when `--mtp` is enabled. Changing that flag requires
+restarting the persistent loader.
 
 Source payload accounting before runtime replication/padding:
 
@@ -298,7 +319,7 @@ Resident full-decoder checks:
    hierarchical candidate-selection evaluation beyond 16,384 positions.
 2. Expert-grouped tensor-core MXFP4 and shape-specific FP8 prefill tuning; a custom
    MXFP8 kernel could consume compact checkpoint scales without temporary expansion.
-3. CP, MTP/DSpark, vision, host-cache offload, and more compact indexer storage.
+3. CP, vision, host-cache offload, and more compact indexer storage.
 
 ## Paged-refactor serving check
 

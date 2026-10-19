@@ -37,26 +37,27 @@ __global__ void swiglu_device(__nv_bfloat16* out, const __nv_bfloat16* gate,
     out[i] = __float2bfloat16(float(g / (1. + exp(-g)) * fmin(10., fmax(-10., double(float(up[i]))))));
 }
 
+template<int Experts, int TopK>
 __global__ void route_device(int32_t* ids, double* weights, const float* logits, const float* bias) {
-    ids += blockIdx.x * 6;
-    weights += blockIdx.x * 6;
-    logits += blockIdx.x * 384;
+    ids += blockIdx.x * TopK;
+    weights += blockIdx.x * TopK;
+    logits += blockIdx.x * Experts;
     // One expert per thread; parallel argmax preserves the original F64 biased
     // comparison and lower-expert-ID tie break. Only the six selected scores
     // are accumulated serially, in selection order.
-    __shared__ float scores[384];
+    __shared__ float scores[Experts];
     __shared__ double warp_value[16], total;
     __shared__ int warp_id[16], selected;
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
-    if (threadIdx.x < 384) {
+    if (threadIdx.x < Experts) {
         const double x = logits[threadIdx.x];
         scores[threadIdx.x] = float(sqrt(fmax(x, 0.) + log1p(exp(-fabs(x)))));
     }
     __syncthreads();
-    double candidate = tid < 384 ? double(scores[tid]) + bias[tid] : -INFINITY;
-    int candidate_id = tid < 384 ? tid : 384;
+    double candidate = tid < Experts ? double(scores[tid]) + bias[tid] : -INFINITY;
+    int candidate_id = tid < Experts ? tid : Experts;
     if (tid == 0) total = 0.;
-    for (int j = 0; j < 6; j++) {
+    for (int j = 0; j < TopK; j++) {
         double value = candidate;
         int best = candidate_id;
         for (int d = 16; d; d /= 2) {
@@ -68,7 +69,7 @@ __global__ void route_device(int32_t* ids, double* weights, const float* logits,
         __syncthreads();
         if (warp == 0) {
             value = lane < 16 ? warp_value[lane] : -INFINITY;
-            best = lane < 16 ? warp_id[lane] : 384;
+            best = lane < 16 ? warp_id[lane] : Experts;
             for (int d = 16; d; d /= 2) {
                 const double v = __shfl_down_sync(0xffffffff, value, d);
                 const int e = __shfl_down_sync(0xffffffff, best, d);
@@ -77,9 +78,9 @@ __global__ void route_device(int32_t* ids, double* weights, const float* logits,
             if (lane == 0) { selected = best; ids[j] = best; total += scores[best]; }
         }
         __syncthreads();
-        if (tid == selected) { candidate = -INFINITY; candidate_id = 384; }
+        if (tid == selected) { candidate = -INFINITY; candidate_id = Experts; }
     }
-    if (tid < 6) weights[tid] = 1.5 * scores[ids[tid]] / (total > 0. ? total : 1.);
+    if (tid < TopK) weights[tid] = 1.5 * scores[ids[tid]] / (total > 0. ? total : 1.);
 }
 
 __global__ void collapse_device(__nv_bfloat16* out, const __nv_bfloat16* hidden,
@@ -120,11 +121,11 @@ __global__ void cache_device(uint8_t* cache, const __nv_bfloat16* input, const i
 }
 
 __global__ void embedding_device(__nv_bfloat16* out, const __nv_bfloat16* table,
-                                  const int32_t* token, int start, int rows, int tokens) {
+                                  const int32_t* token, int start, int rows, int tokens, int dim, int streams) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= tokens * 4 * 5120) return;
-    const int row = token[i / (4 * 5120)] - start;
-    out[i] = row >= 0 && row < rows ? table[size_t(row) * 5120 + i % 5120] : __float2bfloat16(0.f);
+    if (i >= tokens * streams * dim) return;
+    const int row = token[i / (streams * dim)] - start;
+    out[i] = row >= 0 && row < rows ? table[size_t(row) * dim + i % dim] : __float2bfloat16(0.f);
 }
 
 __global__ void hash_device(int32_t* out, const int32_t* lookback, const int32_t* token,
@@ -376,9 +377,10 @@ void glm_dsv41_swiglu(GlmCtx* ctx, void* out, const void* gate, const void* up, 
     cudaSetDevice(ctx->device_id);
     swiglu_device<<<(count+255)/256,256,0,GLM_STREAM(ctx)>>>((__nv_bfloat16*)out,(const __nv_bfloat16*)gate,(const __nv_bfloat16*)up,count);
 }
-void glm_dsv41_route(GlmCtx* ctx, int32_t* ids, double* weights, const float* logits, const float* bias, int tokens) {
+void glm_dsv41_route(GlmCtx* ctx, int32_t* ids, double* weights, const float* logits, const float* bias, int tokens, int experts) {
     cudaSetDevice(ctx->device_id);
-    route_device<<<tokens,512,0,GLM_STREAM(ctx)>>>(ids,weights,logits,bias);
+    if (experts == 128) route_device<128, 3><<<tokens,512,0,GLM_STREAM(ctx)>>>(ids,weights,logits,bias);
+    else route_device<384, 6><<<tokens,512,0,GLM_STREAM(ctx)>>>(ids,weights,logits,bias);
 }
 void glm_dsv41_collapse(GlmCtx* ctx, void* out, const void* hidden, const float* pre, int dim, int tokens) {
     cudaSetDevice(ctx->device_id);
@@ -389,9 +391,9 @@ void glm_dsv41_cache_insert(GlmCtx* ctx, uint8_t* cache, const void* input, cons
     cudaSetDevice(ctx->device_id);
     cache_device<<<dim3(8,tokens),64,0,GLM_STREAM(ctx)>>>(cache,(const __nv_bfloat16*)input,positions,ratio,slots);
 }
-void glm_dsv41_embedding(GlmCtx* ctx, void* out, const void* weight, const int32_t* tokens, int start, int rows, int count) {
+void glm_dsv41_embedding(GlmCtx* ctx, void* out, const void* weight, const int32_t* tokens, int start, int rows, int count, int dim, int streams) {
     cudaSetDevice(ctx->device_id);
-    embedding_device<<<80*count,256,0,GLM_STREAM(ctx)>>>((__nv_bfloat16*)out,(const __nv_bfloat16*)weight,tokens,start,rows,count);
+    embedding_device<<<(count*dim*streams+255)/256,256,0,GLM_STREAM(ctx)>>>((__nv_bfloat16*)out,(const __nv_bfloat16*)weight,tokens,start,rows,count,dim,streams);
 }
 void glm_dsv41_hash(GlmCtx* ctx, int32_t* out, const int32_t* lookback, const int32_t* tokens,
     const int32_t* map, const int32_t* primes, const int32_t* offsets, int count,

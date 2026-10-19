@@ -65,10 +65,10 @@ export interface NativeAddon {
   siluAndMul(ctx: number, out: number, gate: number, up: number, intermediate: number, batch: number): void;
   dsv41Rope(ctx: number, out: number, input: number, positions: number, rows: number, dim: number, compressed: number, inverse: number, ratio: number, heads: number): void;
   dsv41SwiGlu(ctx: number, out: number, gate: number, up: number, count: number): void;
-  dsv41Route(ctx: number, ids: number, weights: number, logits: number, bias: number, tokens: number): void;
+  dsv41Route(ctx: number, ids: number, weights: number, logits: number, bias: number, tokens: number, experts: number): void;
   dsv41Collapse(ctx: number, out: number, hidden: number, pre: number, dim: number, tokens: number): void;
   dsv41CacheInsert(ctx: number, cache: number, input: number, positions: number, ratio: number, tokens: number, slots: number): void;
-  dsv41Embedding(ctx: number, out: number, weight: number, tokens: number, start: number, rows: number, count: number): void;
+  dsv41Embedding(ctx: number, out: number, weight: number, tokens: number, start: number, rows: number, count: number, hidden: number, streams: number): void;
   dsv41Hash(ctx: number, out: number, lookback: number, tokens: number, map: number, primes: number, offsets: number, count: number, qoIndptr: number, batchSize: number): void;
   dsv41IndexQuantize(ctx: number, out: number, input: number, positions: number, heads: number, ratio: number, tokens: number, slots: number): void;
   dsv41IndexScores(ctx: number, out: number, query: number, keys: number, weights: number, positions: number, capacity: number, ratio: number, tokens: number, pages: number, batchIndices: number, pageStride: number): void;
@@ -95,7 +95,7 @@ export interface NativeAddon {
   deinterleave(ctx: number, out: number, input: number, worldSize: number, maxTotalLen: number, pageIndptr: number, kvTokenIndptr: number, batchSize: number, pageSize: number, D: number): void;
   gatherPages(ctx: number, out: number, input: number, pageIndices: number, pageIndptr: number, lastPageLen: number, maxPages: number, batchSize: number, pageSize: number, D: number): void;
   arange(ctx: number, out: number, start: number, step: number, count: number): void;
-  max(ctx: number, outValues: number, outIndices: number, input: number, dim: number, batch: number, offset: number): void;
+  max(ctx: number, outValues: number, outIndices: number, input: number, dim: number, batch: number, offset: number, fp32?: boolean): void;
   memcpy(ctx: number, dst: number, src: number, bytes: number, kind: number): void;
   // Batched flat copies in a single submission on ctx's current stream.
   // Parallel arrays of equal length; pointers/sizes as float64, kinds as

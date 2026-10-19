@@ -725,8 +725,8 @@ export abstract class Tensor implements Disposable {
   protected validateMoeRoute(options: MoeRoutingOptions): void {
     if (options.scoring === "sqrt_softplus") {
       const bias = options.correctionBias;
-      if (this.type !== "F32" || this.shape.length !== 2 || this.shape[1] !== 384 || !bias || bias.type !== "F32"
-        || bias.shape.length !== 1 || bias.numElements !== 384 || options.numExpertsPerToken !== 6
+      if (this.type !== "F32" || this.shape.length !== 2 || ![128, 384].includes(this.shape[1]) || !bias || bias.type !== "F32"
+        || bias.shape.length !== 1 || bias.numElements !== this.shape[1] || options.numExpertsPerToken !== (this.shape[1] === 384 ? 6 : 3)
         || options.scalingFactor !== 1.5 || !options.normalize) throw new Error("moeRoute: unsupported sqrt-softplus geometry/options");
       return;
     }

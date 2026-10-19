@@ -31,6 +31,7 @@ import "./test_glm51";
 import "./test_glm53_flash";
 import "./test_deepseek_v41";
 import "./test_deepseek_v41_generation";
+import "./test_deepseek_v41_dspark";
 import "./test_deepseek_v41_chat";
 import "./test_csf_codec";
 import "./test_csf_checkpoint";

@@ -305,9 +305,11 @@ export class GlmTensor extends Tensor {
     if (this.type === "F8_E4M3") return this.quantizedEmbedding(ids, options.originalRows ?? this.shape[0], options.rowStart ?? 0);
     const hidden = this.shape[1];
     const seqLen = ids.numElements;
-    if (options.streams === 4) {
-      const out = ids.workspace.alloc([seqLen, 4, hidden], "BF16");
-      getNativeAddon().dsv41Embedding(this.ops.ctx, out.data, this.data, ids.data, options.rowStart ?? 0, this.shape[0], seqLen);
+    if (options.streams === 4 || options.rowStart !== undefined) {
+      if (this.type !== "BF16") throw new Error("Vocabulary-sharded embedding requires BF16");
+      const streams = options.streams ?? 1;
+      const out = ids.workspace.alloc(streams === 4 ? [seqLen, 4, hidden] : [seqLen, hidden], "BF16");
+      getNativeAddon().dsv41Embedding(this.ops.ctx, out.data, this.data, ids.data, options.rowStart ?? 0, this.shape[0], seqLen, hidden, streams);
       return out;
     }
     const out = ids.workspace.alloc([seqLen, hidden], this.type);
@@ -346,11 +348,12 @@ export class GlmTensor extends Tensor {
 
   max(offset: number = 0): { values: Tensor, indices: Tensor } {
     super.max(offset);
+    if (this.type !== "BF16" && this.type !== "F32") throw new Error("max requires BF16 or F32 input");
     const dim = this.shape[1];
     const batch = this.shape[0];
     const values = this.workspace.alloc([batch], this.type);
     const indices = this.workspace.alloc([batch], "I32");
-    getNativeAddon().max(this.ops.ctx, values.data, indices.data, this.data, dim, batch, offset);
+    getNativeAddon().max(this.ops.ctx, values.data, indices.data, this.data, dim, batch, offset, this.type === "F32");
     return { values, indices };
   }
 
@@ -358,8 +361,12 @@ export class GlmTensor extends Tensor {
     super.indexSelect(indices, offset);
     const batch = indices.numElements;
     const dim = this.shape[1];
+    const rowBytes = this.bytes / this.shape[0];
+    if (rowBytes % 2) throw new Error("indexSelect requires an even row byte width");
     const out = this.workspace.alloc([batch, dim], this.type);
-    getNativeAddon().indexSelect(this.ops.ctx, out.data, this.data, indices.data, dim, batch, offset);
+    // The native gather copies 16-bit words without arithmetic. F32/I32 rows
+    // therefore contain twice as many words as logical elements.
+    getNativeAddon().indexSelect(this.ops.ctx, out.data, this.data, indices.data, rowBytes / 2, batch, offset);
     return out;
   }
 
@@ -559,8 +566,8 @@ export class GlmTensor extends Tensor {
     const [rows, experts] = this.shape;
     if (options.scoring === "sqrt_softplus") {
       this.validateMoeRoute(options);
-      const indices = this.workspace.alloc([rows, 6], "I32"), weights = this.workspace.alloc([rows, 6], "F64");
-      getNativeAddon().dsv41Route(this.ops.ctx, indices.data, weights.data, this.data, options.correctionBias!.data, rows);
+      const indices = this.workspace.alloc([rows, options.numExpertsPerToken], "I32"), weights = this.workspace.alloc([rows, options.numExpertsPerToken], "F64");
+      getNativeAddon().dsv41Route(this.ops.ctx, indices.data, weights.data, this.data, options.correctionBias!.data, rows, experts);
       return { indices, normalizedWeightsStream: { result: weights, streamWaitEvent() {}, [Symbol.dispose]() {} } };
     }
     // Larger batches retain the default path's overlap with expert computation.
@@ -587,6 +594,11 @@ export class GlmTensor extends Tensor {
   }
 
   add(other: Tensor, n?: number): Tensor {
+    if (this.type === "F32") {
+      if (other.type !== "F32" || JSON.stringify(this.shape) !== JSON.stringify(other.shape)
+        || (n !== undefined && n !== this.numElements)) throw new Error("F32 add requires matching full tensor shapes");
+      return this.sum([other]);
+    }
     if (this.shape.length === 2 && other.shape.length === 1 && this.shape[1] === other.shape[0]) {
       const out = this.workspace.alloc(this.shape, this.type);
       getNativeAddon().addBroadcast(this.ops.ctx, out.data, this.data, other.data, this.shape[1], this.shape[0]);

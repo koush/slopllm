@@ -100,6 +100,8 @@ export interface TokenSelector {
   prepareVerification?(draft: MtpDraftBatch): void;
   /** Capture-safe preparation for drafts generated on-device in the same graph. */
   prepareVerificationFromDevice?(draftTokens: Tensor, batchSize: number): void;
+  /** A greedy draft is a point-mass proposal, including for sampled targets. */
+  prepareDeterministicVerification?(draftTokens: Tensor, batchSize: number): void;
   verify?(logits: Tensor): { tokens: Tensor; numAccepted: Tensor };
 }
 

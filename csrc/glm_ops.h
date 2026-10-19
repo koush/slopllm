@@ -313,6 +313,7 @@ void glm_index_select(GlmCtx* ctx, void* out, const void* src,
 void glm_arange(GlmCtx* ctx, int* out, int start, int step, int count);
 
 void glm_max(GlmCtx* ctx, void* out_values, int* out_indices, const void* input, int dim, int batch, int offset);
+void glm_max_f32(GlmCtx* ctx, void* out_values, int* out_indices, const void* input, int dim, int batch, int offset);
 
 void glm_memcpy(GlmCtx* ctx, void* dst, const void* src, size_t bytes, int kind);
 
@@ -871,10 +872,10 @@ void glm_dsv41_mhc_pre(GlmCtx* ctx, void* out, float* pre, float* post, float* c
 
 void glm_dsv41_rope(GlmCtx*, void*, const void*, const int32_t*, int, int, int, int, int, int);
 void glm_dsv41_swiglu(GlmCtx*, void*, const void*, const void*, int);
-void glm_dsv41_route(GlmCtx*, int32_t*, double*, const float*, const float*, int);
+void glm_dsv41_route(GlmCtx*, int32_t*, double*, const float*, const float*, int, int);
 void glm_dsv41_collapse(GlmCtx*, void*, const void*, const float*, int, int);
 void glm_dsv41_cache_insert(GlmCtx*, uint8_t*, const void*, const int32_t*, int, int, const int32_t*);
-void glm_dsv41_embedding(GlmCtx*, void*, const void*, const int32_t*, int, int, int);
+void glm_dsv41_embedding(GlmCtx*, void*, const void*, const int32_t*, int, int, int, int, int);
 void glm_dsv41_hash(GlmCtx*, int32_t*, const int32_t*, const int32_t*, const int32_t*, const int32_t*, const int32_t*, int, const int32_t*, int);
 void glm_dsv41_index_quantize(GlmCtx*, float*, const void*, const int32_t*, int, int, int, const int32_t*);
 void glm_dsv41_index_scores(GlmCtx*, float*, const float*, const float*, const void*, const int32_t*, int, int, int, const int32_t*, const int32_t*, int);

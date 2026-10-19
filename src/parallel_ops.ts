@@ -1327,12 +1327,13 @@ export class ParallelTensor extends Tensor {
   override embedding(ids: Tensor, options: EmbeddingOptions = {}): Tensor {
     super.embedding(ids, options);
     if (this.type === "F8_E4M3") return this.quantizedEmbedding(ids, options.originalRows ?? this.shape[0], options.rowStart ?? 0);
-    if (options.streams === 4) {
+    if (options.streams === 4 || this.parallelism === TensorParallelism.Column) {
       this.assertParallel("Embedding IDs", this.cast(ids), TensorParallelism.Replicated);
       this.assertParallel("Embedding weight", this, TensorParallelism.Column);
       const shards = this.shards.map((w, r) => w.embedding(this.cast(ids).shards[r],
         { ...options, rowStart: (options.rowStart ?? 0) + r * w.shape[0] }));
-      const out = this.parallelOps.wrapShards(ids.workspace, shards, [ids.numElements, 4, this.shape[1]], "BF16", TensorParallelism.PartialSum);
+      const shape = options.streams === 4 ? [ids.numElements, 4, this.shape[1]] : [ids.numElements, this.shape[1]];
+      const out = this.parallelOps.wrapShards(ids.workspace, shards, shape, "BF16", TensorParallelism.PartialSum);
       out.allReduce();
       return out;
     }

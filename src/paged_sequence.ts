@@ -71,6 +71,19 @@ export class Sequence {
     this.targetToken = undefined;
   }
 
+  /** Remove complete leading pages from a bounded sliding cache. Absolute RoPE
+   * positions are supplied separately by its caller. */
+  discardPrefixPages(count: number): void {
+    const pageSize = this.pagedKvCache.pageSize;
+    if (!Number.isInteger(count) || count < 0 || count > Math.floor(this.allocLen / pageSize)) {
+      throw new Error("discardPrefixPages: invalid full-page count");
+    }
+    for (const page of this.pages.splice(0, count)) {
+      if (!--page.refs) this.pagedKvCache.availablePages.unshift(page.id);
+    }
+    this.allocLen -= count * pageSize;
+  }
+
   private tokenAfter(length: number): number | undefined {
     const pageSize = this.pagedKvCache.pageSize;
     const token = this.pages[Math.floor(length / pageSize)]?.tokenIds[length % pageSize];

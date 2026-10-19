@@ -56,6 +56,18 @@ describe("GlmTensor.indexSelect (single GPU)", () => {
     }
   });
 
+  it("preserves F32 rows and sub-BF16 differences through gather and argmax", () => {
+    using input = ws.alloc([3, 5], "F32");
+    const values = Float32Array.from([0, 1, 1.001, -3, 0, 10, -2, 8, 9, 10.001, -5, -4, -3, -2, -1]);
+    input.h2d(Buffer.from(values.buffer));
+    using indices = ws.alloc([2], "I32"); indices.h2d(Buffer.from(Int32Array.of(1, 0).buffer));
+    using selected = input.indexSelect(indices);
+    const bytes = Buffer.alloc(selected.bytes); selected.d2h(bytes);
+    assert.deepEqual(bytes, Buffer.concat([Buffer.from(values.buffer, 5 * 4, 5 * 4), Buffer.from(values.buffer, 0, 5 * 4)]));
+    using maximum = selected.argmax();
+    assert.deepEqual(maximum.readInt32LEArray(), [4, 2]);
+  });
+
   it("selects a single row (k=1)", () => {
     const rows = 6;
     const dim = 4;
