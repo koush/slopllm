@@ -11,6 +11,8 @@ def torch_rmsnorm(x, weight, eps):
 
 @pytest.mark.parametrize("batch,dim", [
     (1, 64), (4, 128), (2, 6144), (8, 512),
+    (64, 512), (65, 512), (64, 1280), (65, 1280),
+    (64, 65536), (65, 65536),
     (63, 6144), (64, 6144), (256, 6144),
 ])
 def test_rmsnorm_random(glm, device, batch, dim):
@@ -21,7 +23,10 @@ def test_rmsnorm_random(glm, device, batch, dim):
 
     glm.rmsnorm(out, x, w, eps, dim, batch)
     ref = torch_rmsnorm(x, w, eps)
-    torch.testing.assert_close(out.cpu(), ref.cpu(), atol=5e-3, rtol=5e-3)
+    # Wide reductions can straddle a BF16 rounding boundary: allow one BF16
+    # relative step for the stride-fallback boundary cases.
+    rtol = 8e-3 if dim == 65536 else 5e-3
+    torch.testing.assert_close(out.cpu(), ref.cpu(), atol=5e-3, rtol=rtol)
 
 
 def test_rmsnorm_ones_weight(glm, device):

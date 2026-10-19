@@ -19,16 +19,15 @@ namespace cg = cooperative_groups;
 // may launch as soon as its stream predecessor fires
 // cudaTriggerProgrammaticLaunchCompletion() instead of waiting for full grid
 // completion. Correctness requires the kernel to call
-// cudaGridDependencySynchronize() before consuming predecessor data. Kernels
-// launched this way after a non-PDL predecessor serialize normally (implicit
-// trigger at predecessor completion), so the attribute is always safe to set.
+// cudaGridDependencySynchronize() before consuming predecessor data.
+// Keep early-resident work bounded to avoid occupying resources needed by peers.
 template <typename... ExpTypes, typename... ActTypes>
 static inline void launch_pdl(void (*kernel)(ExpTypes...), int grid, int block,
                               size_t smem, cudaStream_t stream, ActTypes&&... args) {
     cudaLaunchConfig_t cfg = {};
     cudaLaunchAttribute attr;
     attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attr.val.programmaticStreamSerializationAllowed = 1;
+    attr.val.programmaticStreamSerializationAllowed = grid <= GLM_PDL_MAX_BLOCKS;
     cfg.gridDim = dim3((unsigned)grid);
     cfg.blockDim = dim3((unsigned)block);
     cfg.dynamicSmemBytes = smem;
@@ -215,10 +214,11 @@ __global__ void __launch_bounds__(MaxThreads) rmsnorm_kernel(
     float eps,
     int dim
 ) {
-    // Let downstream PDL consumers prepare early, but wait for the upstream
-    // producer (including gather barriers) before reading the input.
-    cudaTriggerProgrammaticLaunchCompletion();
-    cudaGridDependencySynchronize();
+    // Large prefill grids must not occupy resources while waiting on peer barriers.
+    if (gridDim.x <= GLM_PDL_MAX_BLOCKS) {
+        cudaTriggerProgrammaticLaunchCompletion();
+        cudaGridDependencySynchronize();
+    }
     int row = blockIdx.x;
     const __nv_bfloat16* x = input + row * dim;
     __nv_bfloat16* o = out + row * dim;
@@ -271,9 +271,10 @@ __global__ void __launch_bounds__(1024, 1) rmsnorm_kernel_stride(
     float eps,
     int dim
 ) {
-    // Preserve the same PDL chain for the large-dimension fallback.
-    cudaTriggerProgrammaticLaunchCompletion();
-    cudaGridDependencySynchronize();
+    if (gridDim.x <= GLM_PDL_MAX_BLOCKS) {
+        cudaTriggerProgrammaticLaunchCompletion();
+        cudaGridDependencySynchronize();
+    }
     int row = blockIdx.x;
     const __nv_bfloat16* x = input + row * dim;
     __nv_bfloat16* o = out + row * dim;
@@ -367,8 +368,10 @@ __global__ void __launch_bounds__(MaxThreads) fused_add_rmsnorm_kernel(
     // PDL: release our stream dependent (e.g. the cuBLAS linear that follows)
     // immediately, then wait for the upstream grid (the p2p barrier that
     // guards peers' all-reduce writes to input_b) before touching any input.
-    cudaTriggerProgrammaticLaunchCompletion();
-    cudaGridDependencySynchronize();
+    if (gridDim.x <= GLM_PDL_MAX_BLOCKS) {
+        cudaTriggerProgrammaticLaunchCompletion();
+        cudaGridDependencySynchronize();
+    }
     int row = blockIdx.x;
     const __nv_bfloat16* a = input_a + row * dim;
     const __nv_bfloat16* b = input_b + row * dim;
@@ -434,8 +437,10 @@ __global__ void __launch_bounds__(1024, 1) fused_add_rmsnorm_kernel_stride(
     float eps, int dim
 ) {
     // PDL: see fused_add_rmsnorm_kernel.
-    cudaTriggerProgrammaticLaunchCompletion();
-    cudaGridDependencySynchronize();
+    if (gridDim.x <= GLM_PDL_MAX_BLOCKS) {
+        cudaTriggerProgrammaticLaunchCompletion();
+        cudaGridDependencySynchronize();
+    }
     int row = blockIdx.x;
     const __nv_bfloat16* a = input_a + row * dim;
     const __nv_bfloat16* b = input_b + row * dim;

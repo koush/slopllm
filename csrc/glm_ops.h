@@ -12,6 +12,8 @@ extern "C" {
 #endif
 
 #define GLM_MAX_STREAMS 64
+// Bound early-resident grids so they leave resources for peer progress.
+#define GLM_PDL_MAX_BLOCKS 64
 
 struct GlmCtx {
     int device_id;

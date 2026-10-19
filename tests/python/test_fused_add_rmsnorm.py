@@ -17,6 +17,8 @@ def torch_add_rmsnorm(input_a, input_b, weight, eps):
 
 @pytest.mark.parametrize("batch,dim", [
     (1, 64), (4, 128), (2, 1024), (8, 512), (1, 6144),
+    (64, 512), (65, 512), (64, 1280), (65, 1280),
+    (64, 65536), (65, 65536),
     (63, 6144), (64, 6144), (256, 6144),
 ])
 def test_fused_add_rmsnorm_random(glm, device, batch, dim):

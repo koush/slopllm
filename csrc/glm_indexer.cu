@@ -1384,9 +1384,11 @@ __global__ void score_kernel(
     const uint8_t* __restrict__ q8Data, int q8Stride,
     const float* __restrict__ effectiveWeights, int weightStride,
     const float* __restrict__ kScaleData) {
-    cudaTriggerProgrammaticLaunchCompletion();
-    // Q and effective weights may still be completing their P2P gather barrier.
-    cudaGridDependencySynchronize();
+    if (uint64_t(gridDim.x) * gridDim.y <= GLM_PDL_MAX_BLOCKS) {
+        cudaTriggerProgrammaticLaunchCompletion();
+        // Q and effective weights may still be completing their P2P gather barrier.
+        cudaGridDependencySynchronize();
+    }
 
     const int qi = blockIdx.y;
     const int globalQuery = qi + qGlobalStart;
@@ -1704,7 +1706,8 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
         }
         cudaLaunchAttribute attr{};
         attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attr.val.programmaticStreamSerializationAllowed = 1;
+        attr.val.programmaticStreamSerializationAllowed =
+            uint64_t(num_splits) * totalQ <= GLM_PDL_MAX_BLOCKS;
         cudaLaunchConfig_t config{};
         config.gridDim = grid;
         config.blockDim = dim3(block);

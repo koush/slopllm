@@ -747,6 +747,9 @@ export class ParallelTensor extends Tensor {
 
   dsv41MhcPre(fn: Tensor, base: Tensor, scale: Tensor, previousPre?: Tensor, normEps = 1e-20, hcEps = 1e-6, iters = 20, normWeight?: Tensor,
     postMix?: { block: Tensor; post: Tensor; comb: Tensor }): { input: Tensor; pre: Tensor; post: Tensor; comb: Tensor; residual?: Tensor } {
+    if (this.parallelism === TensorParallelism.PartialSum) {
+      this.allReduce();
+    }
     // Match mhcPost's collective and BF16 rounding boundary before local fusion.
     if (postMix) {
       const block = this.cast(postMix.block);
@@ -779,12 +782,10 @@ export class ParallelTensor extends Tensor {
     const scales = this.quantizationScales();
     if (this.parallelism !== TensorParallelism.Column || scales.parallelism !== TensorParallelism.Column
       || ids.parallelism !== TensorParallelism.Replicated || originalRows > this.shape[0]) {
-      throw new Error("Engram lookup requires column-sharded tables and replicated IDs/output");
+      throw new Error("Engram lookup requires column-sharded tables and replicated IDs");
     }
     const shards = this.shards.map((t, r) => t.embedding(this.cast(ids).shards[r], { originalRows, rowStart: rowStart + r * t.shape[0] }));
-    const out = this.parallelOps.wrapShards(ids.workspace, shards, [ids.shape[0], (ids.shape[1] ?? 1) * 256], "BF16", TensorParallelism.PartialSum);
-    out.allReduce();
-    return out;
+    return this.parallelOps.wrapShards(ids.workspace, shards, [ids.shape[0], (ids.shape[1] ?? 1) * 256], "BF16", TensorParallelism.PartialSum);
   }
 
   dsv41EngramGate(kv: Tensor, qw: Tensor, kw: Tensor, eps = 1e-20): Tensor {
@@ -1347,9 +1348,7 @@ export class ParallelTensor extends Tensor {
       const shards = this.shards.map((w, r) => w.embedding(this.cast(ids).shards[r],
         { ...options, rowStart: (options.rowStart ?? 0) + r * w.shape[0] }));
       const shape = options.streams === 4 ? [ids.numElements, 4, this.shape[1]] : [ids.numElements, this.shape[1]];
-      const out = this.parallelOps.wrapShards(ids.workspace, shards, shape, "BF16", TensorParallelism.PartialSum);
-      out.allReduce();
-      return out;
+      return this.parallelOps.wrapShards(ids.workspace, shards, shape, "BF16", TensorParallelism.PartialSum);
     }
     const pIds = ids as ParallelTensor;
     this.assertParallel("embedding ids", pIds, TensorParallelism.Replicated, TensorParallelism.PartialSum);

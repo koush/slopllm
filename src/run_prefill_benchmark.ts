@@ -91,8 +91,9 @@ async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const args = parseArgs(argv);
   const modelArgs = parseModelArgs(argv);
-  if (resolveModelSelection(modelArgs).modelType !== "glm_moe_dsa") {
-    throw new Error("Prefill benchmark requires a glm_moe_dsa checkpoint");
+  const { modelType } = resolveModelSelection(modelArgs);
+  if (modelType !== "glm_moe_dsa" && modelType !== "deepseek_v41") {
+    throw new Error("Prefill benchmark requires a glm_moe_dsa or deepseek_v41 checkpoint");
   }
 
   const runtime = await loadModelRuntime(modelArgs);
@@ -105,7 +106,7 @@ async function main(): Promise<void> {
     using ws = new ExecutionWorkspace(ops, 1, Math.min(args.chunkSize, args.seqLen));
     const inputIds = new Array<number>(args.seqLen).fill(1);
 
-    console.log(`GLM-5.1 Prefill | GPUs ${modelArgs.gpus.join(",")} | seq_len=${args.seqLen} | chunk_size=${args.chunkSize} | cp=${modelArgs.cp} | mtp=${modelArgs.mtp} | phased=${process.env.SLOPLLM_PHASED_PREFILL !== "0"}`);
+    console.log(`${modelType} Prefill | GPUs ${modelArgs.gpus.join(",")} | seq_len=${args.seqLen} | chunk_size=${args.chunkSize} | cp=${modelArgs.cp} | mtp=${modelArgs.mtp} | phased=${modelType === "glm_moe_dsa" && process.env.SLOPLLM_PHASED_PREFILL !== "0"}`);
     console.log(`max_pages=${maxPages} | warmup=${args.warmupRuns} | runs=${args.benchRuns}`);
 
     for (let run = 0; run < args.warmupRuns + args.benchRuns; run++) {

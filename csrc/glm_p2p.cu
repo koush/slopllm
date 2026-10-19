@@ -565,10 +565,12 @@ p2p_reduce_scatter_write_kernel(
     void* __restrict__ out4,  void* __restrict__ out5,
     void* __restrict__ out6,  void* __restrict__ out7,
     int chunk_bytes,
-    int rank)
+    int rank, bool use_pdl)
 {
-    cudaTriggerProgrammaticLaunchCompletion();
-    cudaGridDependencySynchronize();
+    if (use_pdl) {
+        cudaTriggerProgrammaticLaunchCompletion();
+        cudaGridDependencySynchronize();
+    }
 
     constexpr int VEC = 16;  // int4
     void* dsts[AG_SMEM_MAX_N] = {
@@ -631,11 +633,13 @@ p2p_reduce_gather_write_kernel(
     scalar_t* __restrict__ out4,  scalar_t* __restrict__ out5,
     scalar_t* __restrict__ out6,  scalar_t* __restrict__ out7,
     int chunk_len,
-    int rank)
+    int rank, bool use_pdl)
 {
-    cudaTriggerProgrammaticLaunchCompletion();
-    // In particular, wait for the preceding peer barrier before reading staging.
-    cudaGridDependencySynchronize();
+    if (use_pdl) {
+        cudaTriggerProgrammaticLaunchCompletion();
+        // In particular, wait for the preceding peer barrier before reading staging.
+        cudaGridDependencySynchronize();
+    }
 
     scalar_t* dsts[AG_SMEM_MAX_N] = {
         out0, out1, out2, out3, out4, out5, out6, out7,
@@ -872,7 +876,7 @@ void glm_p2p_allgather_row_write(GlmCtx* ctx,
     do { \
         cudaLaunchKernelEx(&config, p2p_reduce_scatter_write_kernel<N>, \
             local_shard, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], \
-            chunk_bytes, rank); \
+            chunk_bytes, rank, use_pdl); \
     } while(0)
 
 void glm_p2p_reduce_scatter_write(GlmCtx* ctx,
@@ -890,9 +894,10 @@ void glm_p2p_reduce_scatter_write(GlmCtx* ctx,
     if (grid > 512) grid = 512;
     if (grid < 1) grid = 1;
 
+    const bool use_pdl = grid <= GLM_PDL_MAX_BLOCKS;
     cudaLaunchAttribute attr{};
     attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attr.val.programmaticStreamSerializationAllowed = 1;
+    attr.val.programmaticStreamSerializationAllowed = use_pdl;
     cudaLaunchConfig_t config{};
     config.gridDim = dim3(grid);
     config.blockDim = dim3(RS_WRITE_THREADS);
@@ -917,7 +922,7 @@ void glm_p2p_reduce_scatter_write(GlmCtx* ctx,
             (const SCT*)staging, \
             (SCT*)p[0], (SCT*)p[1], (SCT*)p[2], (SCT*)p[3], \
             (SCT*)p[4], (SCT*)p[5], (SCT*)p[6], (SCT*)p[7], \
-            chunk_len, rank); \
+            chunk_len, rank, use_pdl); \
     } while(0)
 
 void glm_p2p_reduce_gather_write(GlmCtx* ctx,
@@ -939,9 +944,10 @@ void glm_p2p_reduce_gather_write(GlmCtx* ctx,
         grid = 1;
     }
 
+    const bool use_pdl = grid <= GLM_PDL_MAX_BLOCKS;
     cudaLaunchAttribute attr{};
     attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attr.val.programmaticStreamSerializationAllowed = 1;
+    attr.val.programmaticStreamSerializationAllowed = use_pdl;
     cudaLaunchConfig_t config{};
     config.gridDim = dim3(grid);
     config.blockDim = dim3(RS_WRITE_THREADS);

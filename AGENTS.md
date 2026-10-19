@@ -147,6 +147,20 @@ using tensorB = stream.result;
 
 ## Tensor Parallelism
 
+### Programmatic dependent launch (PDL)
+
+Project-owned PDL consumers are limited to at most 64 launched blocks by
+`GLM_PDL_MAX_BLOCKS` in `csrc/glm_ops.h`. Ordinary and fused-add RMSNorm use one
+block per row; CP local merge and the FP8 direct indexer check their
+head/split-expanded grid. P2P reduce-scatter and reduce-gather writes check
+their actual capped launch grids, without passing row counts from TypeScript.
+Both launch eligibility and device-side trigger/wait calls use the same limit.
+Larger grids use ordinary stream ordering to avoid
+early-resident kernels occupying resources needed for peer progress.
+
+The single-block P2P barrier remains PDL-enabled, with its early-release
+trigger at kernel entry.
+
 Weight parallelism is assigned per-tensor during loading.
 
 Linear op parallelism rules (weight × input → output):
