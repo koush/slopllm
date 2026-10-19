@@ -132,13 +132,15 @@ export function writeDsv4Cache(page: Buffer, slot: number, values: Float32Array)
 }
 
 export function dsv41Route(logits: Float32Array, bias: Float32Array): { expert: number; weight: number }[] {
-  if (logits.length !== 384 || bias.length !== 384) throw new Error("Expected 384 router logits/biases");
-  const scores = Float32Array.from(logits, x => Math.sqrt(Math.max(x, 0) + Math.log1p(Math.exp(-Math.abs(x)))));
-  const indices = Array.from({ length: 384 }, (_, i) => i);
-  indices.sort((a, b) => (scores[b] + bias[b]) - (scores[a] + bias[a]) || a - b);
-  const chosen = indices.slice(0, 6);
-  const sum = chosen.reduce((s, i) => s + scores[i], 0);
-  return chosen.map(expert => ({ expert, weight: 1.5 * scores[expert] / (sum > 0 ? sum : 1) }));
+  if (![128, 384].includes(logits.length) || bias.length !== logits.length) throw new Error("Expected 128 or 384 router logits/biases");
+  const f = Math.fround;
+  const scores = Float32Array.from(logits, x => Math.sqrt(f(Math.max(x, 0) + f(Math.log1p(f(Math.exp(-Math.abs(x))))))));
+  const indices = Array.from({ length: logits.length }, (_, i) => i);
+  indices.sort((a, b) => f(scores[b] + bias[b]) - f(scores[a] + bias[a]) || a - b);
+  const chosen = indices.slice(0, logits.length === 384 ? 6 : 3);
+  // FP32 reduction order can differ between block and warp implementations.
+  const sum = chosen.reduce((s, i) => f(s + scores[i]), 0);
+  return chosen.map(expert => ({ expert, weight: f(scores[expert] * f(1.5 / (sum > 0 ? sum : 1))) }));
 }
 
 export function dsv41SwiGlu(gate: Float32Array, up: Float32Array): Float32Array {

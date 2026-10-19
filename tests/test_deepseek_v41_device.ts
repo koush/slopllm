@@ -19,10 +19,11 @@ it("V4.1 routing, clipped activation, rotary and paged cache packing match the h
     using stream = route.normalizedWeightsStream;
     stream.streamWaitEvent();
     using ids = route.indices, weights = stream.result;
-    const expected = dsv41Route(input, b), bytes = Buffer.alloc(48);
+    const expected = dsv41Route(input, b), bytes = Buffer.alloc(weights.bytes);
     weights.d2h(bytes);
     assert.deepEqual(ids.readInt32LEArray(), expected.map(e => e.expert));
-    expected.forEach((e, i) => assert.ok(Math.abs(bytes.readDoubleLE(i * 8) - e.weight) < 1e-14));
+    assert.equal(weights.type, "F32");
+    expected.forEach((e, i) => assert.ok(Math.abs(bytes.readFloatLE(i * 4) - e.weight) < 2e-7));
   }
   const values = bf16BytesToF32(bf16Round(Float32Array.from({ length: 1024 }, (_, i) => Math.sin(i) * 15)));
   using input = ws.alloc([2, 512], "BF16"), position = ws.alloc([1], "I32");
@@ -50,6 +51,44 @@ it("V4.1 routing, clipped activation, rotary and paged cache packing match the h
   assert.deepEqual(actual, expected);
 });
 
+it("V4.1 FP32 routing preserves ties, unbiased weights and changing captured inputs", () => {
+  using ops = new GlmOps(0);
+  for (const experts of [128, 384]) for (const rows of [1, 5, 513, 1025, 2049, 8192]) {
+    using ws = new WorkspaceBase(ops);
+    using manager = new CaptureManager(ops);
+    using logits = ws.alloc([rows, experts], "F32"), bias = ws.alloc([experts], "F32");
+    const topK = experts === 384 ? 6 : 3;
+    for (let pass = 0; pass < 6; pass++) {
+      // The first bias vector distinguishes FP32 ties from FP64 ranking:
+      // all additions to sqrt(softplus(0)) round to the same FP32 score.
+      const correction = Float32Array.from({ length: experts }, (_, i) => pass === 0 ? i * 1e-12 : (i % 7 - 3) * .125);
+      bias.h2d(Buffer.from(correction.buffer));
+      const values = Float32Array.from({ length: rows * experts }, (_, i) => {
+        // Equal scores, complete underflow, extreme positive inputs, and
+        // ordinary logits, with different rows winning on graph replay.
+        const row = Math.floor(i / experts), mode = (row + pass) % 4;
+        return mode === 0 ? 0 : mode === 1 ? -1000 : mode === 2 ? 1000 + (i % experts) : Math.sin(i * .37 + pass) * 13;
+      });
+      logits.h2d(Buffer.from(values.buffer));
+      const output = manager.run({ logits, bias }, (_capture, input) => {
+        const route = input.logits.moeRoute({ scoring: "sqrt_softplus", correctionBias: input.bias,
+          numExpertsPerToken: topK, scalingFactor: 1.5, normalize: true });
+        using stream = route.normalizedWeightsStream; stream.streamWaitEvent();
+        return { ids: route.indices, weights: stream.result };
+      }, ["route"]) as { ids: Tensor; weights: Tensor };
+      using ids = output.ids; using weights = output.weights;
+      assert.equal(weights.type, "F32");
+      const selected = ids.readInt32LEArray(), bytes = Buffer.alloc(weights.bytes); weights.d2h(bytes);
+      for (let row = 0; row < rows; row++) {
+        const expected = dsv41Route(values.subarray(row * experts, (row + 1) * experts), correction);
+        assert.deepEqual(selected.slice(row * topK, (row + 1) * topK), expected.map(e => e.expert));
+        expected.forEach((e, k) => assert(Math.abs(bytes.readFloatLE((row * topK + k) * 4) - e.weight) < 2e-7));
+      }
+    }
+    assert([...manager.captured.values()].some(graph => graph.graphExec));
+  }
+});
+
 it("V4.1 batched primitives preserve token offsets and causal paged visibility", () => {
   using ops = new GlmOps(0);
   using ws = new WorkspaceBase(ops);
@@ -67,7 +106,7 @@ it("V4.1 batched primitives preserve token offsets and causal paged visibility",
   for (let token = 0; token < tokens; token++) {
     const expected = dsv41Route(logitValues.subarray(token * 384, (token + 1) * 384), biasValues);
     assert.deepEqual(selected.slice(token * 6, token * 6 + 6), expected.map(e => e.expert));
-    expected.forEach((e, slot) => assert.ok(Math.abs(weightBytes.readDoubleLE((token * 6 + slot) * 8) - e.weight) < 1e-14));
+    expected.forEach((e, slot) => assert.ok(Math.abs(weightBytes.readFloatLE((token * 6 + slot) * 4) - e.weight) < 2e-7));
   }
   for (const [start, length] of [[0, 5], [125, 131], [256, 3]]) {
     const row = (position: number) => bf16BytesToF32(bf16Round(Float32Array.from({ length: 512 }, (_, d) => Math.sin(position * 0.3 + d * 0.1))));

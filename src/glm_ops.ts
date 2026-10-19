@@ -566,7 +566,7 @@ export class GlmTensor extends Tensor {
     const [rows, experts] = this.shape;
     if (options.scoring === "sqrt_softplus") {
       this.validateMoeRoute(options);
-      const indices = this.workspace.alloc([rows, options.numExpertsPerToken], "I32"), weights = this.workspace.alloc([rows, options.numExpertsPerToken], "F64");
+      const indices = this.workspace.alloc([rows, options.numExpertsPerToken], "I32"), weights = this.workspace.alloc([rows, options.numExpertsPerToken], "F32");
       getNativeAddon().dsv41Route(this.ops.ctx, indices.data, weights.data, this.data, options.correctionBias!.data, rows, experts);
       return { indices, normalizedWeightsStream: { result: weights, streamWaitEvent() {}, [Symbol.dispose]() {} } };
     }

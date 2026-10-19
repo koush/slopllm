@@ -132,7 +132,13 @@ then completes the combined output before its final BF16 conversion. This uses
 3.5x fewer MoE output payload bytes than separately reducing six BF16 routed
 outputs and one BF16 shared output. Generic replicated shared inputs are included
 on rank zero only, avoiding multiplication by the TP world size.
-Routing uses parallel argmax reductions with lower-ID tie breaks. Index scoring
+Routing uses FP32 sqrt-softplus scores, biased comparisons, normalization and
+output weights, with lower-ID tie breaks. Bias affects selection only. Small
+batches evaluate scores across a block before warp-local top-k; large batches
+process four independent rows per block with register-resident scores. Target
+routing uses 384 score threads through 512 tokens, 128 threads through 1,024,
+then four rows per block. Draft routing uses 128 score threads through 2,048
+tokens, then four rows per block. Index scoring
 uses FP8 Tensor Core dot products with FP32 accumulation and weighted per-head
 ReLU, followed by BF16 score rounding before candidate selection and top-k.
 Small workloads use one query per CTA; larger workloads reuse a 64-key tile

@@ -48,50 +48,70 @@ __global__ void swiglu_device(__nv_bfloat16* out, const __nv_bfloat16* gate,
     out[i] = __float2bfloat16(float(g / (1. + exp(-g)) * fmin(10., fmax(-10., double(float(up[i]))))));
 }
 
-template<int Experts, int TopK>
-__global__ void route_device(int32_t* ids, double* weights, const float* logits, const float* bias) {
-    ids += blockIdx.x * TopK;
-    weights += blockIdx.x * TopK;
-    logits += blockIdx.x * Experts;
-    // One expert per thread; parallel argmax preserves the original F64 biased
-    // comparison and lower-expert-ID tie break. Only the six selected scores
-    // are accumulated serially, in selection order.
-    __shared__ float scores[Experts];
-    __shared__ double warp_value[16], total;
-    __shared__ int warp_id[16], selected;
-    const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
-    if (threadIdx.x < Experts) {
-        const double x = logits[threadIdx.x];
-        scores[threadIdx.x] = float(sqrt(fmax(x, 0.) + log1p(exp(-fabs(x)))));
-    }
-    __syncthreads();
-    double candidate = tid < Experts ? double(scores[tid]) + bias[tid] : -INFINITY;
-    int candidate_id = tid < Experts ? tid : Experts;
-    if (tid == 0) total = 0.;
-    for (int j = 0; j < TopK; j++) {
-        double value = candidate;
-        int best = candidate_id;
-        for (int d = 16; d; d /= 2) {
-            const double v = __shfl_down_sync(0xffffffff, value, d);
-            const int e = __shfl_down_sync(0xffffffff, best, d);
-            if (lane + d < 32 && (v > value || (v == value && e < best))) { value = v; best = e; }
+// GLM-style register-resident scores and warp-local top-k. Each warp owns
+// one token in the throughput path. For small batches, ComputeThreads spreads
+// sqrt-softplus across a block before handing selection to its first warp.
+// Scores, biased comparisons, normalization and output weights remain FP32.
+template<int Experts, int TopK, int Warps, int ComputeThreads = 0>
+__global__ void route_warp_device(int32_t* ids, float* weights, const float* logits,
+                                  const float* bias, int tokens) {
+    const int row = ComputeThreads ? blockIdx.x : blockIdx.x * Warps + threadIdx.x / 32;
+    if (row >= tokens) return;
+    __shared__ float transformed[ComputeThreads ? Experts : 1];
+    if constexpr (ComputeThreads > 0) {
+        for (int e = threadIdx.x; e < Experts; e += ComputeThreads) {
+            const float x = logits[size_t(row) * Experts + e];
+            transformed[e] = sqrtf(fmaxf(x, 0.f) + log1pf(expf(-fabsf(x))));
         }
-        if (lane == 0) { warp_value[warp] = value; warp_id[warp] = best; }
         __syncthreads();
-        if (warp == 0) {
-            value = lane < 16 ? warp_value[lane] : -INFINITY;
-            best = lane < 16 ? warp_id[lane] : Experts;
-            for (int d = 16; d; d /= 2) {
-                const double v = __shfl_down_sync(0xffffffff, value, d);
-                const int e = __shfl_down_sync(0xffffffff, best, d);
-                if (lane + d < 32 && (v > value || (v == value && e < best))) { value = v; best = e; }
+        if (threadIdx.x >= 32) return;
+    }
+    const int lane = threadIdx.x % 32;
+    float scores[Experts / 32], original[Experts / 32];
+    #pragma unroll
+    for (int j = 0; j < Experts / 32; j++) {
+        const int expert = lane + j * 32;
+        if constexpr (ComputeThreads > 0) original[j] = transformed[expert];
+        else {
+            const float x = logits[size_t(row) * Experts + expert];
+            original[j] = sqrtf(fmaxf(x, 0.f) + log1pf(expf(-fabsf(x))));
+        }
+        scores[j] = original[j] + bias[expert];
+    }
+    float selected = 0.f;
+    #pragma unroll
+    for (int k = 0; k < TopK; k++) {
+        float best = -INFINITY;
+        int index = Experts;
+        #pragma unroll
+        for (int j = 0; j < Experts / 32; j++) {
+            const int candidate = lane + j * 32;
+            if (scores[j] > best || (scores[j] == best && candidate < index)) {
+                best = scores[j]; index = candidate;
             }
-            if (lane == 0) { selected = best; ids[j] = best; total += scores[best]; }
         }
-        __syncthreads();
-        if (tid == selected) { candidate = -INFINITY; candidate_id = Experts; }
+        #pragma unroll
+        for (int delta = 16; delta > 0; delta /= 2) {
+            const float other = __shfl_down_sync(0xffffffff, best, delta);
+            const int other_id = __shfl_down_sync(0xffffffff, index, delta);
+            if (other > best || (other == best && other_id < index)) {
+                best = other; index = other_id;
+            }
+        }
+        const int winner = __shfl_sync(0xffffffff, index, 0);
+        float value = 0.f;
+        #pragma unroll
+        for (int j = 0; j < Experts / 32; j++) {
+            if (lane + j * 32 == winner) { value = original[j]; scores[j] = -INFINITY; }
+        }
+        value = __shfl_sync(0xffffffff, value, winner % 32);
+        if (lane == k) { ids[size_t(row) * TopK + k] = winner; selected = value; }
     }
-    if (tid < TopK) weights[tid] = 1.5 * scores[ids[tid]] / (total > 0. ? total : 1.);
+    float sum = selected;
+    #pragma unroll
+    for (int delta = 16; delta > 0; delta /= 2) sum += __shfl_down_sync(0xffffffff, sum, delta);
+    sum = __shfl_sync(0xffffffff, sum, 0);
+    if (lane < TopK) weights[size_t(row) * TopK + lane] = selected * (1.5f / (sum > 0.f ? sum : 1.f));
 }
 
 __global__ void collapse_device(__nv_bfloat16* out, const __nv_bfloat16* hidden,
@@ -364,10 +384,18 @@ void glm_dsv41_swiglu(GlmCtx* ctx, void* out, const void* gate, const void* up, 
     cudaSetDevice(ctx->device_id);
     swiglu_device<<<(count+255)/256,256,0,GLM_STREAM(ctx)>>>((__nv_bfloat16*)out,(const __nv_bfloat16*)gate,(const __nv_bfloat16*)up,count);
 }
-void glm_dsv41_route(GlmCtx* ctx, int32_t* ids, double* weights, const float* logits, const float* bias, int tokens, int experts) {
+void glm_dsv41_route(GlmCtx* ctx, int32_t* ids, float* weights, const float* logits, const float* bias, int tokens, int experts) {
     cudaSetDevice(ctx->device_id);
-    if (experts == 128) route_device<128, 3><<<tokens,512,0,GLM_STREAM(ctx)>>>(ids,weights,logits,bias);
-    else route_device<384, 6><<<tokens,512,0,GLM_STREAM(ctx)>>>(ids,weights,logits,bias);
+    // Small batches favor parallel score evaluation; large batches favor four
+    // register-resident rows per CTA. Both paths use the same warp reduction.
+    if (experts == 128) {
+        if (tokens <= 2048) route_warp_device<128, 3, 1, 128><<<tokens,128,0,GLM_STREAM(ctx)>>>(ids,weights,logits,bias,tokens);
+        else route_warp_device<128, 3, 4><<<(tokens+3)/4,128,0,GLM_STREAM(ctx)>>>(ids,weights,logits,bias,tokens);
+    } else {
+        if (tokens <= 512) route_warp_device<384, 6, 1, 384><<<tokens,384,0,GLM_STREAM(ctx)>>>(ids,weights,logits,bias,tokens);
+        else if (tokens <= 1024) route_warp_device<384, 6, 1, 128><<<tokens,128,0,GLM_STREAM(ctx)>>>(ids,weights,logits,bias,tokens);
+        else route_warp_device<384, 6, 4><<<(tokens+3)/4,128,0,GLM_STREAM(ctx)>>>(ids,weights,logits,bias,tokens);
+    }
 }
 void glm_dsv41_collapse(GlmCtx* ctx, void* out, const void* hidden, const float* pre, int dim, int tokens) {
     cudaSetDevice(ctx->device_id);

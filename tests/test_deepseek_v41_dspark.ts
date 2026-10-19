@@ -11,6 +11,7 @@ import type { DeepseekV41Config } from "../src/deepseek_v41_model";
 import { PagedKVCache } from "../src/paged_kv";
 import { WorkspaceBase } from "../src/workspace";
 import { SamplingWorkspace } from "../src/sampling";
+import { dsv41Route } from "./deepseek_v41_oracles";
 
 it("DSpark top-3 routing matches independent sqrt-softplus selection and weights", {
   skip: process.env.SLOPLLM_TEST_DSV41_RESIDENT === "1",
@@ -24,11 +25,10 @@ it("DSpark top-3 routing matches independent sqrt-softplus selection and weights
   using ids = routing.indices; using stream = routing.normalizedWeightsStream; stream.streamWaitEvent(); using weights = stream.result;
   const selected = ids.readInt32LEArray(), bytes = Buffer.alloc(weights.bytes); weights.d2h(bytes);
   for (let b = 0; b < 2; b++) {
-    const scores = Array.from(values.slice(b * 128, (b + 1) * 128), x => Math.fround(Math.sqrt(Math.max(x, 0) + Math.log1p(Math.exp(-Math.abs(x))))));
-    const expected = Array.from({ length: 128 }, (_, i) => i).sort((a, b) => (scores[b] + correction[b]) - (scores[a] + correction[a]) || a - b).slice(0, 3);
-    assert.deepEqual(selected.slice(b * 3, b * 3 + 3), expected);
-    const total = expected.reduce((sum, i) => sum + scores[i], 0);
-    expected.forEach((id, d) => assert(Math.abs(bytes.readDoubleLE((b * 3 + d) * 8) - 1.5 * scores[id] / total) < 1e-12));
+    const expected = dsv41Route(values.subarray(b * 128, (b + 1) * 128), correction);
+    assert.deepEqual(selected.slice(b * 3, b * 3 + 3), expected.map(e => e.expert));
+    assert.equal(weights.type, "F32");
+    expected.forEach((e, d) => assert(Math.abs(bytes.readFloatLE((b * 3 + d) * 4) - e.weight) < 2e-7));
   }
 });
 

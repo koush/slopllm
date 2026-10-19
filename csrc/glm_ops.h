@@ -873,7 +873,7 @@ void glm_dsv41_mhc_pre(GlmCtx* ctx, void* out, float* pre, float* post, float* c
 void glm_dsv41_rotary_embedding(GlmCtx*, float*, const int32_t*, int);
 void glm_dsv41_rope(GlmCtx*, void*, const void*, const float*, int, int, int, int, int, int);
 void glm_dsv41_swiglu(GlmCtx*, void*, const void*, const void*, int);
-void glm_dsv41_route(GlmCtx*, int32_t*, double*, const float*, const float*, int, int);
+void glm_dsv41_route(GlmCtx*, int32_t*, float*, const float*, const float*, int, int);
 void glm_dsv41_collapse(GlmCtx*, void*, const void*, const float*, int, int);
 void glm_dsv41_cache_insert(GlmCtx*, uint8_t*, const void*, const int32_t*, int, int, const int32_t*);
 void glm_dsv41_embedding(GlmCtx*, void*, const void*, const int32_t*, int, int, int, int, int);
