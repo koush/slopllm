@@ -10,6 +10,8 @@ import { GlmOps, bf16BytesToF32 } from "../src/glm_ops";
 import { ParallelOps } from "../src/parallel_ops";
 import { WorkspaceBase } from "../src/workspace";
 import { loadDeepseekV41Config } from "../src/deepseek_v41_model";
+import { CompressorCarry } from "../src/deepseek_v41_cache";
+import { UsingHolder } from "../src/using-holder";
 import { bf16Round, dsv41IndexQuantize, dsv41IndexScores, dsv41Rope, engramHashes } from "./deepseek_v41_oracles";
 
 for (const tp of [1, 2]) {
@@ -157,8 +159,8 @@ for (const tp of [1, 2]) {
       indexScores.d2h(scoreBytes);
       const expectedScores = dsv41IndexScores(expectedIndex, [keyValues.subarray(0, 128), keyValues.subarray(128)], weightValues);
       assert.deepEqual(scoreBytes, Buffer.from(expectedScores.buffer));
-      using pending = ws.alloc([1, 1024], "F32"), pendingPosition = ws.alloc([1], "I32");
-      pending.fill(0, pending.numElements); pendingPosition.fill(-1, 1);
+      using carry = new UsingHolder<CompressorCarry>(undefined!);
+      using retained = new UsingHolder<CompressorCarry>(undefined!);
       using raw = ws.alloc([2, 1024], "F32");
       const rawValues = new Float32Array(2048);
       rawValues.fill(1, 0, 512);
@@ -173,7 +175,9 @@ for (const tp of [1, 2]) {
       for (let token = 0; token < 2; token++) {
         using input = raw.narrow(token, 1);
         using position = positions.narrow(token, 1);
-        const compressed = input.dsv41Compress(position, cu, norm, 2, pending, pendingPosition);
+        const compressed = input.dsv41Compress(position, cu, norm, 2, carry.value?.pending, carry.value?.pendingPosition);
+        carry.replace(new CompressorCarry(compressed.pending!, compressed.pendingPosition!));
+        if (token === 0) retained.replace(carry.value.viewClone());
         using latent = compressed.latent;
         using valid = compressed.valid;
         const validity = Buffer.alloc(valid.bytes);
@@ -183,6 +187,23 @@ for (const tp of [1, 2]) {
         latent.d2h(bytes);
         assert.ok(bf16BytesToF32(bytes).every(value => value === token));
       }
+      // A later pair replaces the holder without clobbering a retained first half.
+      using laterPosition = ws.alloc([1], "I32"); laterPosition.fill(2, 1);
+      using laterInput = raw.narrow(1, 1);
+      const later = laterInput.dsv41Compress(laterPosition, cu, norm, 2, carry.value.pending, carry.value.pendingPosition);
+      using laterLatent = later.latent; using laterValid = later.valid;
+      carry.replace(new CompressorCarry(later.pending!, later.pendingPosition!));
+      const savedBytes = Buffer.alloc(retained.value.pending.bytes);
+      retained.value.pending.d2h(savedBytes);
+      assert.deepEqual(savedBytes, Buffer.from(rawValues.buffer, 0, 1024 * 4));
+      assert.deepEqual(retained.value.pendingPosition.readInt32LEArray(), [0]);
+      using restoredPosition = positions.narrow(1, 1);
+      const restored = laterInput.dsv41Compress(restoredPosition, cu, norm, 2, retained.value.pending, retained.value.pendingPosition);
+      using restoredLatent = restored.latent; using restoredValid = restored.valid;
+      using restoredCarry = new CompressorCarry(restored.pending!, restored.pendingPosition!);
+      assert.deepEqual(restoredValid.readInt32LEArray(), [1]);
+      assert.throws(() => laterInput.dsv41Compress(laterPosition, cu, norm, 2,
+        carry.value.pending, carry.value.pendingPosition, 1e-20, carry.value), /must not alias/);
     } finally {
       ws.free();
       if (ops instanceof ParallelOps) ops.free();

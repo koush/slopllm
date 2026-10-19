@@ -747,12 +747,18 @@ export class ParallelTensor extends Tensor {
       post: wrap(result.map(r => r.post), [this.shape[0], 4], "F32"), comb: wrap(result.map(r => r.comb), [this.shape[0], 4, 4], "F32") };
   }
 
-  dsv41Compress(positions: Tensor, cu: Tensor, weight: Tensor, ratio: 1 | 2, pending?: Tensor, pendingPosition?: Tensor, eps = 1e-20): { latent: Tensor; valid: Tensor } {
-    this.requireDsv4Replicated(this, positions, cu, weight, pending, pendingPosition);
+  dsv41Compress(positions: Tensor, cu: Tensor, weight: Tensor, ratio: 1 | 2, pending?: Tensor, pendingPosition?: Tensor, eps = 1e-20,
+    next?: { pending: Tensor; pendingPosition: Tensor }): { latent: Tensor; valid: Tensor; pending?: Tensor; pendingPosition?: Tensor } {
+    this.requireDsv4Replicated(this, positions, cu, weight, pending, pendingPosition, next?.pending, next?.pendingPosition);
     const result = this.shards.map((x, r) => x.dsv41Compress(this.cast(positions).shards[r], this.cast(cu).shards[r], this.cast(weight).shards[r], ratio,
-      pending ? this.cast(pending).shards[r] : undefined, pendingPosition ? this.cast(pendingPosition).shards[r] : undefined, eps));
+       pending ? this.cast(pending).shards[r] : undefined, pendingPosition ? this.cast(pendingPosition).shards[r] : undefined, eps,
+       next ? { pending: this.cast(next.pending).shards[r], pendingPosition: this.cast(next.pendingPosition).shards[r] } : undefined));
     return { latent: this.parallelOps.wrapShards(this.workspace, result.map(r => r.latent), [this.shape[0], 512], "BF16", TensorParallelism.Replicated),
-      valid: this.parallelOps.wrapShards(this.workspace, result.map(r => r.valid), [this.shape[0]], "I32", TensorParallelism.Replicated) };
+       valid: this.parallelOps.wrapShards(this.workspace, result.map(r => r.valid), [this.shape[0]], "I32", TensorParallelism.Replicated),
+       ...(ratio === 2 ? next ?? {
+         pending: this.parallelOps.wrapShards(this.workspace, result.map(r => r.pending!), [cu.numElements - 1, 1024], "F32", TensorParallelism.Replicated),
+         pendingPosition: this.parallelOps.wrapShards(this.workspace, result.map(r => r.pendingPosition!), [cu.numElements - 1], "I32", TensorParallelism.Replicated),
+       } : {}) };
   }
 
   private quantizedEmbedding(ids: Tensor, originalRows: number, rowStart: number): Tensor {

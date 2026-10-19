@@ -44,6 +44,15 @@ one-token overlap; full prefixes are not replayed. Engram uses three lookback
 token IDs supplied by planning. Indexer selections/candidates have one row per
 query; score scratch uses prefill lengths or captured decode KV-length buckets.
 
+Compressor carry tensors are immutable inputs: each forward produces fresh
+FP32 value/gate and position allocations, owned through `UsingHolder`. A
+`CompressorCarry.viewClone()` preserves a boundary without copying or being
+clobbered by later pairs. Planning reserves the outputs outside CUDA capture
+and retains the preceding inputs per plan slot, including plan+plan+run+run.
+Decode graph keys include all carry input/output addresses; released allocations
+are recycled normally, while retained views prevent premature reuse. Ratio-1
+compression has no carry. Prefix-cache reuse still uses the one-token overlap.
+
 Batched GEMM/prefill attention and single-token GEMV/decode attention have
 different rounding paths. Full-model hidden states and near-tied greedy choices
 can differ with chunk geometry; eager-versus-graph comparisons use identical

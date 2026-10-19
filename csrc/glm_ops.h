@@ -894,8 +894,8 @@ void glm_dsv41_engram_lookup(GlmCtx* ctx, void* out, const int32_t* ids,
     const uint8_t* table, const uint8_t* scales, int count, int row_start, int row_end);
 void glm_dsv41_engram_gate(GlmCtx* ctx, void* out, const void* x, const void* kv,
     const void* qw, const void* kw, int tokens, int dim, float eps);
-void glm_dsv41_compress(GlmCtx* ctx, void* out, int32_t* valid, float* state,
-    int32_t* state_position, const float* raw, const int32_t* positions, const int32_t* cu,
+void glm_dsv41_compress(GlmCtx* ctx, void* out, int32_t* valid, const float* state,
+    const int32_t* state_position, float* next_state, int32_t* next_position, const float* raw, const int32_t* positions, const int32_t* cu,
     const void* weight, int batch, int ratio, float eps);
 
 void glm_mhc_pre(GlmCtx* ctx, void* out, float* post, float* comb, const void* x,

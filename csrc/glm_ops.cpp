@@ -2977,15 +2977,15 @@ static Napi::Value Dsv41EngramGate(const Napi::CallbackInfo& info) {
 
 static Napi::Value Dsv41Compress(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() != 12) {
-        Napi::TypeError::New(env, "dsv41Compress expects 12 arguments").ThrowAsJavaScriptException();
+    if (info.Length() != 14) {
+        Napi::TypeError::New(env, "dsv41Compress expects 14 arguments").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     auto ptr = [&](int i) { return info[i].As<Napi::Number>().Int64Value(); };
     glm_dsv41_compress((GlmCtx*)ptr(0), (void*)ptr(1), (int32_t*)ptr(2), (float*)ptr(3),
-        (int32_t*)ptr(4), (float*)ptr(5), (int32_t*)ptr(6), (int32_t*)ptr(7), (void*)ptr(8),
-        info[9].As<Napi::Number>().Int32Value(), info[10].As<Napi::Number>().Int32Value(),
-        info[11].As<Napi::Number>().FloatValue());
+        (int32_t*)ptr(4), (float*)ptr(5), (int32_t*)ptr(6), (float*)ptr(7), (int32_t*)ptr(8), (int32_t*)ptr(9), (void*)ptr(10),
+        info[11].As<Napi::Number>().Int32Value(), info[12].As<Napi::Number>().Int32Value(),
+        info[13].As<Napi::Number>().FloatValue());
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) Napi::Error::New(env, cudaGetErrorString(err)).ThrowAsJavaScriptException();
     return env.Undefined();

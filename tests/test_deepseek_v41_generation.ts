@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { it } from "node:test";
 import { CaptureManager } from "../src/capture-manager";
 import { DeepseekV41Model } from "../src/deepseek_v41_model";
+import { DeepseekV41Cache } from "../src/deepseek_v41_cache";
 import { ExecutionWorkspace } from "../src/execution-workspace";
 import { freeModelRuntime, loadModelRuntime, parseModelArgs } from "../src/model_cli";
 import { TensorParallelism } from "../src/device_ops";
@@ -104,19 +105,27 @@ it("V4.1 resident generation supports batched chunks, captured decode, and rollb
       runtime.ops.dsv4TopkToSlots = sharedSlots;
     }
     assert.deepEqual(targets.map(token => model.tokenizer.decode([token!])), [" Paris", " Berlin"]);
+    using retainedCarry = (cache as DeepseekV41Cache).compressorCarry.get(2)!.value.viewClone();
+    const carryBytes = Buffer.alloc(retainedCarry.pending.bytes);
+    retainedCarry.pending.d2h(carryBytes);
+    const carryPosition = retainedCarry.pendingPosition.readInt32LEArray();
     const decode = model.generateDecode(ws, cache, manager);
     const capturedTokens: number[][][] = [];
     try {
-      for (let i = 0; i < 7; i++) {
+      for (let i = 0; i < 20; i++) {
         const step = await decode.next();
         capturedTokens.push(step.value!.tokens);
         assert.equal(step.done, false);
-        // The first call discovers KV-length variance; the bucketed key then
-        // performs its normal warmup before capture and replay.
-        if (i >= 5) assert.equal(step.value!.warmup, false);
+        // Immutable carry allocations recycle input/output addresses, each
+        // with its own warmup and graph. All variants must settle into replay.
+        if (i >= 17) assert.equal(step.value!.warmup, false);
         assert.equal(step.value!.tokens.length, 2);
       }
     } finally { await decode.return(); }
+    const retainedBytes = Buffer.alloc(retainedCarry.pending.bytes);
+    retainedCarry.pending.d2h(retainedBytes);
+    assert.deepEqual(retainedBytes, carryBytes, "Retained carry must survive eager forwards and graph replay");
+    assert.deepEqual(retainedCarry.pendingPosition.readInt32LEArray(), carryPosition);
     assert.ok([...manager.captured.values()].some(c => c.graphExec !== null), "Decode must instantiate and replay a CUDA graph");
     using eagerCache = model.createChatCache(16, 2, 128);
     eagerCache.reset(2);
@@ -145,8 +154,8 @@ it("V4.1 resident generation supports batched chunks, captured decode, and rollb
     using boundaryCache = model.createChatCache(16, 1, 128);
     using boundaryEagerCache = model.createChatCache(16, 1, 128);
     const padding = model.tokenizer.encode("A short note.\n".repeat(100));
-    const boundaryInput = [...padding.slice(0, 120 - inputs[0].length), ...inputs[0]];
-    assert.equal(boundaryInput.length, 120);
+    const boundaryInput = [...padding.slice(0, 104 - inputs[0].length), ...inputs[0]];
+    assert.equal(boundaryInput.length, 104);
     for (const c of [boundaryCache, boundaryEagerCache]) {
       c.reset(1);
       let remaining = [boundaryInput];
@@ -158,10 +167,10 @@ it("V4.1 resident generation supports batched chunks, captured decode, and rollb
     const boundaryTokens: number[][][] = [];
     const boundaryDecode = model.generateDecode(ws, boundaryCache, manager);
     try {
-      for (let i = 0; i < 12; i++) {
+      for (let i = 0; i < 28; i++) {
         const step = await boundaryDecode.next();
         assert.equal(step.done, false);
-        if (i >= 5) assert.equal(step.value!.warmup, false, "Boundary crossing must replay the existing graph");
+        if (i >= 17) assert.equal(step.value!.warmup, false, "Boundary crossing must replay the existing graph");
         boundaryTokens.push(step.value!.tokens);
       }
     } finally { await boundaryDecode.return(); }

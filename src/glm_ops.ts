@@ -1051,18 +1051,35 @@ export class GlmTensor extends Tensor {
     return { input, pre, post, comb };
   }
 
-  dsv41Compress(positions: Tensor, cu: Tensor, weight: Tensor, ratio: 1 | 2, pending?: Tensor, pendingPosition?: Tensor, eps = 1e-20): { latent: Tensor; valid: Tensor } {
+  dsv41Compress(positions: Tensor, cu: Tensor, weight: Tensor, ratio: 1 | 2, pending?: Tensor, pendingPosition?: Tensor, eps = 1e-20,
+    next?: { pending: Tensor; pendingPosition: Tensor }): { latent: Tensor; valid: Tensor; pending?: Tensor; pendingPosition?: Tensor } {
     const raw = this;
-    this.checkDsv41Tensors(positions, cu, weight, pending, pendingPosition);
+    this.checkDsv41Tensors(positions, cu, weight, pending, pendingPosition, next?.pending, next?.pendingPosition);
     if (![1, 2].includes(ratio) || raw.type !== "F32" || raw.shape.length !== 2 || raw.shape[1] !== 512 * ratio
       || positions.type !== "I32" || positions.shape.length !== 1 || positions.numElements !== raw.shape[0]
       || cu.type !== "I32" || cu.shape.length !== 1 || cu.numElements < 2 || weight.type !== "BF16" || weight.shape.length !== 1 || weight.numElements !== 512
-      || !Number.isFinite(eps) || eps <= 0 || (ratio === 2 && (!pending || pending.type !== "F32" || pending.shape[0] < cu.numElements - 1
-        || pending.shape[1] !== 1024 || !pendingPosition || pendingPosition.type !== "I32" || pendingPosition.numElements < cu.numElements - 1))) throw new Error("Invalid V4.1 compressor inputs/state");
+      || !Number.isFinite(eps) || eps <= 0 || !!pending !== !!pendingPosition
+      || (pending && (pending.type !== "F32" || pending.shape.length !== 2 || pending.shape[0] < cu.numElements - 1
+        || pending.shape[1] !== 1024 || pendingPosition!.type !== "I32" || pendingPosition!.shape.length !== 1 || pendingPosition!.numElements < cu.numElements - 1))
+      || (ratio === 1 && (pending || next))) throw new Error("Invalid V4.1 compressor inputs/state");
+    if (next && (next.pending.type !== "F32" || next.pending.shape.length !== 2 || next.pending.shape[1] !== 1024
+      || next.pending.shape[0] < cu.numElements - 1 || next.pendingPosition.type !== "I32"
+      || next.pendingPosition.shape.length !== 1 || next.pendingPosition.numElements < cu.numElements - 1
+      || (next.pending.data < next.pendingPosition.data + next.pendingPosition.bytes
+        && next.pendingPosition.data < next.pending.data + next.pending.bytes))) throw new Error("Invalid V4.1 compressor output carry");
+    if (next) {
+      for (const output of [next.pending, next.pendingPosition]) for (const input of [raw, positions, cu, weight, pending, pendingPosition]) {
+        if (input && output.data < input.data + input.bytes && input.data < output.data + output.bytes) {
+          throw new Error("V4.1 compressor output carry must not alias an input");
+        }
+      }
+    }
+    const carry = ratio === 2 ? next ?? { pending: raw.workspace.alloc([cu.numElements - 1, 1024], "F32"),
+      pendingPosition: raw.workspace.alloc([cu.numElements - 1], "I32") } : undefined;
     const latent = raw.workspace.alloc([raw.shape[0], 512], "BF16"), valid = raw.workspace.alloc([raw.shape[0]], "I32");
     getNativeAddon().dsv41Compress(this.ops.ctx, latent.data, valid.data, pending?.data ?? 0, pendingPosition?.data ?? 0,
-      raw.data, positions.data, cu.data, weight.data, cu.shape[0] - 1, ratio, eps);
-    return { latent, valid };
+      carry?.pending.data ?? 0, carry?.pendingPosition.data ?? 0, raw.data, positions.data, cu.data, weight.data, cu.shape[0] - 1, ratio, eps);
+    return { latent, valid, ...carry };
   }
 
   private quantizedEmbedding(ids: Tensor, originalRows: number, rowStart: number): Tensor {

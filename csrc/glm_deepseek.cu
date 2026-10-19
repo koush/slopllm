@@ -320,11 +320,14 @@ __global__ void engram_gate(__nv_bfloat16* out, const __nv_bfloat16* x, const __
     }
 }
 
-__global__ void compress_latent(__nv_bfloat16* out, int32_t* valid, float* state,
-    int32_t* state_position, const float* raw, const int32_t* positions,
+__global__ void compress_latent(__nv_bfloat16* out, int32_t* valid, const float* state,
+    const int32_t* state_position, float* next_state, int32_t* next_position, const float* raw, const int32_t* positions,
     const int32_t* cu, const __nv_bfloat16* weight, int ratio, float eps) {
     const int sequence = blockIdx.x, d = threadIdx.x;
     __shared__ float squares[512];
+    int saved_position = state_position ? state_position[sequence] : -1;
+    float saved_value = saved_position >= 0 ? state[size_t(sequence) * 1024 + d] : 0.f;
+    float saved_gate = saved_position >= 0 ? state[size_t(sequence) * 1024 + 512 + d] : 0.f;
     for (int token = cu[sequence]; token < cu[sequence + 1]; token++) {
         const int position = positions[token];
         const float value = raw[size_t(token) * (512 * ratio) + d];
@@ -332,16 +335,15 @@ __global__ void compress_latent(__nv_bfloat16* out, int32_t* valid, float* state
         bool emit = ratio == 1;
         if (ratio == 2) {
             const float gate = raw[size_t(token) * 1024 + 512 + d];
-            float* saved = state + size_t(sequence) * 1024;
             if ((position & 1) == 0) {
-                saved[d] = value;
-                saved[512 + d] = gate;
-                if (d == 0) state_position[sequence] = position;
+                saved_value = value;
+                saved_gate = gate;
+                saved_position = position;
             } else {
-                emit = state_position[sequence] == position - 1;
-                const float peak = fmaxf(saved[512 + d], gate);
-                const float a = expf(saved[512 + d] - peak), b = expf(gate - peak);
-                pooled = saved[d] * (a / (a + b)) + value * (b / (a + b));
+                emit = saved_position == position - 1;
+                const float peak = fmaxf(saved_gate, gate);
+                const float a = expf(saved_gate - peak), b = expf(gate - peak);
+                pooled = saved_value * (a / (a + b)) + value * (b / (a + b));
             }
         }
         if (d == 0) valid[token] = emit ? 1 : (ratio == 2 && (position & 1) ? -1 : 0);
@@ -355,6 +357,11 @@ __global__ void compress_latent(__nv_bfloat16* out, int32_t* valid, float* state
             ? __float2bfloat16(pooled * rsqrtf(squares[0] / 512 + eps) * float(weight[d]))
             : __float2bfloat16(0.f);
         __syncthreads();
+    }
+    if (ratio == 2) {
+        next_state[size_t(sequence) * 1024 + d] = saved_value;
+        next_state[size_t(sequence) * 1024 + 512 + d] = saved_gate;
+        if (d == 0) next_position[sequence] = saved_position;
     }
 }
 }
@@ -438,11 +445,11 @@ extern "C" void glm_dsv41_engram_gate(GlmCtx* ctx, void* out, const void* x, con
         (const __nv_bfloat16*)qw, (const __nv_bfloat16*)kw, dim, eps);
 }
 
-extern "C" void glm_dsv41_compress(GlmCtx* ctx, void* out, int32_t* valid, float* state,
-    int32_t* state_position, const float* raw, const int32_t* positions, const int32_t* cu,
+extern "C" void glm_dsv41_compress(GlmCtx* ctx, void* out, int32_t* valid, const float* state,
+    const int32_t* state_position, float* next_state, int32_t* next_position, const float* raw, const int32_t* positions, const int32_t* cu,
     const void* weight, int batch, int ratio, float eps) {
     cudaSetDevice(ctx->device_id);
     if (batch > 0) compress_latent<<<batch, 512, 0, GLM_STREAM(ctx)>>>(
-        (__nv_bfloat16*)out, valid, state, state_position, raw, positions, cu,
+        (__nv_bfloat16*)out, valid, state, state_position, next_state, next_position, raw, positions, cu,
         (const __nv_bfloat16*)weight, ratio, eps);
 }

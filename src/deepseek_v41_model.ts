@@ -265,12 +265,15 @@ export class DeepseekV41Model extends ChatModel {
     pageHost.withPinnedBuffer(buffer => Buffer.from(pageIds.buffer).copy(buffer));
     pageTable.memcpy(pageHost, pageHost.bytes, MemcpyKind.HostToDevice);
     state.extras.set("dsv41.pages", pageTable);
+    cache.planCompressor(state);
   }
 
   override forwardCaptureKey(state: ExecutionState): (string | number)[] {
     const cache = state.cache as DeepseekV41Cache;
+    const compressor = cache.compressorPlan(state);
     return ["dsv41-paged", cache.maxPages, cache.maxBatch, JSON.stringify([
-      cache.ckvData[0], cache.compressorPending.get(2)!, state.positionIds, state.qoIndptrD, state.mlaBatchIndices,
+      cache.ckvData[0], ...[...compressor.inputs.values(), ...compressor.outputs.values()].flatMap(carry => [carry.pending, carry.pendingPosition]),
+      state.positionIds, state.qoIndptrD, state.mlaBatchIndices,
       state.extras.get("dsv41.lookback") as Tensor, state.extras.get("dsv41.pages") as Tensor,
     ].map(tensor => tensor.memoryRanges()))];
   }
@@ -397,8 +400,10 @@ export class DeepseekV41Model extends ChatModel {
       using projected = normed.linear(this.weight(p + ".compressor.wkv.weight"), { outputType: "F32" });
       using gate = ratio === 2 ? normed.linear(this.weight(p + ".compressor.wgate.weight"), { outputType: "F32" }) : undefined;
       using raw = gate ? projected.cat([gate], 1) : projected.viewClone();
+      const carry = cache.compressorPlan(state);
+      const previous = carry.inputs.get(layer);
       const result = raw.dsv41Compress(position, state.qoIndptrD, this.weight(p + ".compressor.norm.weight"), ratio as 1 | 2,
-        cache.compressorPending.get(layer), cache.compressorPosition.get(layer));
+        previous?.pending, previous?.pendingPosition, 1e-20, carry.outputs.get(layer));
       using latent = result.latent;
       using valid = result.valid;
       using compressed = latent.dsv41Rope(position, true, false, 512, ratio);

@@ -155,7 +155,7 @@ export interface NativeAddon {
   dsv41EngramGate(ctx: number, output: number, x: number, kv: number, qw: number, kw: number,
     tokens: number, dim: number, eps: number): void;
   dsv41Compress(ctx: number, output: number, valid: number, state: number, statePosition: number,
-    raw: number, positions: number, cu: number, weight: number, batch: number, ratio: number, eps: number): void;
+    nextState: number, nextPosition: number, raw: number, positions: number, cu: number, weight: number, batch: number, ratio: number, eps: number): void;
   sparseMlaPrefill(ctx: number, qNope: number, qRope: number, kvCache: number, indices: number, output: number, outLse: number, numTokens: number, numHeads: number, topk: number, smScale: number, strideKvBlock: number, topkLength: number, qScales?: number): void;
   sparseMlaDecode(ctx: number, qNope: number, qRope: number, kvCache: number, indices: number, midOut: number, midLse: number, output: number, outLse: number, numTokens: number, numHeads: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, topkLength?: number, qScales?: number): void;
   gatherTopkCkv(ctx: number, flatPtrs: Float64Array, localKvCache: number, topkIdx: number, batchIndices: number, pageIndices: number, pageIndptr: number, kvTokenIndptr: number, N: number, cpWorldSize: number, cpRank: number, effPageSize: number, bptBytes: number, numTokens: number, topk: number, paddedKvLen: number, scratchBitmap: number, scratchUnique: number, scratchCounter: number): void;
