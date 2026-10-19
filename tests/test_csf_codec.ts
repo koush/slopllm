@@ -13,6 +13,32 @@ import {
   tpExtent,
 } from "../src/csf_codec";
 import { makeScaleMatrix } from "./csf_fixture";
+import { expandMxfp4ScalePlanes, expandMxfp4ScaleWindow } from "../src/mxfp4_csf_codec";
+
+describe("mxfp4 csf codec", () => {
+  // A 16x9 matrix exercises LSB order, the partial final selector byte,
+  // byte wraparound, and exceptions straddling a sliced row boundary.
+  const fixed = Buffer.concat([Buffer.alloc(16, 255), Buffer.from(Array(16).fill([0x55, 1]).flat())]);
+  const exceptions = Buffer.from([8, 0, 0, 127, 9, 0, 0, 128]);
+  it("recovers bytes and bounded windows across selector/exception boundaries", () => {
+    const expected = Buffer.from(Array(16).fill([0, 255, 0, 255, 0, 255, 0, 255, 0]).flat());
+    expected[8] = 127;
+    expected[9] = 128;
+    assert.deepEqual(expandMxfp4ScalePlanes(fixed, exceptions, 16, 9), expected);
+    assert.deepEqual(expandMxfp4ScaleWindow(fixed, exceptions, 16, 9, 0, 2, 7, 2),
+      Buffer.from([255, 127, 255, 0]));
+    assert.deepEqual(expandMxfp4ScaleWindow(fixed, exceptions, 16, 9, 1, 1, 0, 2),
+      Buffer.from([128, 255]));
+  });
+  it("rejects truncated, duplicate, out-of-range and unsorted exception planes", () => {
+    for (const bad of [exceptions.subarray(0, 7), Buffer.concat([exceptions, exceptions]),
+      Buffer.from([144, 0, 0, 127]), Buffer.from([9, 0, 0, 127, 8, 0, 0, 128])]) {
+      assert.throws(() => expandMxfp4ScalePlanes(fixed, bad, 16, 9), CsfContractError);
+    }
+    assert.throws(() => expandMxfp4ScalePlanes(fixed.subarray(1), exceptions, 16, 9), CsfContractError);
+    assert.throws(() => expandMxfp4ScaleWindow(fixed, exceptions, 16, 9, 16, 1, 0, 9), CsfContractError);
+  });
+});
 
 // §9.7.1 CPU fixtures: exact NVFP4 codec recovery (byte-window4 fixed
 // stream + u24 exceptions), invalid-plane rejection, TP slice/exception

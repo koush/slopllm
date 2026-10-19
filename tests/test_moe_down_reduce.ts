@@ -25,6 +25,47 @@ function bytes(tensor: Tensor) {
   return data;
 }
 
+for (const world of [1, 2]) for (const sharedLayout of [TensorParallelism.Replicated, TensorParallelism.PartialSum]) {
+  it(`MXFP4 MoE combines locally in F32 with ${sharedLayout} shared output, TP${world}`, () => {
+    using gpu0 = new GlmOps(0);
+    using gpu1 = world === 2 ? new GlmOps(1) : undefined;
+    using parallel = gpu1 ? new ParallelOps([gpu0, gpu1]) : undefined;
+    using ws = new WorkspaceBase(parallel ?? gpu0);
+    const makeWeights = (prefix: string, layout: TensorParallelism) => Array.from({ length: 6 }, (_, e) => {
+      const w = ws.alloc([64, 32], "U8_MXFP4", `${prefix}.${e}.weight`, layout);
+      w.h2d(Buffer.alloc(w.bytes, 0x22));
+      const s = ws.alloc([64, 2], "F8_E8M0", `${prefix}.${e}.scale`, layout);
+      s.h2d(Buffer.alloc(s.bytes, 127));
+      return w;
+    });
+    const experts = { gate: makeWeights("gate", TensorParallelism.Column), up: makeWeights("up", TensorParallelism.Column),
+      down: makeWeights("down", TensorParallelism.Row) };
+    using input = ws.alloc([2, 64], "BF16"); input.fill(1, input.numElements);
+    using shared = ws.alloc([2, 64], "BF16", undefined, sharedLayout);
+    if (shared instanceof ParallelTensor && sharedLayout === TensorParallelism.PartialSum) {
+      for (const shard of shared.shards) shard.fill(1, shard.numElements);
+    } else shared.fill(1, shared.numElements);
+    using logits = ws.alloc([2, 384], "F32"); logits.fill(0, logits.numElements);
+    using bias = ws.alloc([384], "F32"); bias.fill(0, bias.numElements);
+    const routing = logits.moeRoute({ scoring: "sqrt_softplus", correctionBias: bias, numExpertsPerToken: 6, scalingFactor: 1.5, normalize: true });
+    using indices = routing.indices;
+    using ids = indices.reshape([12]);
+    using stream = routing.normalizedWeightsStream;
+    using weights = stream.result;
+    using partial = input.swiGluMlpMoeReduce({ ...experts, normalizedWeightsStream: stream,
+      shared, activationLimit: 10, outputType: "F32" }, ids, 6, 12, 64, 64, "test");
+    assert.deepEqual(partial.shape, [2, 64], "Only combined token rows reach the collective");
+    assert.equal(partial.type, "F32");
+    assert.equal(partial.parallelism, world === 2 ? TensorParallelism.PartialSum : TensorParallelism.Replicated);
+    using full = partial.replicate();
+    const data = bytes(full);
+    // Clipping makes SiLU(10)*10 round to BF16 100. Each full down output
+    // is 64*100; six routing weights of .25 give 9600 before the shared term.
+    const expected = 9600 + (sharedLayout === TensorParallelism.PartialSum ? world : 1);
+    for (let i = 0; i < full.numElements; i++) assert.equal(data.readFloatLE(i * 4), expected);
+  });
+}
+
 // Independent decomposed reference using the retained native combine kernel.
 function combine(down: Tensor, routing: Tensor, topK: number, rows: number): Tensor {
   if (down instanceof ParallelTensor && routing instanceof ParallelTensor) {

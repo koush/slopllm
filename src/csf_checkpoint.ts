@@ -15,8 +15,10 @@ import {
   requireLocalSafetensorsName,
 } from "./csf_codec";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
+import { MXFP4_CSF_SCHEMA, MXFP4_CSF_CODEC, mxfp4FixedStreamLength,
+  expandMxfp4ScalePlanes, expandMxfp4ScaleWindow } from "./mxfp4_csf_codec";
 
-// GLM-5.3 NVFP4-CSF checkpoint container reader (`lil-nvfp4-csf-checkpoint/1`).
+// NVFP4-CSF and DeepSeek V4.1 MXFP4-CSF checkpoint container reader.
 //
 // Validation is split per the port plan §9.2:
 //
@@ -61,7 +63,7 @@ export interface CsfContract {
   codec: string;
   family: string;
   sourceModelId: string;
-  sourceRevision: string;
+  sourceRevision?: string;
   sourceModelPath: string;
   /** Logical source name -> shard file (contract.source_names). */
   sourceNames: Map<string, string>;
@@ -198,19 +200,17 @@ export function readCsfContract(root: string): CsfOpenResult {
   const manifest = asRecord(readJson(root, "manifest.json"), "manifest");
   const contractJson = asRecord(readJson(root, "build-contract.json"), "build-contract");
 
-  for (const [key, expected] of [["schema", NVFP4_CSF_SCHEMA], ["codec", NVFP4_CSF_CODEC]] as const) {
+  const mxfp4 = contractJson.schema === MXFP4_CSF_SCHEMA;
+  for (const [key, expected] of [["schema", mxfp4 ? MXFP4_CSF_SCHEMA : NVFP4_CSF_SCHEMA],
+    ["codec", mxfp4 ? MXFP4_CSF_CODEC : NVFP4_CSF_CODEC]] as const) {
     if (manifest[key] !== expected || contractJson[key] !== expected) {
       throw new CsfContractError(`CSF requires ${key}=${expected} in both manifest and build-contract`);
     }
   }
-  // Reject unsupported codec variants explicitly (e.g. the MXFP4
-  // row-base-offset1-u24-exceptions/1 grammar has a different decoder).
-  if (contractJson.codec !== NVFP4_CSF_CODEC) {
-    throw new CsfContractError(`CSF codec variant ${contractJson.codec} is not supported`);
-  }
   const family = requireString(contractJson.family, "family");
-  if (!SUPPORTED_CSF_FAMILIES.includes(family)) {
-    throw new CsfContractError(`CSF family ${family} is not supported (want one of ${SUPPORTED_CSF_FAMILIES.join(", ")})`);
+  const families = mxfp4 ? ["deepseek_v41"] : SUPPORTED_CSF_FAMILIES;
+  if (!families.includes(family)) {
+    throw new CsfContractError(`CSF family ${family} is not supported (want one of ${families.join(", ")})`);
   }
   if (manifest.family !== family) {
     throw new CsfContractError("CSF manifest and build-contract must name the same model family");
@@ -337,8 +337,8 @@ export function readCsfContract(root: string): CsfOpenResult {
         if (!extentOk) {
           throw new CsfContractError(`CSF shard ${file} tensor ${name} has out-of-file extents`);
         }
-        const fixedMatch = /^(.*)\.nvfp4_csf_fixed$/.exec(name);
-        const exceptionMatch = /^(.*)\.nvfp4_csf_exceptions$/.exec(name);
+        const fixedMatch = (mxfp4 ? /^(.*)\.mxfp4_csf_fixed$/ : /^(.*)\.nvfp4_csf_fixed$/).exec(name);
+        const exceptionMatch = (mxfp4 ? /^(.*)\.mxfp4_csf_exceptions$/ : /^(.*)\.nvfp4_csf_exceptions$/).exec(name);
         if (fixedMatch || exceptionMatch) {
           const scaleName = (fixedMatch ?? exceptionMatch)![1];
           const planes = scalePlanes.get(scaleName) ?? {};
@@ -365,15 +365,17 @@ export function readCsfContract(root: string): CsfOpenResult {
         const fixed = st.meta(planes.fixedName);
         const exceptions = st.meta(planes.exceptionName);
         const [rows, columns] = record.shape;
-        if (record.dtype !== "F8_E4M3" || rows * columns !== record.sourceBytes) {
-          throw new CsfContractError(`CSF scale ${scaleName} record does not describe an F8_E4M3 [rows, columns] matrix`);
+        if (record.dtype !== (mxfp4 ? "F8_E8M0" : "F8_E4M3") || rows * columns !== record.sourceBytes) {
+          throw new CsfContractError(`CSF scale ${scaleName} record has invalid scale dtype/geometry`);
         }
-        if (fixedStreamLength(rows, columns) !== record.fixedBytes
-          || fixed.dtype !== "U8" || fixed.shape[0] !== record.fixedBytes) {
+        if ((mxfp4 ? mxfp4FixedStreamLength : fixedStreamLength)(rows, columns) !== record.fixedBytes
+          || fixed.dtype !== "U8" || fixed.shape.reduce((a, b) => a * b, 1) !== record.fixedBytes
+          || fixed.dataOffsets[1] - fixed.dataOffsets[0] !== record.fixedBytes) {
           throw new CsfContractError(`CSF scale ${scaleName} fixed stream size disagrees with its shape`);
         }
         if (record.exceptionBytes % 4 !== 0
-          || exceptions.dtype !== "U32" || exceptions.shape[0] * 4 !== record.exceptionBytes) {
+          || exceptions.dtype !== "U32" || exceptions.shape.length !== 1 || exceptions.shape[0] * 4 !== record.exceptionBytes
+          || exceptions.dataOffsets[1] - exceptions.dataOffsets[0] !== record.exceptionBytes) {
           throw new CsfContractError(`CSF scale ${scaleName} exception plane size disagrees with its record`);
         }
         if (logicalSeen.has(scaleName)) {
@@ -422,16 +424,15 @@ export function readCsfContract(root: string): CsfOpenResult {
     }
   }
 
-  // Global shapes/dtypes: every compressed scale belongs to a packed U8
-  // weight with NVFP4 geometry [N, K/2] -> scale [N, K/16], wherever the
-  // source sharding placed each tensor.
+  // Check every scale against its packed weight globally: NVFP4 uses K/16
+  // and MXFP4 uses K/32, regardless of their source-shard placement.
   for (const [scaleName, entry] of scales) {
-    const weightName = scaleName.replace(/\.weight_scale$/, ".weight");
+    const weightName = scaleName.replace(mxfp4 ? /\.scale$/ : /\.weight_scale$/, ".weight");
     const weight = globalMeta.get(weightName);
-    if (!weight || weight.dtype !== "U8" || weight.shape.length !== 2) {
+    if (!weight || !(mxfp4 ? ["I8", "U8"].includes(weight.dtype) : weight.dtype === "U8") || weight.shape.length !== 2) {
       throw new CsfContractError(`CSF scale ${scaleName} has no packed U8 ${weightName} to scale`);
     }
-    const geometry = nvfp4ScaleGeometry(weight.shape);
+    const geometry = mxfp4 ? { rows: weight.shape[0], columns: weight.shape[1] / 16 } : nvfp4ScaleGeometry(weight.shape);
     if (geometry.rows !== entry.shape[0] || geometry.columns !== entry.shape[1]) {
       throw new CsfContractError(`CSF scale ${scaleName} shape [${entry.shape}] does not match ${weightName} geometry`);
     }
@@ -444,7 +445,8 @@ export function readCsfContract(root: string): CsfOpenResult {
       codec: contractJson.codec,
       family,
       sourceModelId: requireString(contractJson.source_model_id, "source_model_id"),
-      sourceRevision: requireString(contractJson.source_revision, "source_revision"),
+      sourceRevision: mxfp4 && contractJson.source_revision === undefined
+        ? undefined : requireString(contractJson.source_revision, "source_revision"),
       sourceModelPath: requireString(contractJson.source, "source"),
       sourceNames,
       shards,
@@ -459,7 +461,7 @@ export function readCsfContract(root: string): CsfOpenResult {
 
 /**
  * Logical reads and compressed-plane access over a validated CSF container.
- * GPU loaders consume the planes; CPU reads support integrity verification.
+ * NVFP4 loaders may consume the planes directly; MXFP4 loads expanded bytes.
  */
 export class CsfContainer {
   readonly contract: CsfContract;
@@ -526,7 +528,7 @@ export class CsfContainer {
     }
     const entry = this.layouts.get(located.file)!.compressed.get(name)!;
     const [rows, columns] = entry.record.shape;
-    return expandScalePlanes(
+    return (this.contract.codec === MXFP4_CSF_CODEC ? expandMxfp4ScalePlanes : expandScalePlanes)(
       st.readTensor(entry.fixedName),
       st.readTensor(entry.exceptionName),
       rows,
@@ -562,7 +564,7 @@ export class CsfContainer {
       throw new CsfContractError(`CSF slice rank mismatch for ${name}`);
     }
     for (let d = 0; d < rank; d++) {
-      if (extent.offsets[d] < 0 || extent.shape[d] < 0
+      if (!Number.isSafeInteger(extent.offsets[d]) || !Number.isSafeInteger(extent.shape[d]) || extent.offsets[d] < 0 || extent.shape[d] < 0
         || extent.offsets[d] + extent.shape[d] > located.meta.shape[d]) {
         throw new CsfContractError(`CSF slice for ${name} is out of bounds`);
       }
@@ -574,7 +576,7 @@ export class CsfContainer {
     if (located.kind === "compressed") {
       const entry = this.layouts.get(located.file)!.compressed.get(name)!;
       const [rows, columns] = entry.record.shape;
-      return expandScaleWindow(
+      return (this.contract.codec === MXFP4_CSF_CODEC ? expandMxfp4ScaleWindow : expandScaleWindow)(
         st.readTensor(entry.fixedName),
         st.readTensor(entry.exceptionName),
         rows, columns,
@@ -590,14 +592,13 @@ export class CsfContainer {
     const innerRows = rank >= 2 ? extent.shape[1] * (located.meta.shape.slice(2).reduce((a, b) => a * b, 1)) : 1;
     const innerRowBytes = innerRows * dtypeBytes;
     const rowsToRead = extent.shape[0];
-    const source = st.readTensor(name);
     const out = Buffer.allocUnsafe(extent.shape.reduce((a, b) => a * b, 1) * dtypeBytes);
     const srcBase = rank >= 2
       ? extent.offsets[0] * rowBytes + extent.offsets[1] * (located.meta.shape.slice(2).reduce((a, b) => a * b, 1)) * dtypeBytes
       : extent.offsets[0] * dtypeBytes;
     for (let r = 0; r < rowsToRead; r++) {
       const src = srcBase + r * rowBytes;
-      source.copy(out, r * innerRowBytes, src, src + innerRowBytes);
+      st.readTensorRange(name, src, innerRowBytes).copy(out, r * innerRowBytes);
     }
     return out;
   }
@@ -653,6 +654,19 @@ export async function reconstructSourceShard(
     hash.update(sourceHeader.prefix);
     let bytes = sourceHeader.prefix.length;
     for (const name of sourceHeader.order) {
+      const range = container.physicalRange(name);
+      if (range && range.size > 64 * 1024 ** 2) {
+        // Engram tables exceed the maximum Node Buffer size. Hash their native
+        // bytes directly from disk instead of materializing a whole tensor.
+        const stream = fs.createReadStream(path.join(root, "tensors", range.file), {
+          start: range.offset, end: range.offset + range.size - 1, highWaterMark: 8 * 1024 ** 2,
+        });
+        for await (const chunk of stream) {
+          hash.update(chunk);
+          bytes += chunk.length;
+        }
+        continue;
+      }
       const data = container.readTensor(name);
       hash.update(data);
       bytes += data.length;

@@ -167,6 +167,12 @@ export abstract class ChatModel extends WorkspaceBase {
   abstract createChatCache(maxPages?: number, maxBatch?: number, maxSeqLen?: number, pageSize?: number, pinned?: boolean): ChatCache;
   abstract forwardPhased(state: ExecutionState): Generator<void, Tensor, void>;
 
+  get outputWeight(): Tensor {
+    const weight = this.tensors.get("lm_head.weight");
+    if (!weight) throw new Error("Missing lm_head.weight");
+    return weight;
+  }
+
   protected runPhased<T>(generator: Generator<void, T, void>): T {
     while (true) {
       const iter = generator.next();
@@ -416,11 +422,12 @@ export abstract class ChatModel extends WorkspaceBase {
           throw new Error("Decode batch changed; close and restart the generator");
         }
         const state = ws.planDecode(this, batchSize, cache, executionManager.captureEnabled);
+        this.prepareForward(state);
         const inputTokens = nextTokens;
         state.setInput([nextTokens]);
         let warmup: boolean;
         {
-          const captureKey = ["decode", samplingPolicy.captureKey ?? "greedy"];
+          const captureKey = ["decode", samplingPolicy.captureKey ?? "greedy", ...this.forwardCaptureKey(state)];
           const execution = executionManager.execute({ states: [state], inputs: {}, key: captureKey }, () => {
             using hidden = this.forwardModel(state);
             using logits = state.computeLogits(hidden, this);
@@ -453,6 +460,12 @@ export abstract class ChatModel extends WorkspaceBase {
   createParser(_chatTemplateKwargs: ChatTemplateKwargs = {}): ChatModelParser {
     return new DefaultChatModelParser(this.tokenizer);
   }
+
+  /** Prepare persistent forward resources outside CUDA graph capture. */
+  prepareForward(_state: ExecutionState): void {}
+
+  /** Model-owned persistent resources that distinguish otherwise identical graphs. */
+  forwardCaptureKey(_state: ExecutionState): (string | number)[] { return []; }
 
   forward(state: ExecutionState): Tensor {
     using _tracker = state.ws.startTracking();
@@ -599,6 +612,9 @@ export abstract class ChatModel extends WorkspaceBase {
     return resolveWeightType(name, meta, this.weightQuantizationConfig, name => this.checkpointSource!.meta(name));
   }
 
+  /** Deterministic load/replay boundaries for models with substantial host staging. */
+  protected readonly loadSyncInterval: number = 0;
+
   protected async loadWeights(modelDir: string): Promise<void> {
     // Shard discovery and physical plane handling live behind the
     // checkpoint-source abstraction: safetensors roots and CSF containers
@@ -678,6 +694,8 @@ export abstract class ChatModel extends WorkspaceBase {
           loadedBytes += meta.dataOffsets[1] - meta.dataOffsets[0];
         }
         loadedTensors += batch.length;
+        if (this.loadSyncInterval > 0 && Math.floor(loadedTensors / this.loadSyncInterval)
+          > Math.floor(i / this.loadSyncInterval)) await this.drainLoadTransfers();
         const layerMatch = layerRe.exec(batch[batch.length - 1]);
         if (layerMatch) currentLayer = Math.max(currentLayer, Number(layerMatch[1]));
         this.releaseLoadTensors();
@@ -697,6 +715,9 @@ export abstract class ChatModel extends WorkspaceBase {
     if (isTty) process.stderr.write(`\r${" ".repeat(lastLineLength)}\r`);
     console.log(`Loaded ${totalTensors} weight tensors (${giB(totalBytes)}) in ${((performance.now() - startedMs) / 1000).toFixed(1)}s`);
   }
+
+  /** Initialize model-owned constants after weights/tokenizer loading, before freeze. */
+  protected async initializeConstants(): Promise<void> {}
 
   protected async fromPretrained(modelDir: string, tokenizerRepo: string): Promise<void> {
     await this.loadWeights(modelDir);
@@ -720,6 +741,7 @@ export abstract class ChatModel extends WorkspaceBase {
     }
     this.cfg.maxPositionEmbeddings = loadMaxPositionEmbeddings(configDir);
     this.cfg.generationConfig = loadGenerationConfig(configDir);
+    await this.initializeConstants();
     this.freeze();
   }
 }

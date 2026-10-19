@@ -3,7 +3,7 @@ import type { ExecutionState } from "./execution-workspace";
 import { GlmOps } from "./glm_ops";
 import { SafeTensorFile } from "./safetensors";
 import { MemcpyKind } from "./sampling";
-import { Tensor } from "./tensor";
+import { Tensor, type LinearOptions, type EmbeddingOptions } from "./tensor";
 import { WorkspaceBase } from "./workspace";
 import type { HeapKey } from "./heap";
 import { validateCsfScaleDecode, type MhcPreResult } from "./device_ops";
@@ -55,10 +55,10 @@ export class MetaTensor extends Tensor {
         super.memcpy2d(_dstOffset, _dpitch, _src, _srcOffset, _spitch, _width, _height, _kind);
     }
 
-    linear(weight: Tensor): Tensor {
-        super.linear(weight);
+    linear(weight: Tensor, options: LinearOptions = {}): Tensor {
+        super.linear(weight, options);
         const n = weight.shape[0];
-        return this.workspace.alloc([this.shape[0], n], this.type);
+        return this.workspace.alloc([this.shape[0], n], options.outputType ?? this.type);
     }
 
     bmm(B: Tensor, batch: number, M: number, N: number, K: number, transA: boolean = false, transB: boolean = false, tokenMajor: boolean = false): Tensor {
@@ -95,16 +95,22 @@ export class MetaTensor extends Tensor {
         return this.workspace.alloc([batch, nHeads, seqLen, headDim], this.type);
     }
 
-    embedding(ids: Tensor): Tensor {
-        super.embedding(ids);
+    embedding(ids: Tensor, options: EmbeddingOptions = {}): Tensor {
+        super.embedding(ids, options);
+        if (this.type === "F8_E4M3") return ids.workspace.alloc([ids.shape[0], (ids.shape[1] ?? 1) * this.shape[1]], "BF16");
         const seqLen = ids.numElements;
         const hidden = this.shape[1];
-        return ids.workspace.alloc([seqLen, hidden], this.type);
+        return ids.workspace.alloc(options.streams === 4 ? [seqLen, 4, hidden] : [seqLen, hidden], this.type);
     }
 
-    siluAndMul(up: Tensor): Tensor {
-        super.siluAndMul(up);
+    siluAndMul(up: Tensor, limit?: number): Tensor {
+        super.siluAndMul(up, limit);
         return this.workspace.alloc(this.shape, this.type);
+    }
+
+    toType(type: "BF16"): Tensor {
+        if (this.type !== "F32") return super.toType(type);
+        return this.workspace.alloc(this.shape, type);
     }
 
     arange(start: number, step: number, count: number): void {
@@ -277,12 +283,22 @@ export class MetaTensor extends Tensor {
         moeIntermediate: number, hs: number,
         pfx: string,
     ): Tensor {
-        return this.workspace.alloc([count / topK, hs], this.type);
+        return this.workspace.alloc([count / topK, hs], inputs.outputType ?? this.type);
     }
 
 }
 
 export class MetaOps implements DeviceOps {
+    dsv4SparseAttention(): never { throw new Error("DSV4 requires CUDA"); }
+    dsv41IndexQuantize(): never { throw new Error("DSV4 requires CUDA"); }
+    dsv41Hash(): never { throw new Error("DSV4 requires CUDA"); }
+    dsv41Candidates(): never { throw new Error("DSV4 requires CUDA"); }
+    dsv41Select(): never { throw new Error("DSV4 requires CUDA"); }
+    dsv4CacheAppend(): never { throw new Error("DSV4 cache operations require CUDA"); }
+    dsv4IndexAppend(): never { throw new Error("DSV4 cache operations require CUDA"); }
+    dsv4LocalSlots(): never { throw new Error("DSV4 cache operations require CUDA"); }
+    dsv4TopkToSlots(): never { throw new Error("DSV4 cache operations require CUDA"); }
+    dsv4IndexScores(): never { throw new Error("DSV4 cache operations require CUDA"); }
     kdaScan(query: Tensor, state: Tensor, key: Tensor, value: Tensor, forget: Tensor, beta: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, lowerBound = -5): Tensor {
         validateKdaScan(this, query, state, key, value, forget, beta, aLog, dtBias, cuSeqlens, lowerBound);
         return query.workspace.alloc(query.shape, "BF16");

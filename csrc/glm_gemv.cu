@@ -7,13 +7,14 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <unordered_map>
+#include <type_traits>
 
 #define CUBLAS(ctx) (*reinterpret_cast<cublasHandle_t*>(&(ctx)->cublas_handle))
 
 namespace {
 
 // ---------------------------------------------------------------------------
-// cublasLt algorithm cache: maps (device_id, M, N, K, workspace size) → heuristic result.
+// cublasLt algorithm cache: maps (device_id, M, N, K, workspace size, output dtype) → heuristic result.
 // The heuristic is a host-side query that runs during warmup (before graph
 // capture). After capture, the graph replays the selected kernel — the cache
 // is never hit again.
@@ -21,13 +22,14 @@ namespace {
 struct LtCacheKey {
     int m, n, k;
     size_t workspace_size;
+    cudaDataType_t output_type;
     bool operator==(const LtCacheKey& o) const {
-        return m == o.m && n == o.n && k == o.k && workspace_size == o.workspace_size;
+        return m == o.m && n == o.n && k == o.k && workspace_size == o.workspace_size && output_type == o.output_type;
     }
 };
 struct LtCacheKeyHash {
     size_t operator()(const LtCacheKey& k) const {
-        return ((size_t)k.m * 1000003) ^ ((size_t)k.n * 1009) ^ (size_t)k.k ^ (k.workspace_size * 31);
+        return ((size_t)k.m * 1000003) ^ ((size_t)k.n * 1009) ^ (size_t)k.k ^ (k.workspace_size * 31) ^ ((size_t)k.output_type * 131);
     }
 };
 struct LtCacheEntry {
@@ -43,7 +45,6 @@ static std::unordered_map<int, std::unordered_map<LtCacheKey, LtCacheEntry, LtCa
 constexpr int GEMV_WARP_SIZE = 32;
 constexpr int GEMV_ROWS_PER_BLOCK = 8;
 constexpr int GEMV_BLOCK_SIZE = GEMV_ROWS_PER_BLOCK * GEMV_WARP_SIZE;
-constexpr int FP8_QUANT_BLOCK = 128;
 
 
 // ---------------------------------------------------------------------------
@@ -76,10 +77,16 @@ __device__ __forceinline__ void uint4_to_bf16x8(
 // (vs 10.9 warps/SM for the regular kernel). Block-level reduction via shared
 // memory + warp shuffle.
 // ---------------------------------------------------------------------------
-template <int BLOCK_SIZE>
+template <typename Output>
+__device__ __forceinline__ Output linear_output(float value) {
+    if constexpr (std::is_same_v<Output, float>) return value;
+    else return __float2bfloat16(value);
+}
+
+template <int BLOCK_SIZE, typename Output>
 __global__ void
 bf16_gemv_multiwarp_kernel(
-    __nv_bfloat16* __restrict__ output,
+    Output* __restrict__ output,
     const __nv_bfloat16* __restrict__ input,
     const __nv_bfloat16* __restrict__ weight,
     int M, int N, int K) {
@@ -180,12 +187,12 @@ bf16_gemv_multiwarp_kernel(
                 sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset);
             }
             if (lane == 0) {
-                output[(size_t)m * N + row] = __float2bfloat16(sum);
+                output[(size_t)m * N + row] = linear_output<Output>(sum);
             }
         }
     } else {
         if (lane == 0) {
-            output[(size_t)m * N + row] = __float2bfloat16(sum);
+            output[(size_t)m * N + row] = linear_output<Output>(sum);
         }
     }
 }
@@ -203,10 +210,10 @@ constexpr int GEMV_SPLITK_WARPS = 4;
 constexpr int GEMV_SPLITK_BLOCK_SIZE = GEMV_SPLITK_WARPS * GEMV_WARP_SIZE;
 constexpr int GEMV_SPLITK_PARTITIONS = 4;  // K is split into this many segments
 
-template <int NumPartitions>
+template <int NumPartitions, typename Output>
 __global__ void __launch_bounds__(GEMV_SPLITK_BLOCK_SIZE * NumPartitions, 2)
 bf16_gemv_splitk_kernel(
-    __nv_bfloat16* __restrict__ output,
+    Output* __restrict__ output,
     const __nv_bfloat16* __restrict__ input,
     const __nv_bfloat16* __restrict__ weight,
     int M, int N, int K) {
@@ -306,188 +313,8 @@ bf16_gemv_splitk_kernel(
             s += __shfl_down_sync(0xFFFFFFFF, s, offset);
         }
         if (lane == 0) {
-            output[(size_t)m * N + row] = __float2bfloat16(s);
+            output[(size_t)m * N + row] = linear_output<Output>(s);
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// FP8 GEMV kernel: optimized for M=1 (single-token decode)
-// Same structure as BF16 GEMV but dequantizes FP8 weights with per-block
-// scale factors (128x128 block quantization). K_TILE must be a multiple of
-// FP8_QUANT_BLOCK (128) so each K-tile contains an integer number of
-// quantization blocks, reducing __syncthreads barriers proportionally.
-// ---------------------------------------------------------------------------
-
-template<int K_TILE>
-__global__ void __launch_bounds__(GEMV_BLOCK_SIZE, 4)
-fp8_dequantize_gemv_kernel(
-    __nv_bfloat16* __restrict__ output,
-    const __nv_bfloat16* __restrict__ input,
-    const __nv_fp8_e4m3* __restrict__ weight,
-    const __nv_bfloat16* __restrict__ scale_inv,
-    int M, int N, int K) {
-
-    constexpr int K_TILE_VEC = K_TILE / 2;
-    constexpr int BLOCKS_PER_TILE = K_TILE / FP8_QUANT_BLOCK;
-
-    int num_row_groups = (N + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
-    int m = blockIdx.x / num_row_groups;
-    int row_group = blockIdx.x % num_row_groups;
-    int row = row_group * GEMV_ROWS_PER_BLOCK + threadIdx.x / GEMV_WARP_SIZE;
-    int lane = threadIdx.x % GEMV_WARP_SIZE;
-
-    bool valid = m < M && row < N;
-
-    __shared__ __nv_bfloat162 smem_vec[K_TILE_VEC];
-
-    int num_k_tiles = K / K_TILE;
-    int num_k_blocks = K / FP8_QUANT_BLOCK;
-    const __nv_bfloat16* input_row = input + (size_t)m * K;
-    const __nv_fp8_e4m3* weight_row = weight + (size_t)row * K;
-    int n_block = row / FP8_QUANT_BLOCK;
-
-    float sum = 0.0f;
-
-    for (int tile = 0; tile < num_k_tiles; tile++) {
-        int k_start = tile * K_TILE;
-
-        const __nv_bfloat162* input_vec = reinterpret_cast<const __nv_bfloat162*>(input_row + k_start);
-        for (int i = threadIdx.x; i < K_TILE_VEC; i += GEMV_BLOCK_SIZE) {
-            smem_vec[i] = input_vec[i];
-        }
-        __syncthreads();
-
-        if (valid) {
-            #pragma unroll
-            for (int b = 0; b < BLOCKS_PER_TILE; b++) {
-                int kb = tile * BLOCKS_PER_TILE + b;
-                float scale = __bfloat162float(scale_inv[n_block * num_k_blocks + kb]);
-                #pragma unroll
-                for (int ki = lane; ki < FP8_QUANT_BLOCK / 2; ki += GEMV_WARP_SIZE) {
-                    __nv_bfloat162 x2 = smem_vec[b * (FP8_QUANT_BLOCK / 2) + ki];
-                    float x0 = __bfloat162float(x2.x);
-                    float x1 = __bfloat162float(x2.y);
-                    float w0 = fp8_e4m3_to_float(weight_row[k_start + b * FP8_QUANT_BLOCK + ki * 2]) * scale;
-                    float w1 = fp8_e4m3_to_float(weight_row[k_start + b * FP8_QUANT_BLOCK + ki * 2 + 1]) * scale;
-                    sum += w0 * x0 + w1 * x1;
-                }
-            }
-        }
-
-        __syncthreads();
-    }
-
-    int remaining_start = num_k_tiles * K_TILE;
-    int remaining = K - remaining_start;
-    if (remaining > 0) {
-        __nv_bfloat16* smem = reinterpret_cast<__nv_bfloat16*>(smem_vec);
-        for (int i = threadIdx.x; i < remaining; i += GEMV_BLOCK_SIZE) {
-            smem[i] = input_row[remaining_start + i];
-        }
-        __syncthreads();
-
-        if (valid) {
-            int remaining_k_blocks_start = num_k_tiles * BLOCKS_PER_TILE;
-            int remaining_k_blocks = remaining / FP8_QUANT_BLOCK;
-            for (int b = 0; b < remaining_k_blocks; b++) {
-                int kb = remaining_k_blocks_start + b;
-                float scale = __bfloat162float(scale_inv[n_block * num_k_blocks + kb]);
-                int b_start = b * FP8_QUANT_BLOCK;
-                for (int k = b_start + lane; k < b_start + FP8_QUANT_BLOCK; k += GEMV_WARP_SIZE) {
-                    float w_val = fp8_e4m3_to_float(weight_row[remaining_start + k]) * scale;
-                    float x_val = __bfloat162float(smem[k]);
-                    sum += w_val * x_val;
-                }
-            }
-        }
-
-        __syncthreads();
-    }
-
-    if (valid) {
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
-        }
-        if (lane == 0) {
-            output[(size_t)m * N + row] = __float2bfloat16(sum);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Smem-staged GEMM kernel: optimized for M>1 (batch decode / prefill)
-// Each block computes an M_TILE x N_TILE output tile.
-// Weight and input tiles are staged to shared memory for reuse across M rows.
-// ---------------------------------------------------------------------------
-
-constexpr int FP8_GEMM_M_TILE = 16;
-constexpr int FP8_GEMM_N_TILE = 32;
-constexpr int FP8_GEMM_K_TILE = 128;
-constexpr int FP8_GEMM_BLOCK_DIM = FP8_GEMM_M_TILE * FP8_GEMM_N_TILE;
-constexpr int FP8_GEMM_WEIGHT_PAD = 4;
-
-__global__ void __launch_bounds__(FP8_GEMM_BLOCK_DIM, 3)
-fp8_dequantize_gemm_smem_kernel(
-    __nv_bfloat16* __restrict__ output,
-    const __nv_bfloat16* __restrict__ input,
-    const __nv_fp8_e4m3* __restrict__ weight,
-    const __nv_bfloat16* __restrict__ scale_inv,
-    int M, int N, int K) {
-
-    int m_start = blockIdx.y * FP8_GEMM_M_TILE;
-    int n_start = blockIdx.x * FP8_GEMM_N_TILE;
-    int local_m = threadIdx.x / FP8_GEMM_N_TILE;
-    int local_n = threadIdx.x % FP8_GEMM_N_TILE;
-    int m = m_start + local_m;
-    int n = n_start + local_n;
-
-    __shared__ __nv_bfloat16 smem_input[FP8_GEMM_M_TILE][FP8_GEMM_K_TILE];
-    __shared__ __nv_fp8_e4m3 smem_weight[FP8_GEMM_N_TILE][FP8_GEMM_K_TILE + FP8_GEMM_WEIGHT_PAD];
-
-    float sum = 0.0f;
-    int num_k_tiles = (K + FP8_GEMM_K_TILE - 1) / FP8_GEMM_K_TILE;
-    int num_k_blocks = K / 128;
-    int valid_m = min(FP8_GEMM_M_TILE, M - m_start);
-    int valid_n = min(FP8_GEMM_N_TILE, N - n_start);
-
-    for (int kb = 0; kb < num_k_tiles; kb++) {
-        int k_start = kb * FP8_GEMM_K_TILE;
-        int k_tile = min(FP8_GEMM_K_TILE, K - k_start);
-
-        for (int i = threadIdx.x; i < valid_m * k_tile; i += FP8_GEMM_BLOCK_DIM) {
-            int lm = i / k_tile;
-            int lk = i % k_tile;
-            smem_input[lm][lk] = input[(m_start + lm) * K + k_start + lk];
-        }
-
-        for (int i = threadIdx.x; i < valid_n * k_tile; i += FP8_GEMM_BLOCK_DIM) {
-            int ln = i / k_tile;
-            int lk = i % k_tile;
-            smem_weight[ln][lk] = weight[(n_start + ln) * K + k_start + lk];
-        }
-
-        __syncthreads();
-
-        if (m < M && n < N) {
-            int n_block = n / 128;
-            float scale = __bfloat162float(scale_inv[n_block * num_k_blocks + kb]);
-
-            #pragma unroll
-            for (int k = 0; k < FP8_GEMM_K_TILE; k++) {
-                if (k < k_tile) {
-                    float w_val = fp8_e4m3_to_float(smem_weight[local_n][k]) * scale;
-                    float x_val = __bfloat162float(smem_input[local_m][k]);
-                    sum += w_val * x_val;
-                }
-            }
-        }
-
-        __syncthreads();
-    }
-
-    if (m < M && n < N) {
-        output[(size_t)m * N + n] = __float2bfloat16(sum);
     }
 }
 
@@ -734,16 +561,39 @@ nvfp4_dequantize_gemm_smem_kernel(
 // Each block covers GEMV_ROWS_PER_BLOCK * RowsPerWarp rows.
 // ---------------------------------------------------------------------------
 
-template <int RowsPerWarp, bool Fixed6144 = false, bool Hybrid = false>
+// Keep 16-weight work units and their vector loads identical for both formats.
+// MXFP4 shares one E8M0 scale across two adjacent work units.
+struct Nvfp4ScalePolicy {
+    using Scale = __nv_fp8_e4m3;
+    static constexpr int GROUP_SIZE = 16;
+    __device__ static float global(const float* const* scales, int expert) { return *scales[expert]; }
+    __device__ static float load(const Scale* row, int group, float global_scale) {
+        return fp8_e4m3_to_float(row[group]) * global_scale;
+    }
+};
+
+struct Mxfp4ScalePolicy {
+    using Scale = uint8_t;
+    static constexpr int GROUP_SIZE = 32;
+    __device__ static float global(const float* const*, int) { return 1.f; }
+    __device__ static float load(const Scale* row, int group, float) {
+        const uint32_t exponent = row[group / 2];
+        // E8M0 code 0 is 2^-127, code 255 is NaN (not IEEE infinity).
+        return __uint_as_float(exponent == 255 ? 0x7fc00000u : exponent == 0 ? 0x00400000u : exponent << 23);
+    }
+};
+
+template <int RowsPerWarp, bool Fixed6144 = false, bool Hybrid = false,
+          class Quant = Nvfp4ScalePolicy, int PointerStride = 1, int IdStride = 1>
 __global__ void __launch_bounds__(GEMV_BLOCK_SIZE, 4)
 nvfp4_mul_mat_id_kernel(
     __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ input,
     const uint8_t* const* __restrict__ weight_ptrs,
-    const __nv_fp8_e4m3* const* __restrict__ scale_ptrs,
+    const typename Quant::Scale* const* __restrict__ scale_ptrs,
     const float* const* __restrict__ scale2_ptrs,
     const int* __restrict__ expert_ids,
-    int top_k, int count, int N, int K, const MoeHybridPlan* plan = nullptr) {
+    int top_k, int count, int N, int K, const MoeHybridPlan* plan = nullptr, int id_offset = 0) {
 
     constexpr int LANES_PER_ROW = GEMV_WARP_SIZE / RowsPerWarp;
     constexpr int ROWS_PER_BLOCK = GEMV_ROWS_PER_BLOCK * RowsPerWarp;
@@ -759,7 +609,7 @@ nvfp4_mul_mat_id_kernel(
             return;
         }
         // No CUDA route queue: every expert is owned entirely by one worker.
-        const int expert = expert_ids[entry];
+        const int expert = expert_ids[entry * IdStride + id_offset];
         if (plan->offsets[expert + 1] - plan->offsets[expert] >= plan->min_rows) {
             return;
         }
@@ -775,11 +625,11 @@ nvfp4_mul_mat_id_kernel(
     int row = row_group * ROWS_PER_BLOCK + warp_id * RowsPerWarp + row_in_warp;
 
     int bid = entry / top_k;
-    int eid = expert_ids[entry];
+    int eid = expert_ids[entry * IdStride + id_offset];
     const __nv_bfloat16* input_row  = input + (size_t)bid * K;
-    const uint8_t* weight_row = weight_ptrs[eid] + (size_t)row * (K / 2);
-    const __nv_fp8_e4m3* scale_row = scale_ptrs[eid] + (size_t)row * (K / NVFP4_QUANT_GROUP);
-    float scale_2_val = *scale2_ptrs[eid];
+    const uint8_t* weight_row = weight_ptrs[eid * PointerStride] + (size_t)row * (K / 2);
+    const typename Quant::Scale* scale_row = scale_ptrs[eid * PointerStride] + (size_t)row * (K / Quant::GROUP_SIZE);
+    float scale_2_val = Quant::global(scale2_ptrs, eid);
 
     int num_k_groups = Fixed6144 ? 6144 / NVFP4_QUANT_GROUP : K / NVFP4_QUANT_GROUP;
     bool row_valid = row < N;
@@ -804,7 +654,7 @@ nvfp4_mul_mat_id_kernel(
         for (int g0 = 0; g0 < GEMV_WARP_SIZE; g0 += LANES_PER_ROW) {
             int g = inner_lane + g0;
             if (g >= num_k_groups) continue;
-            float scale = fp8_e4m3_to_float(scale_row[g]) * scale_2_val;
+            float scale = Quant::load(scale_row, g, scale_2_val);
             int k_start = g * NVFP4_QUANT_GROUP;
 
             const uint4* input_v4 = reinterpret_cast<const uint4*>(input_row + k_start);
@@ -838,7 +688,7 @@ nvfp4_mul_mat_id_kernel(
         constexpr int OUTER_UNROLL = Fixed6144 ? 4 : 2;
         #pragma unroll OUTER_UNROLL
         for (int g = inner_lane; g < num_k_groups; g += LANES_PER_ROW) {
-            float scale = fp8_e4m3_to_float(scale_row[g]) * scale_2_val;
+            float scale = Quant::load(scale_row, g, scale_2_val);
             int k_start = g * NVFP4_QUANT_GROUP;
 
             const uint4* input_v4 = reinterpret_cast<const uint4*>(input_row + k_start);
@@ -1359,7 +1209,80 @@ nvfp4_down_reduce_kernel(
     }
 }
 
+// Both output variants retain FP32 thread accumulators, warp shuffles and
+// shared-memory partials. Only the final store differs.
+template <typename Output>
+static void launch_bf16_gemv(GlmCtx* ctx, Output* out, const void* input,
+                            const void* weight, int batch, int n, int k) {
+    constexpr int SPLITK_THRESHOLD = 512;
+    constexpr int SPLITK_FULL_THREADS = GEMV_SPLITK_PARTITIONS * GEMV_SPLITK_WARPS * GEMV_WARP_SIZE;
+    const auto* in_bf = static_cast<const __nv_bfloat16*>(input);
+    const auto* wt_bf = static_cast<const __nv_bfloat16*>(weight);
+    const int K_vec = k / GEMV_K_VEC;
+    if (n < SPLITK_THRESHOLD) {
+        const int grid_size = batch * n;
+        if (K_vec < SPLITK_FULL_THREADS) {
+            constexpr int BLOCK = GEMV_SPLITK_WARPS * 2 * GEMV_WARP_SIZE;
+            bf16_gemv_splitk_kernel<2><<<grid_size, BLOCK, 0, GLM_STREAM(ctx)>>>(out, in_bf, wt_bf, batch, n, k);
+        } else {
+            constexpr int BLOCK = GEMV_SPLITK_WARPS * GEMV_SPLITK_PARTITIONS * GEMV_WARP_SIZE;
+            bf16_gemv_splitk_kernel<4><<<grid_size, BLOCK, 0, GLM_STREAM(ctx)>>>(out, in_bf, wt_bf, batch, n, k);
+        }
+        return;
+    }
+    dim3 grid(n, batch);
+    int mw_block = GEMV_WARP_SIZE;
+    int niter_best = (K_vec + GEMV_WARP_SIZE - 1) / GEMV_WARP_SIZE;
+    for (int bs = 2 * GEMV_WARP_SIZE; bs <= 256; bs += GEMV_WARP_SIZE) {
+        const int niter = (K_vec + bs - 1) / bs;
+        if (niter < niter_best) {
+            niter_best = niter;
+            mw_block = bs;
+        }
+    }
+    #define LAUNCH_MW(BS) \
+        bf16_gemv_multiwarp_kernel<BS><<<grid, BS, 0, GLM_STREAM(ctx)>>>(out, in_bf, wt_bf, batch, n, k)
+    switch (mw_block) {
+        case 32:  LAUNCH_MW(32);  break;
+        case 64:  LAUNCH_MW(64);  break;
+        case 96:  LAUNCH_MW(96);  break;
+        case 128: LAUNCH_MW(128); break;
+        case 160: LAUNCH_MW(160); break;
+        case 192: LAUNCH_MW(192); break;
+        case 224: LAUNCH_MW(224); break;
+        case 256: LAUNCH_MW(256); break;
+        default:  LAUNCH_MW(256); break;
+    }
+    #undef LAUNCH_MW
+}
+
 extern "C" {
+
+// Interleaved [weight, scale] table and flattened routing IDs. As with the
+// NVFP4 path, top_k routes share each input row; down projections use top_k=1.
+int glm_mxfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
+                             const void* pointer_table, const int* expert_ids,
+                             int top_k, int count, int N, int K) {
+    if (count <= 0 || N <= 0 || K <= 0 || K % 32 || top_k <= 0 || count % top_k)
+        return cudaErrorInvalidValue;
+    cudaSetDevice(ctx->device_id);
+    const auto weights = reinterpret_cast<const uint8_t* const*>(pointer_table);
+    const auto scales = weights + 1;
+    if (K <= 512) {
+        constexpr int rows = GEMV_ROWS_PER_BLOCK * 8;
+        nvfp4_mul_mat_id_kernel<8, false, false, Mxfp4ScalePolicy, 2>
+            <<<count * ((N + rows - 1) / rows), GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)output, (const __nv_bfloat16*)input, weights, scales, nullptr,
+                expert_ids, top_k, count, N, K);
+    } else {
+        constexpr int rows = GEMV_ROWS_PER_BLOCK * 2;
+        nvfp4_mul_mat_id_kernel<2, false, false, Mxfp4ScalePolicy, 2>
+            <<<count * ((N + rows - 1) / rows), GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)output, (const __nv_bfloat16*)input, weights, scales, nullptr,
+                expert_ids, top_k, count, N, K);
+    }
+    return cudaGetLastError();
+}
 
 void glm_nvfp4_mul_mat_id_reduce(GlmCtx* ctx, void* output, const void* input,
                                 const void* const* weight_ptrs, const void* const* scale_ptrs,
@@ -1371,45 +1294,6 @@ void glm_nvfp4_mul_mat_id_reduce(GlmCtx* ctx, void* output, const void* input,
         (__nv_bfloat16*)output, (const __nv_bfloat16*)input,
         (const uint8_t* const*)weight_ptrs, (const __nv_fp8_e4m3* const*)scale_ptrs,
         (const float* const*)scale2_ptrs, expert_ids, (const __nv_bfloat16*)routing_weights);
-}
-
-void glm_fp8_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
-                            const void* fp8_weight, const void* weight_scale,
-                            int m, int n, int k) {
-    cudaSetDevice(ctx->device_id);
-    const __nv_bfloat16* scale_ptr = reinterpret_cast<const __nv_bfloat16*>(weight_scale);
-    if (m == 1) {
-        int num_row_groups = (n + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
-        int grid_size = m * num_row_groups;
-        if (k >= 512) {
-            fp8_dequantize_gemv_kernel<512><<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
-                reinterpret_cast<__nv_bfloat16*>(bf16_out),
-                reinterpret_cast<const __nv_bfloat16*>(bf16_input),
-                reinterpret_cast<const __nv_fp8_e4m3*>(fp8_weight),
-                scale_ptr, m, n, k);
-        } else if (k >= 256) {
-            fp8_dequantize_gemv_kernel<256><<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
-                reinterpret_cast<__nv_bfloat16*>(bf16_out),
-                reinterpret_cast<const __nv_bfloat16*>(bf16_input),
-                reinterpret_cast<const __nv_fp8_e4m3*>(fp8_weight),
-                scale_ptr, m, n, k);
-        } else {
-            fp8_dequantize_gemv_kernel<128><<<grid_size, GEMV_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
-                reinterpret_cast<__nv_bfloat16*>(bf16_out),
-                reinterpret_cast<const __nv_bfloat16*>(bf16_input),
-                reinterpret_cast<const __nv_fp8_e4m3*>(fp8_weight),
-                scale_ptr, m, n, k);
-        }
-    } else {
-        dim3 grid((n + FP8_GEMM_N_TILE - 1) / FP8_GEMM_N_TILE,
-                  (m + FP8_GEMM_M_TILE - 1) / FP8_GEMM_M_TILE);
-        fp8_dequantize_gemm_smem_kernel<<<grid, FP8_GEMM_BLOCK_DIM, 0, GLM_STREAM(ctx)>>>(
-            reinterpret_cast<__nv_bfloat16*>(bf16_out),
-            reinterpret_cast<const __nv_bfloat16*>(bf16_input),
-            reinterpret_cast<const __nv_fp8_e4m3*>(fp8_weight),
-            scale_ptr,
-            m, n, k);
-    }
 }
 
 void glm_nvfp4_linear_decode(GlmCtx* ctx, void* bf16_out, const void* bf16_input,
@@ -1641,68 +1525,13 @@ void glm_nvfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
 
 void glm_linear(GlmCtx* ctx, void* out, const void* input,
                  const void* weight, int batch, int n, int k,
-                 void* workspace, size_t workspace_size) {
+                 void* workspace, size_t workspace_size, bool output_f32) {
     cudaSetDevice(ctx->device_id);
-
-    if (batch < 3) {
-        // Split-K variant when N is small enough that fewer blocks would
-        // underutilize the GPU. With 512 threads/block, split-K provides
-        // more memory-level parallelism per SM when block count is low.
-        // Threshold tuned for RTX PRO 6000 / sm_120 (~140 SMs): below 512
-        // blocks, the extra warps help hide memory latency; at 512+ blocks
-        // the multiwarp kernel's lighter reduction wins.
-        constexpr int SPLITK_THRESHOLD = 512;
-        constexpr int SPLITK_FULL_THREADS = GEMV_SPLITK_PARTITIONS * GEMV_SPLITK_WARPS * GEMV_WARP_SIZE;
-        if (n < SPLITK_THRESHOLD) {
-            int grid_size = batch * n;
-            int K_vec = k / GEMV_K_VEC;
-            if (K_vec < SPLITK_FULL_THREADS) {
-                constexpr int SPLITK_BLOCK = GEMV_SPLITK_WARPS * 2 * GEMV_WARP_SIZE;
-                bf16_gemv_splitk_kernel<2><<<grid_size, SPLITK_BLOCK, 0, GLM_STREAM(ctx)>>>(
-                    reinterpret_cast<__nv_bfloat16*>(out),
-                    reinterpret_cast<const __nv_bfloat16*>(input),
-                    reinterpret_cast<const __nv_bfloat16*>(weight),
-                    batch, n, k);
-            } else {
-                constexpr int SPLITK_BLOCK = GEMV_SPLITK_WARPS * GEMV_SPLITK_PARTITIONS * GEMV_WARP_SIZE;
-                bf16_gemv_splitk_kernel<4><<<grid_size, SPLITK_BLOCK, 0, GLM_STREAM(ctx)>>>(
-                    reinterpret_cast<__nv_bfloat16*>(out),
-                    reinterpret_cast<const __nv_bfloat16*>(input),
-                    reinterpret_cast<const __nv_bfloat16*>(weight),
-                    batch, n, k);
-            }
-        } else {
-            dim3 grid(n, batch);
-            int K_vec = k / GEMV_K_VEC;
-            int mw_block = GEMV_WARP_SIZE;
-            int niter_best = (K_vec + GEMV_WARP_SIZE - 1) / GEMV_WARP_SIZE;
-            for (int bs = 2 * GEMV_WARP_SIZE; bs <= 256; bs += GEMV_WARP_SIZE) {
-                int niter = (K_vec + bs - 1) / bs;
-                if (niter < niter_best) {
-                    niter_best = niter;
-                    mw_block = bs;
-                }
-            }
-            auto* out_bf = reinterpret_cast<__nv_bfloat16*>(out);
-            auto* in_bf = reinterpret_cast<const __nv_bfloat16*>(input);
-            auto* wt_bf = reinterpret_cast<const __nv_bfloat16*>(weight);
-            // BS >= 128 uses shared memory for input staging (K*2 bytes).
-            // BS < 128 uses no dynamic shared memory to preserve high occupancy.
-            #define LAUNCH_MW(BS) \
-                bf16_gemv_multiwarp_kernel<BS><<<grid, BS, 0, GLM_STREAM(ctx)>>>(out_bf, in_bf, wt_bf, batch, n, k)
-            switch (mw_block) {
-                case 32:  LAUNCH_MW(32);  break;
-                case 64:  LAUNCH_MW(64);  break;
-                case 96:  LAUNCH_MW(96);  break;
-                case 128: LAUNCH_MW(128); break;
-                case 160: LAUNCH_MW(160); break;
-                case 192: LAUNCH_MW(192); break;
-                case 224: LAUNCH_MW(224); break;
-                case 256: LAUNCH_MW(256); break;
-                default:  LAUNCH_MW(256); break;
-            }
-            #undef LAUNCH_MW
-        }
+    if (batch <= 0 || n <= 0 || k <= 0) return;
+    // Vectorized GEMV needs every input/weight row aligned to uint4.
+    if (batch < 3 && k % GEMV_K_VEC == 0) {
+        if (output_f32) launch_bf16_gemv(ctx, static_cast<float*>(out), input, weight, batch, n, k);
+        else launch_bf16_gemv(ctx, static_cast<__nv_bfloat16*>(out), input, weight, batch, n, k);
         return;
     }
 
@@ -1712,7 +1541,8 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
     cublasLtHandle_t ltHandle = *reinterpret_cast<cublasLtHandle_t*>(&ctx->cublaslt_handle);
 
     auto& cache = g_lt_caches[ctx->device_id];
-    LtCacheKey key{batch, n, k, workspace_size};
+    const cudaDataType_t output_type = output_f32 ? CUDA_R_32F : CUDA_R_16BF;
+    LtCacheKey key{batch, n, k, workspace_size, output_type};
     auto& entry = cache[key];
 
     if (!entry.valid) {
@@ -1725,7 +1555,7 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
         // weight [n,k] row-major = [k,n] col-major; input [batch,k] row-major = [k,batch] col-major
         cublasLtMatrixLayoutCreate(&entry.Adesc, CUDA_R_16BF, k, n, k);
         cublasLtMatrixLayoutCreate(&entry.Bdesc, CUDA_R_16BF, k, batch, k);
-        cublasLtMatrixLayoutCreate(&entry.Cdesc, CUDA_R_16BF, n, batch, n);
+        cublasLtMatrixLayoutCreate(&entry.Cdesc, output_type, n, batch, n);
 
         cublasLtMatmulPreference_t pref;
         cublasLtMatmulPreferenceCreate(&pref);
@@ -1762,7 +1592,7 @@ void glm_linear(GlmCtx* ctx, void* out, const void* input,
             weight, CUDA_R_16BF, k,
             input,  CUDA_R_16BF, k,
             &beta,
-            out,    CUDA_R_16BF, n,
+            out,    output_type, n,
             CUDA_R_32F,
             CUBLAS_GEMM_DEFAULT_TENSOR_OP);
         // Other cuBLAS entry points share this handle; do not leave them bound

@@ -142,10 +142,21 @@ export class SafeTensorFile {
   }
 
   readTensor(name: string): Buffer {
-    const size = this.tensorSize(name);
-    const offset = this.tensorOffset(name);
+    return this.readTensorRange(name, 0, this.tensorSize(name));
+  }
+
+  /** Bounded byte read, including tensors larger than a Node Buffer. */
+  readTensorRange(name: string, byteOffset: number, size: number): Buffer {
+    if (!Number.isSafeInteger(byteOffset) || !Number.isSafeInteger(size) || byteOffset < 0 || size < 0
+      || byteOffset + size > this.tensorSize(name)) throw new Error(`Invalid byte range for ${name}`);
+    const offset = this.tensorOffset(name) + byteOffset;
     const buf = Buffer.alloc(size);
-    fs.readSync(this.fd, buf, 0, size, offset);
+    let read = 0;
+    while (read < size) {
+      const count = fs.readSync(this.fd, buf, read, size - read, offset + read);
+      if (!count) throw new Error(`Unexpected end of tensor ${name}`);
+      read += count;
+    }
     return buf;
   }
 

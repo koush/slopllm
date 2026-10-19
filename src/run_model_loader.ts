@@ -163,8 +163,9 @@ async function main(): Promise<void> {
   if (loaderArgs.initialCommand) validateWorkerModelArgs(loaderArgs.initialCommand.args, modelArgs);
   if (!modelArgs.arenaExplicit) throw new Error("run_model_loader requires --arena <GiB>");
   const selection = resolveModelSelection(modelArgs);
-  if (!selection.registration.persistentLoader || selection.config.quantization_config?.quant_method === "fp8") {
-    throw new Error("The model loader currently supports non-FP8 Qwen3, GLM, and GLM-5.3-Flash checkpoints");
+  if (!selection.registration.persistentLoader || (selection.modelType !== "deepseek_v41"
+    && selection.config.quantization_config?.quant_method === "fp8")) {
+    throw new Error("The model loader supports non-FP8 Qwen3, GLM, GLM-5.3-Flash, and DeepSeek V4.1 checkpoints");
   }
 
   console.log(`Loading ${modelLabel(modelArgs)} for persistent worker execution...`);

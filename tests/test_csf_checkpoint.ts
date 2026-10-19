@@ -12,6 +12,7 @@ import {
   validateCalibrationScalar,
 } from "../src/checkpoint_source";
 import { reconstructSourceShard, verifyCsfIntegrity, readCsfContract } from "../src/csf_checkpoint";
+import { SafeTensorFile } from "../src/safetensors";
 import {
   buildCsfFixture,
   readJsonFile,
@@ -26,6 +27,34 @@ import {
 // preservation, and the separate integrity/provenance pass.
 
 const PFX = "model.layers.3.mlp.experts.0";
+
+it("reads a bounded row beyond 4 GiB without materializing an embedding table", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "slopllm-large-table-"));
+  const size = 8 * 1024 ** 3, rows = size / 256;
+  const header = Buffer.from(JSON.stringify({ table: { dtype: "F8_E4M3", shape: [rows, 256], data_offsets: [0, size] } }));
+  const prefix = Buffer.alloc(8);
+  prefix.writeBigUInt64LE(BigInt(header.length));
+  const fd = fs.openSync(path.join(root, "model.safetensors"), "w");
+  const expected = Buffer.from(Array.from({ length: 256 }, (_, i) => i));
+  try {
+    fs.writeSync(fd, prefix);
+    fs.writeSync(fd, header);
+    fs.writeSync(fd, expected, 0, expected.length, 8 + header.length + size - 256);
+  } finally {
+    fs.closeSync(fd);
+  }
+  const source = openCheckpointSource(root);
+  const read = SafeTensorFile.prototype.readTensor;
+  SafeTensorFile.prototype.readTensor = () => { throw new Error("Unbounded table read"); };
+  try {
+    assert.deepEqual(source.tensor("table").readSlice({ offsets: [rows - 1, 0], shape: [1, 256] }), expected);
+    assert.throws(() => source.tensor("table").readSlice({ offsets: [rows - .5, 0], shape: [0, 256] }), /bounds/);
+  } finally {
+    SafeTensorFile.prototype.readTensor = read;
+    source.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 describe("csf checkpoint container", () => {
   let scratch: string;

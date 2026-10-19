@@ -5,7 +5,23 @@ import { SafeTensorFile } from "./safetensors";
 import { type WorkspaceBase } from "./workspace";
 import type { HeapKey } from "./heap";
 
+const TRACE_ALLOCATIONS = process.env.SLOPLLM_TENSOR_ALLOCATION_STACKS === "1";
+
+export interface LinearOptions {
+  outputType?: "BF16" | "F32";
+  /** Independent projections over consecutive input feature groups. */
+  groups?: number;
+}
+
+export interface EmbeddingOptions {
+  streams?: 1 | 4;
+  rowStart?: number;
+  /** Unpadded vocabulary size for a sharded quantized table. */
+  originalRows?: number;
+}
+
 export interface MoeRoutingOptions {
+  scoring?: "sigmoid" | "sqrt_softplus";
   numExpertsPerToken: number;
   correctionBias?: Tensor;
   scalingFactor: number;
@@ -31,7 +47,7 @@ function numElements(shape: number[]): number {
 export abstract class Tensor implements Disposable {
   parallelism: TensorParallelism = TensorParallelism.Replicated;
   private pinnedBuffer?: Buffer;
-  // stack: string;
+  stack?: string;
   views = new Set<Tensor>();
   disposed = false;
   viewDisposed = false;
@@ -52,7 +68,7 @@ export abstract class Tensor implements Disposable {
     while (this.view?.view) {
       this.view = this.view.view;
     }
-    // this.stack = this.name ? undefined! : new Error("Tensor allocated at:").stack!;
+    this.stack = TRACE_ALLOCATIONS && !this.name ? new Error("Tensor allocated at:").stack : undefined;
     if (this.view) {
       this.view.views.add(this);
     }
@@ -335,19 +351,36 @@ export abstract class Tensor implements Disposable {
   abstract h2d(data: Buffer, size?: number): void;
   abstract d2h(buf: Buffer, size?: number): void;
 
-  linear(weight: Tensor): Tensor {
-    this.validateLinear(weight);
+  linear(weight: Tensor, options: LinearOptions = {}): Tensor {
+    this.validateLinear(weight, options);
     return undefined as never;
   }
 
-  protected validateLinear(weight: Tensor): void {
-    if (this.shape.length !== 2) throw new Error(`linear: input must be 2D, got shape [${this.shape}]`);
+  protected validateLinear(weight: Tensor, options: LinearOptions = {}): void {
+    if (weight.workspace.ops !== this.workspace.ops || weight.pinned || this.pinned) throw new Error("linear: matrices must belong to the same device backend");
+    const groups = options.groups ?? 1;
+    if (!Number.isSafeInteger(groups) || groups < 1 || weight.shape[0] % groups) throw new Error("linear: invalid groups");
+    if (this.shape.length !== 2 && groups === 1) throw new Error(`linear: input must be 2D, got shape [${this.shape}]`);
     if (weight.shape.length !== 2) throw new Error(`linear: weight must be 2D, got shape [${weight.shape}]`);
     const packed = weight.type === "U8_NVFP4" || weight.type === "U8_MXFP4";
     const weightK = packed ? weight.shape[1] * 2 : weight.shape[1]; // FP4: packed K/2
-    if (this.shape[1] !== weightK) throw new Error(`linear: input dim ${this.shape[1]} != weight dim ${weightK} (weight type ${weight.type}, shape [${weight.shape}])`);
+    if (this.numElements !== this.shape[0] * groups * weightK) throw new Error(`linear: input dimensions [${this.shape}] incompatible with weight [${weight.shape}] and groups=${groups}`);
+    if (options.outputType && options.outputType !== "BF16" && options.outputType !== "F32") throw new Error("linear: unsupported output type");
+    if (this.type !== "BF16" || (options.outputType === "F32" && weight.type !== "BF16")) throw new Error("linear: F32 output requires BF16 matrices");
+    if (groups > 1 && weight.type !== "F8_E4M3") throw new Error("linear: grouped projection requires FP8 weights");
     if (weight.type !== "BF16" && weight.type !== "F8_E4M3" && !packed) throw new Error(`linear: weight type must be BF16, F8_E4M3, U8_NVFP4, or U8_MXFP4, got ${weight.type}`);
     if (weight.type === "U8_MXFP4") throw new Error("linear: MXFP4 execution is not implemented");
+  }
+
+  /** Resolve checkpoint-associated scales, including views of named weights. */
+  quantizationScales(): Tensor {
+    const weight = this.name ? this : this.view;
+    const name = weight?.name;
+    const scales = name && ((name.endsWith(".weight") ? weight!.workspace.tensors.get(name.replace(/\.weight$/, ".scale")) : undefined)
+      ?? weight!.workspace.tensors.get(name + "_scale_inv")
+      ?? weight!.workspace.tensors.get(name + "_weight_scale"));
+    if (!scales) throw new Error(`Missing quantization scales for ${name ?? "unnamed weight"}`);
+    return scales;
   }
 
   protected validateGroupedLinear(weights: readonly Tensor[]): void {
@@ -447,18 +480,32 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  embedding(ids: Tensor): Tensor {
+  embedding(ids: Tensor, options: EmbeddingOptions = {}): Tensor {
+    if (options.streams !== undefined && options.streams !== 1 && options.streams !== 4) throw new Error("embedding: unsupported stream count");
+    if (options.streams === 4 && (this.type !== "BF16" || this.shape[1] !== 5120)) throw new Error("embedding: four-stream kernel requires BF16 width 5120");
     if (this.shape.length !== 2) {
       throw new Error(`embedding: table must be 2D, got [${this.shape}]`);
     }
     if (ids.type !== "I32") throw new Error(`embedding: ids must be I32, got ${ids.type}`);
-    if (ids.shape.length !== 1) {
+    if (ids.shape.length !== 1 && !(this.type === "F8_E4M3" && ids.shape.length === 2)) {
       throw new Error(`embedding: ids must be 1D, got [${ids.shape}]`);
     }
     return undefined as never;
   }
 
-  siluAndMul(up: Tensor): Tensor {
+  toType(type: "BF16"): Tensor {
+    if (this.type === type) return this.viewClone();
+    throw new Error(`Unsupported conversion ${this.type} to ${type}`);
+  }
+
+  dsv41Rope(positions: Tensor, compressed: boolean, inverse = false, dim = 512, ratio = 0): Tensor { throw new Error("V4.1 rotary requires CUDA"); }
+  dsv41Collapse(pre: Tensor): Tensor { throw new Error("V4.1 collapse requires CUDA"); }
+  dsv41MhcPre(fn: Tensor, base: Tensor, scale: Tensor, previousPre?: Tensor, normEps = 1e-20, hcEps = 1e-6, iters = 20): { input: Tensor; pre: Tensor; post: Tensor; comb: Tensor } { throw new Error("V4.1 mHC requires CUDA"); }
+  dsv41Compress(positions: Tensor, cu: Tensor, weight: Tensor, ratio: 1 | 2, pending?: Tensor, pendingPosition?: Tensor, eps = 1e-20): { latent: Tensor; valid: Tensor } { throw new Error("V4.1 compression requires CUDA"); }
+  dsv41EngramGate(kv: Tensor, qw: Tensor, kw: Tensor, eps = 1e-20): Tensor { throw new Error("Engram gate requires CUDA"); }
+
+  siluAndMul(up: Tensor, limit?: number): Tensor {
+    if (limit !== undefined && (limit !== 10 || this.type !== "BF16")) throw new Error("siluAndMul: supported clipped variant uses BF16 and limit=10");
     if (this.shape.length !== 2) {
       throw new Error(`siluAndMul: gate must be 2D, got [${this.shape}]`);
     }
@@ -469,12 +516,12 @@ export abstract class Tensor implements Disposable {
     return undefined as never;
   }
 
-  swiGluMlp(weights: { gate: Tensor, up: Tensor, down: Tensor }): Tensor {
+  swiGluMlp(weights: { gate: Tensor, up: Tensor, down: Tensor }, activationLimit?: number): Tensor {
     using upStream = this.workspace.ops.withStream(() => this.linear(weights.up));
     using upBuf = upStream.result;
     using gateBuf = this.linear(weights.gate);
     upStream.streamWaitEvent();
-    using siluBuf = gateBuf.siluAndMul(upBuf);
+    using siluBuf = gateBuf.siluAndMul(upBuf, activationLimit);
     return siluBuf.linear(weights.down);
   }
 
@@ -483,7 +530,7 @@ export abstract class Tensor implements Disposable {
    *  Gate/up use topK routing; down uses topK=1 (each token-expert pair is independent).
    *  Implementations should overlap gate and up on separate streams. */
   swiGluMlpMoe(
-    weights: { gate: Tensor[], up: Tensor[], down: Tensor[] },
+    weights: { gate: Tensor[], up: Tensor[], down: Tensor[], activationLimit?: number },
     topkIndicesFlat: Tensor,
     topK: number, count: number,
     moeIntermediate: number, hs: number,
@@ -503,6 +550,10 @@ export abstract class Tensor implements Disposable {
     inputs: {
       gate: Tensor[], up: Tensor[], down: Tensor[],
       normalizedWeightsStream: MoeRoutingWeightsStream,
+      activationLimit?: number,
+      outputType?: "BF16" | "F32",
+      /** Optional BF16 shared-expert output, combined with local routed outputs. */
+      shared?: Tensor,
     },
     topkIndicesFlat: Tensor,
     topK: number, count: number,
@@ -670,6 +721,13 @@ export abstract class Tensor implements Disposable {
   }
 
   protected validateMoeRoute(options: MoeRoutingOptions): void {
+    if (options.scoring === "sqrt_softplus") {
+      const bias = options.correctionBias;
+      if (this.type !== "F32" || this.shape.length !== 2 || this.shape[1] !== 384 || !bias || bias.type !== "F32"
+        || bias.shape.length !== 1 || bias.numElements !== 384 || options.numExpertsPerToken !== 6
+        || options.scalingFactor !== 1.5 || !options.normalize) throw new Error("moeRoute: unsupported sqrt-softplus geometry/options");
+      return;
+    }
     if (this.type !== "BF16" || this.shape.length !== 2) {
       throw new Error("moeRoute: expected BF16 logits [rows, experts]");
     }
@@ -687,6 +745,7 @@ export abstract class Tensor implements Disposable {
   /** Sigmoid routing: biased expert selection, unbiased normalized weights. */
   moeRoute(options: MoeRoutingOptions): MoeRoutingResult {
     this.validateMoeRoute(options);
+    if (options.scoring === "sqrt_softplus") throw new Error("sqrt-softplus routing requires a backend implementation");
     const [rows, experts] = this.shape;
     const topK = options.numExpertsPerToken;
     using sigmoid = this.sigmoid();

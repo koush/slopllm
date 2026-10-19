@@ -91,6 +91,9 @@ export class CaptureManager implements Disposable, ExecutionManager {
             return;
         }
         if (workspace.tracked.size) {
+            for (const tensor of workspace.tracked) {
+                console.error("Tracked tensor at capture entry", tensor.id, tensor.shape, tensor.type, tensor.stack);
+            }
             throw new Error("Cannot capture a workspace that has tracked tensors: " + workspace.tracked.size);
         }
         capturedWorkspaces.add(workspace);

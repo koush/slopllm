@@ -1,4 +1,5 @@
 import { CaptureManager } from "./capture-manager";
+import type { Dsv4CacheSelection } from "./device_ops";
 import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type MemcpyBatchEntry, type MlaQuery, type StreamResult } from "./device_ops";
 import { MemcpyKind } from "./enums";
 import { ExecutionState } from "./execution-workspace";
@@ -6,7 +7,7 @@ import { bf16BytesToF32, f32ToBf16Bytes, GlmOps, GlmTensor, INDEXER_FP8_MMA_DISA
 import type { HeapKey } from "./heap";
 import { getNativeAddon } from "./native-addon";
 import { SafeTensorFile } from "./safetensors";
-import { Tensor, type MoeRoutingOptions, type MoeRoutingResult } from "./tensor";
+import { Tensor, type EmbeddingOptions, type LinearOptions, type MoeRoutingOptions, type MoeRoutingResult } from "./tensor";
 import { UsingHolder } from "./using-holder";
 import { WorkspaceBase } from "./workspace";
 import { validateCsfScaleDecode, type MhcPreResult } from "./device_ops";
@@ -721,9 +722,101 @@ export class ParallelTensor extends Tensor {
     throw new Error(`ParallelTensor.d2h: unsupported parallelism ${this.parallelism}`);
   }
 
-  override linear(weight: Tensor): Tensor {
-    super.linear(weight);
+  private requireDsv4Replicated(...tensors: (Tensor | undefined)[]): void {
+    for (const t of tensors) if (t) this.assertParallel("DSV4", this.cast(t), TensorParallelism.Replicated);
+  }
+
+  dsv41Rope(positions: Tensor, compressed: boolean, inverse = false, dim = 512, ratio = 0): Tensor {
+    this.requireDsv4Replicated(positions);
+    this.assertParallel("DSV4 rotary input", this, TensorParallelism.Row, TensorParallelism.Replicated);
+    const shards = this.shards.map((x, r) => x.dsv41Rope(this.cast(positions).shards[r], compressed, inverse, dim, ratio));
+    return this.parallelOps.wrapShards(this.workspace, shards, this.shape, "BF16", this.parallelism);
+  }
+
+  dsv41Collapse(pre: Tensor): Tensor {
+    this.requireDsv4Replicated(this, pre);
+    const shards = this.shards.map((x, r) => x.dsv41Collapse(this.cast(pre).shards[r]));
+    return this.parallelOps.wrapShards(this.workspace, shards, [this.shape[0], this.shape[2]], "BF16", TensorParallelism.Replicated);
+  }
+
+  dsv41MhcPre(fn: Tensor, base: Tensor, scale: Tensor, previousPre?: Tensor, normEps = 1e-20, hcEps = 1e-6, iters = 20): { input: Tensor; pre: Tensor; post: Tensor; comb: Tensor } {
+    this.requireDsv4Replicated(this, fn, base, scale, previousPre);
+    const result = this.shards.map((x, r) => x.dsv41MhcPre(this.cast(fn).shards[r], this.cast(base).shards[r], this.cast(scale).shards[r], previousPre ? this.cast(previousPre).shards[r] : undefined, normEps, hcEps, iters));
+    const wrap = (shards: Tensor[], shape: number[], type: string) => this.parallelOps.wrapShards(this.workspace, shards, shape, type, TensorParallelism.Replicated);
+    return { input: wrap(result.map(r => r.input), [this.shape[0], this.shape[2]], "BF16"), pre: wrap(result.map(r => r.pre), [this.shape[0], 4], "F32"),
+      post: wrap(result.map(r => r.post), [this.shape[0], 4], "F32"), comb: wrap(result.map(r => r.comb), [this.shape[0], 4, 4], "F32") };
+  }
+
+  dsv41Compress(positions: Tensor, cu: Tensor, weight: Tensor, ratio: 1 | 2, pending?: Tensor, pendingPosition?: Tensor, eps = 1e-20): { latent: Tensor; valid: Tensor } {
+    this.requireDsv4Replicated(this, positions, cu, weight, pending, pendingPosition);
+    const result = this.shards.map((x, r) => x.dsv41Compress(this.cast(positions).shards[r], this.cast(cu).shards[r], this.cast(weight).shards[r], ratio,
+      pending ? this.cast(pending).shards[r] : undefined, pendingPosition ? this.cast(pendingPosition).shards[r] : undefined, eps));
+    return { latent: this.parallelOps.wrapShards(this.workspace, result.map(r => r.latent), [this.shape[0], 512], "BF16", TensorParallelism.Replicated),
+      valid: this.parallelOps.wrapShards(this.workspace, result.map(r => r.valid), [this.shape[0]], "I32", TensorParallelism.Replicated) };
+  }
+
+  private quantizedEmbedding(ids: Tensor, originalRows: number, rowStart: number): Tensor {
+    const scales = this.quantizationScales();
+    if (this.parallelism !== TensorParallelism.Column || scales.parallelism !== TensorParallelism.Column
+      || ids.parallelism !== TensorParallelism.Replicated || originalRows > this.shape[0]) {
+      throw new Error("Engram lookup requires column-sharded tables and replicated IDs/output");
+    }
+    const shards = this.shards.map((t, r) => t.embedding(this.cast(ids).shards[r], { originalRows, rowStart: rowStart + r * t.shape[0] }));
+    const out = this.parallelOps.wrapShards(ids.workspace, shards, [ids.shape[0], (ids.shape[1] ?? 1) * 256], "BF16", TensorParallelism.PartialSum);
+    out.allReduce();
+    return out;
+  }
+
+  dsv41EngramGate(kv: Tensor, qw: Tensor, kw: Tensor, eps = 1e-20): Tensor {
+    this.requireDsv4Replicated(this, qw, kw);
+    this.assertParallel("Engram KV", this.cast(kv), TensorParallelism.Row, TensorParallelism.Replicated);
+    using fullKv = kv.replicate();
+    const shards = this.shards.map((x, r) => x.dsv41EngramGate(this.cast(fullKv).shards[r], this.cast(qw).shards[r], this.cast(kw).shards[r], eps));
+    return this.parallelOps.wrapShards(this.workspace, shards, this.shape, "BF16", TensorParallelism.Replicated);
+  }
+
+  // Preserve the scale pairing when communication produces unnamed weight tensors.
+  override linear(weight: Tensor, options: LinearOptions = {}, resolvedScales?: Tensor): Tensor {
+    super.linear(weight, options);
     const pWeight = weight as ParallelTensor;
+    const scales = weight.type === "F8_E4M3" ? (resolvedScales ?? weight.quantizationScales()) as ParallelTensor : undefined;
+    if (scales?.type === "F8_E8M0") {
+      const TP = TensorParallelism, xp = this.parallelism, wp = weight.parallelism, groups = options.groups ?? 1;
+      let outputLayout: TensorParallelism, localGroups = groups;
+      if (groups > 1) {
+        if (wp !== TP.Column || xp !== TP.Row || groups % this.worldSize) throw new Error("Grouped FP8 requires whole column-sharded groups and feature-sharded input");
+        localGroups /= this.worldSize;
+        outputLayout = TP.Row;
+      } else {
+        if (wp === TP.Row && xp !== TP.Row) {
+          using w = weight.replicate(); using s = scales.replicate();
+          return this.linear(w, options, s);
+        }
+        if (xp === TP.Row && wp !== TP.Row || wp === TP.Column && (xp === TP.Column || xp === TP.PartialSum)) {
+          using x = this.replicate();
+          return (x as ParallelTensor).linear(weight, options, scales);
+        }
+        const layout = wp === TP.Column && xp === TP.Replicated ? TP.Row
+          : wp === TP.Row && xp === TP.Row ? TP.PartialSum : wp === TP.Replicated ? xp : undefined;
+        if (layout === undefined) throw new Error(`Unsupported FP8 layouts W=${wp}, X=${xp}`);
+        outputLayout = layout;
+      }
+      if (scales.parallelism !== wp || scales.workspace.ops !== this.parallelOps
+        || scales.shape.length !== 2 || scales.shape[0] !== Math.ceil(weight.shape[0] / 32)
+        || scales.shape[1] !== Math.ceil(weight.shape[1] / 32)) throw new Error("Invalid FP8 weight scales/layout");
+      const localWeight = pWeight.shards[0];
+      if ((wp === TP.Column && localWeight.shape[0] % 32) || (wp === TP.Row && localWeight.shape[1] % 32)) {
+        throw new Error("FP8 shards must preserve 32x32 scale blocks");
+      }
+      const results = this.shards.map((x, r) => {
+        // A grouped projection may have only one feature group on this GPU.
+        using input = x.reshape([x.shape[0], x.numElements / x.shape[0]]);
+        return (input as GlmTensor).linear(pWeight.shards[r], { ...options, groups: localGroups }, scales.shards[r]);
+      });
+      return this.parallelOps.wrapShards(this.workspace, results, [this.shape[0], weight.shape[0]], "BF16", outputLayout);
+    }
+    if ((options.groups ?? 1) !== 1) throw new Error("Grouped linear requires E8M0-scaled FP8 weights");
+    const outputType = options.outputType ?? this.type;
     const batch = this.shape[0];
     const n = weight.shape[0];
     const WP = pWeight.parallelism;
@@ -735,28 +828,28 @@ export class ParallelTensor extends Tensor {
     if (WP === TensorParallelism.Column && XP === TensorParallelism.Replicated) {
       const shards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
-        shards.push(this.shards[i].linear(pWeight.shards[i]));
+        shards.push(this.shards[i].linear(pWeight.shards[i], options));
       }
-      return this.parallelOps.wrapShards(this.workspace, shards, [batch, n], this.type, TensorParallelism.Row);
+      return this.parallelOps.wrapShards(this.workspace, shards, [batch, n], outputType, TensorParallelism.Row);
     }
 
     // Row weight + Row input → PartialSum output
     if (WP === TensorParallelism.Row && XP === TensorParallelism.Row) {
       const shards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
-        shards.push(this.shards[i].linear(pWeight.shards[i]));
+        shards.push(this.shards[i].linear(pWeight.shards[i], options));
       }
-      return this.parallelOps.wrapShards(this.workspace, shards, [batch, n], this.type, TensorParallelism.PartialSum);
+      return this.parallelOps.wrapShards(this.workspace, shards, [batch, n], outputType, TensorParallelism.PartialSum);
     }
 
     // Replicated weight + Replicated input → Replicated output
     if (WP === TensorParallelism.Replicated && XP === TensorParallelism.Replicated) {
       const W = this.worldSize;
-      if (n % W === 0 && batch <= W && pWeight.numElements > 1048576) {
+      if (outputType !== "F32" && n % W === 0 && batch <= W && pWeight.numElements > 1048576) {
         // these weights are better as column parallel for decode but replicated for prefill
         using narrowed = this.parallelOps.tryNarrowLinearCandidate(pWeight, batch);
         if (narrowed) {
-          return this.linear(narrowed);
+          return this.linear(narrowed, options);
         }
         // mlp.gate.weight ended up being slightly slower, and while it does overlap with shared, its still on the critical path.
         if (!pWeight.name?.includes(".mlp.gate.weight")) {
@@ -765,36 +858,36 @@ export class ParallelTensor extends Tensor {
       }
       const shards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
-        shards.push(this.shards[i].linear(pWeight.shards[i]));
+        shards.push(this.shards[i].linear(pWeight.shards[i], options));
       }
-      return this.parallelOps.wrapShards(this.workspace, shards, [batch, n], this.type, TensorParallelism.Replicated);
+      return this.parallelOps.wrapShards(this.workspace, shards, [batch, n], outputType, TensorParallelism.Replicated);
     }
 
     // Replicated weight + Column input → Column output
     if (WP === TensorParallelism.Replicated && XP === TensorParallelism.Column) {
       const shards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
-        shards.push(this.shards[i].linear(pWeight.shards[i]));
+        shards.push(this.shards[i].linear(pWeight.shards[i], options));
       }
-      return this.parallelOps.wrapShards(this.workspace, shards, [batch, n], this.type, TensorParallelism.Column);
+      return this.parallelOps.wrapShards(this.workspace, shards, [batch, n], outputType, TensorParallelism.Column);
     }
 
     // Replicated weight + PartialSum input → PartialSum output (distributivity: Σ(P_i @ W) = (Σ P_i) @ W)
     if (WP === TensorParallelism.Replicated && XP === TensorParallelism.PartialSum) {
       const shards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
-        shards.push(this.shards[i].linear(pWeight.shards[i]));
+        shards.push(this.shards[i].linear(pWeight.shards[i], options));
       }
-      return this.parallelOps.wrapShards(this.workspace, shards, [batch, n], this.type, TensorParallelism.PartialSum);
+      return this.parallelOps.wrapShards(this.workspace, shards, [batch, n], outputType, TensorParallelism.PartialSum);
     }
 
     // PartialSum weight + Replicated input → PartialSum output (distributivity: X @ (Σ W_i) = Σ(X @ W_i))
     if (WP === TensorParallelism.PartialSum && XP === TensorParallelism.Replicated) {
       const shards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
-        shards.push(this.shards[i].linear(pWeight.shards[i]));
+        shards.push(this.shards[i].linear(pWeight.shards[i], options));
       }
-      return this.parallelOps.wrapShards(this.workspace, shards, [batch, n], this.type, TensorParallelism.PartialSum);
+      return this.parallelOps.wrapShards(this.workspace, shards, [batch, n], outputType, TensorParallelism.PartialSum);
     }
 
     // --- Fallback paths (need communication) ---
@@ -802,7 +895,7 @@ export class ParallelTensor extends Tensor {
     // PartialSum input: allReduce to Replicated, then retry (hits Replicated+Column or Replicated+Replicated)
     if (XP === TensorParallelism.PartialSum) {
       this.allReduce();
-      return this.linear(weight);
+      return this.linear(weight, options);
     }
 
     // PartialSum weight with non-Replicated input: can't allReduce a persistent weight
@@ -813,19 +906,19 @@ export class ParallelTensor extends Tensor {
     // Row weight: K dimension mismatch, allGather weight to Replicated
     if (WP === TensorParallelism.Row) {
       using gathered = pWeight.allGather(this.workspace);
-      return this.linear(gathered);
+      return this.linear(gathered, options);
     }
 
     // Row input: K dimension mismatch, allGather input to Replicated
     if (XP === TensorParallelism.Row) {
       using gathered = this.allGather(this.workspace);
-      return gathered.linear(weight);
+      return gathered.linear(weight, options);
     }
 
     // Column+Column: allGather input to Replicated, then Column+Replicated → Row
     if (XP === TensorParallelism.Column && WP === TensorParallelism.Column) {
       using gathered = this.allGather(this.workspace);
-      return gathered.linear(weight);
+      return gathered.linear(weight, options);
     }
 
     throw new Error(`linear: unsupported parallelism combination W=${WP}, X=${XP}`);
@@ -1216,8 +1309,27 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(this.workspace, shards, [batch, nHeads, seqLen, headDim], this.type, TensorParallelism.Replicated);
   }
 
-  override embedding(ids: Tensor): Tensor {
-    super.embedding(ids);
+  toType(type: "BF16"): Tensor {
+    if (this.type === type) return this.viewClone();
+    // Round the logical value, not individual partial contributions. Keep the
+    // reduction in the source dtype before narrowing to BF16.
+    if (this.parallelism === TensorParallelism.PartialSum) this.allReduce();
+    const shards = this.shards.map(t => t.toType(type));
+    return this.parallelOps.wrapShards(this.workspace, shards, this.shape, type, this.parallelism);
+  }
+
+  override embedding(ids: Tensor, options: EmbeddingOptions = {}): Tensor {
+    super.embedding(ids, options);
+    if (this.type === "F8_E4M3") return this.quantizedEmbedding(ids, options.originalRows ?? this.shape[0], options.rowStart ?? 0);
+    if (options.streams === 4) {
+      this.assertParallel("Embedding IDs", this.cast(ids), TensorParallelism.Replicated);
+      this.assertParallel("Embedding weight", this, TensorParallelism.Column);
+      const shards = this.shards.map((w, r) => w.embedding(this.cast(ids).shards[r],
+        { ...options, rowStart: (options.rowStart ?? 0) + r * w.shape[0] }));
+      const out = this.parallelOps.wrapShards(ids.workspace, shards, [ids.numElements, 4, this.shape[1]], "BF16", TensorParallelism.PartialSum);
+      out.allReduce();
+      return out;
+    }
     const pIds = ids as ParallelTensor;
     this.assertParallel("embedding ids", pIds, TensorParallelism.Replicated, TensorParallelism.PartialSum);
     const hidden = this.shape[1];
@@ -1240,8 +1352,8 @@ export class ParallelTensor extends Tensor {
     return this.parallelOps.wrapShards(pIds.workspace, shards, [seqLen, hidden], this.type, TensorParallelism.Replicated);
   }
 
-  override siluAndMul(up: Tensor): Tensor {
-    super.siluAndMul(up);
+  override siluAndMul(up: Tensor, limit?: number): Tensor {
+    super.siluAndMul(up, limit);
     const pUp = up as ParallelTensor;
     const intermediate = this.shape[1];
     const batch = this.shape[0];
@@ -1257,23 +1369,23 @@ export class ParallelTensor extends Tensor {
         : intermediate;
       const shards: Tensor[] = [];
       for (let i = 0; i < this.worldSize; i++) {
-        shards.push(this.shards[i].siluAndMul(pUp.shards[i]));
+        shards.push(this.shards[i].siluAndMul(pUp.shards[i], limit));
       }
       return this.parallelOps.wrapShards(this.workspace, shards, [batch, intermediate], this.type, outPar);
     }
 
     if (this.parallelism === TensorParallelism.PartialSum) {
       this.allReduce();
-      return this.siluAndMul(up);
+      return this.siluAndMul(up, limit);
     }
     if (pUp.parallelism === TensorParallelism.PartialSum) {
       pUp.allReduce();
-      return this.siluAndMul(pUp);
+      return this.siluAndMul(pUp, limit);
     }
 
     using gatheredGate = this.allGather(this.workspace);
     using gatheredUp = pUp.allGather(pUp.workspace);
-    return gatheredGate.siluAndMul(gatheredUp);
+    return gatheredGate.siluAndMul(gatheredUp, limit);
   }
 
   arange(start: number, step: number, count: number): void {
@@ -1774,7 +1886,7 @@ export class ParallelTensor extends Tensor {
     }
     const shape = [this.shape[0], options.numExpertsPerToken];
     const indices = this.parallelOps.wrapShards(this.workspace, results.map(r => r.indices), shape, "I32", TensorParallelism.Replicated);
-    const weights = this.parallelOps.wrapShards(this.workspace, results.map(r => r.normalizedWeightsStream.result), shape, "BF16", TensorParallelism.Replicated);
+    const weights = this.parallelOps.wrapShards(this.workspace, results.map(r => r.normalizedWeightsStream.result), shape, results[0].normalizedWeightsStream.result.type, TensorParallelism.Replicated);
     return {
       indices,
       normalizedWeightsStream: {
@@ -2129,7 +2241,7 @@ export class ParallelTensor extends Tensor {
   }
 
   swiGluMlpMoe(
-    weights: { gate: Tensor[], up: Tensor[], down: Tensor[] },
+    weights: Parameters<Tensor["swiGluMlpMoe"]>[0],
     topkIndicesFlat: Tensor,
     topK: number, count: number,
     moeIntermediate: number, hs: number,
@@ -2154,6 +2266,7 @@ export class ParallelTensor extends Tensor {
     const outShards: Tensor[] = [];
     for (let i = 0; i < this.worldSize; i++) {
       const shardWeights = {
+        activationLimit: weights.activationLimit,
         gate: pGate.map(w => w.shards[i]),
         up: pUp.map(w => w.shards[i]),
         down: pDown.map(w => w.shards[i]),
@@ -2182,14 +2295,21 @@ export class ParallelTensor extends Tensor {
     const expertIds = topkIndicesFlat as ParallelTensor;
     this.assertParallel("swiGluMlpMoeReduce input", this, TensorParallelism.Replicated);
     this.assertParallel("swiGluMlpMoeReduce routing weights", routingWeights, TensorParallelism.Replicated);
+    const shared = inputs.shared as ParallelTensor | undefined;
+    if (shared) this.assertParallel("swiGluMlpMoeReduce shared output", shared, TensorParallelism.PartialSum, TensorParallelism.Replicated);
     const shardIntermediate = this.shardDim(moeIntermediate, "swiGluMlpMoeReduce moeIntermediate");
     const shards = this.shards.map((shard, i) => shard.swiGluMlpMoeReduce({
       gate: inputs.gate.map(w => (w as ParallelTensor).shards[i]),
       up: inputs.up.map(w => (w as ParallelTensor).shards[i]),
       down: inputs.down.map(w => (w as ParallelTensor).shards[i]),
       normalizedWeightsStream: routingShards[i],
+      activationLimit: inputs.activationLimit,
+      outputType: inputs.outputType,
+      // Partial shared outputs belong on every rank. A replicated shared output
+      // is included only once, just like ParallelTensor.add's PartialSum path.
+      shared: shared && (shared.parallelism === TensorParallelism.PartialSum || i === 0) ? shared.shards[i] : undefined,
     }, expertIds.shards[i], topK, count, shardIntermediate, hs, pfx));
-    return this.parallelOps.wrapShards(this.workspace, shards, [count / topK, hs], this.type, TensorParallelism.PartialSum);
+    return this.parallelOps.wrapShards(this.workspace, shards, [count / topK, hs], inputs.outputType ?? this.type, TensorParallelism.PartialSum);
   }
 
   rotaryEmbedding(positionIds: Tensor, batch: number, seqLen: number): { cos: Tensor, sin: Tensor } {
@@ -2360,6 +2480,67 @@ interface CommunicationPool {
 }
 
 export class ParallelOps implements DeviceOps {
+  private local(tensor: Tensor, rank: number): Tensor { return this.cast(tensor).shards[rank]; }
+  private optionalLocal(tensor: Tensor | undefined, rank: number): Tensor | undefined {
+    return tensor ? this.local(tensor, rank) : undefined;
+  }
+  private requireDsv4Replicated(...tensors: (Tensor | undefined)[]): void {
+    for (const t of tensors) if (t) this.assertParallel("DSV4", this.cast(t), TensorParallelism.Replicated);
+  }
+  dsv41Hash(tokens: Tensor, lookback: Tensor, map: Tensor, primes: Tensor, offsets: Tensor, qoIndptr?: Tensor): Tensor {
+    this.requireDsv4Replicated(tokens, lookback, map, primes, offsets, qoIndptr);
+    const shards = this.devices.map((ops, r) => ops.dsv41Hash(this.local(tokens, r), this.local(lookback, r), this.local(map, r), this.local(primes, r), this.local(offsets, r), this.optionalLocal(qoIndptr, r)));
+    return this.wrapShards(tokens.workspace, shards, [2, tokens.numElements, 24], "I32", TensorParallelism.Replicated);
+  }
+  dsv41IndexQuantize(output: Tensor, input: Tensor, positions: Tensor): void {
+    this.requireDsv4Replicated(positions);
+    this.assertParallel("Indexer query", this.cast(input), TensorParallelism.Row, TensorParallelism.Replicated);
+    this.assertParallel("Quantized query", this.cast(output), input.parallelism);
+    this.devices.forEach((ops, r) => ops.dsv41IndexQuantize(this.local(output, r), this.local(input, r), this.local(positions, r)));
+  }
+  dsv4IndexScores(query: Tensor, keys: Tensor, weights: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, capacity: number, batchIndices?: Tensor): Tensor {
+    this.requireDsv4Replicated(keys, positions, pages, batchIndices);
+    using q = query.replicate(); using w = weights.replicate();
+    const shards = this.devices.map((ops, r) => ops.dsv4IndexScores(this.local(q, r), this.local(keys, r), this.local(w, r), this.local(positions, r), this.local(pages, r), ratio, capacity, this.optionalLocal(batchIndices, r)));
+    return this.wrapShards(query.workspace, shards, [positions.numElements, capacity], "F32", TensorParallelism.Replicated);
+  }
+  dsv41Candidates(scores: Tensor, positions: Tensor): Tensor {
+    this.requireDsv4Replicated(scores, positions);
+    const shards = this.devices.map((ops, r) => ops.dsv41Candidates(this.local(scores, r), this.local(positions, r)));
+    return this.wrapShards(scores.workspace, shards, [scores.shape[0], Math.ceil(scores.shape[1] / 8)], "I32", TensorParallelism.Replicated);
+  }
+  dsv41Select(scores: Tensor, positions: Tensor, ratio: number, candidates?: Tensor): Tensor {
+    this.requireDsv4Replicated(scores, positions, candidates);
+    const shards = this.devices.map((ops, r) => ops.dsv41Select(this.local(scores, r), this.local(positions, r), ratio, this.optionalLocal(candidates, r)));
+    return this.wrapShards(scores.workspace, shards, [scores.shape[0], 512], "I32", TensorParallelism.Replicated);
+  }
+  dsv4LocalSlots(positions: Tensor, pages: Tensor, batchIndices?: Tensor): Tensor {
+    this.requireDsv4Replicated(positions, pages, batchIndices);
+    const shards = this.devices.map((ops, r) => ops.dsv4LocalSlots(this.local(positions, r), this.local(pages, r), this.optionalLocal(batchIndices, r)));
+    return this.wrapShards(positions.workspace, shards, [positions.numElements, 128], "I32", TensorParallelism.Replicated);
+  }
+  dsv4TopkToSlots(selected: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, batchIndices?: Tensor): Tensor {
+    this.requireDsv4Replicated(selected, positions, pages, batchIndices);
+    const shards = this.devices.map((ops, r) => ops.dsv4TopkToSlots(this.local(selected, r), this.local(positions, r), this.local(pages, r), ratio, this.optionalLocal(batchIndices, r)));
+    return this.wrapShards(selected.workspace, shards, selected.shape, "I32", TensorParallelism.Replicated);
+  }
+  dsv4CacheAppend(cache: Tensor, input: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2 = 1, batchIndices?: Tensor): void {
+    this.requireDsv4Replicated(cache, input, positions, pages, batchIndices);
+    this.devices.forEach((ops, r) => ops.dsv4CacheAppend(this.local(cache, r), this.local(input, r), this.local(positions, r), this.local(pages, r), ratio, this.optionalLocal(batchIndices, r)));
+  }
+  dsv4IndexAppend(cache: Tensor, input: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, batchIndices?: Tensor): void {
+    this.requireDsv4Replicated(cache, input, positions, pages, batchIndices);
+    this.devices.forEach((ops, r) => ops.dsv4IndexAppend(this.local(cache, r), this.local(input, r), this.local(positions, r), this.local(pages, r), ratio, this.optionalLocal(batchIndices, r)));
+  }
+  dsv4SparseAttention(q: Tensor, local: Dsv4CacheSelection, global?: Dsv4CacheSelection, sinks?: Tensor, mode: "auto" | "prefill" | "decode" = "auto"): { output: Tensor; lse: Tensor } {
+    this.requireDsv4Replicated(local.cache, local.indices, local.lengths, global?.cache, global?.indices, global?.lengths);
+    this.assertParallel("DSV4 query", this.cast(q), TensorParallelism.Row, TensorParallelism.Replicated);
+    if (sinks) this.assertParallel("DSV4 sinks", this.cast(sinks), q.parallelism === TensorParallelism.Row ? TensorParallelism.Column : TensorParallelism.Replicated);
+    const selection = (s: Dsv4CacheSelection, r: number): Dsv4CacheSelection => ({ cache: this.local(s.cache, r), indices: this.local(s.indices, r), lengths: this.optionalLocal(s.lengths, r) });
+    const result = this.devices.map((ops, r) => ops.dsv4SparseAttention(this.local(q, r), selection(local, r), global ? selection(global, r) : undefined, this.optionalLocal(sinks, r), mode));
+    return { output: this.wrapShards(q.workspace, result.map(r => r.output), q.shape, "BF16", q.parallelism),
+      lse: this.wrapShards(q.workspace, result.map(r => r.lse), q.shape.slice(0, 2), "F32", q.parallelism) };
+  }
   kdaScan(query: Tensor, state: Tensor, key: Tensor, value: Tensor, forget: Tensor, beta: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, lowerBound = -5): Tensor {
     validateKdaScan(this, query, state, key, value, forget, beta, aLog, dtBias, cuSeqlens, lowerBound);
     const [q, s, k, v, f, b, a, dt, cu] = [query, state, key, value, forget, beta, aLog, dtBias, cuSeqlens].map(t => this.cast(t));

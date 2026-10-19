@@ -181,7 +181,7 @@ class GlmOps:
         self.lib.glm_linear.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_void_p, ctypes.c_size_t
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_bool
         ]
 
         self.lib.glm_layernorm.restype = None
@@ -922,6 +922,7 @@ class GlmOps:
             ctypes.c_int,
             ctypes.c_int, ctypes.c_int,
             ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_bool, ctypes.c_void_p,
         ]
 
         self.lib.glm_mma_moe_workspace_size.restype = ctypes.c_size_t
@@ -1028,7 +1029,7 @@ class GlmOps:
             intermediate, batch
         )
 
-    def linear(self, output, input, weight, batch, n, k):
+    def linear(self, output, input, weight, batch, n, k, output_f32=False):
         workspace_size = 2 * 1024 * 1024 if batch >= 3 else 0
         if workspace_size and self._linear_workspace is None:
             self._linear_workspace = self.alloc(workspace_size)
@@ -1039,7 +1040,7 @@ class GlmOps:
             self._ptr(weight),
             batch, n, k,
             ctypes.c_void_p(self._linear_workspace) if self._linear_workspace else ctypes.c_void_p(0),
-            workspace_size
+            workspace_size, output_f32
         )
 
     def embedding(self, output, table, ids, hidden, seq_len):
@@ -2067,14 +2068,15 @@ class GlmOps:
             ctypes.c_void_p(weight_ptrs), ctypes.c_void_p(scale_ptrs), ctypes.c_void_p(scale2_ptrs),
             self._ptr(expert_ids), self._ptr(routing_weights), num_rows)
 
-    def scatter_add_rows(self, out, input, scales, top_k, dim, num_rows, workspace):
+    def scatter_add_rows(self, out, input, scales, top_k, dim, num_rows, workspace,
+                         scale_type=0, output_f32=False, residual=0):
         self.lib.glm_scatter_add_rows(
             self.ctx,
             self._ptr(out),
             self._ptr(input),
             self._ptr(scales),
             top_k, dim, num_rows,
-            self._ptr(workspace)
+            self._ptr(workspace), scale_type, output_f32, self._ptr(residual)
         )
 
     def p2p_enable_peer_access(self, peer_device):

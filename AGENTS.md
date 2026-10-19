@@ -230,7 +230,7 @@ npx tsx --test tests/test_parallel.ts  # multi-GPU
 
 Executor CUDA contexts, streams, cuBLAS handles, NCCL communicators, graphs, and workspaces are process-local and are released by process teardown. The loader remains the sole owner of the exported arena allocations. For custom direct-P2P collectives, each executor GPU context opens every owner's arena handle and translates tensor pointers through the resulting per-reader/per-owner base table; process-local P2P metadata pointers do not require translation. NCCL collectives remain available as fallback.
 
-The loader supports non-FP8 Qwen3, the GLM backend (including the default GLM-5.3 checkpoint), and GLM-5.3-Flash. It requires `--arena <GiB>` and rejects Qwen3.5 and FP8 checkpoints based on checkpoint metadata.
+The loader supports non-FP8 Qwen3, the GLM backend (including the default GLM-5.3 checkpoint), GLM-5.3-Flash, and DeepSeek V4.1 text weights. DeepSeek V4.1 uses model-owned batched forward execution, ordinary paged KV storage and captured decode through the standard chat interfaces; see `DEEPSEEK-V41-SCOPE.md` for numerical contracts and limitations. Independent numerical expectations for production-kernel tests live in `tests/deepseek_v41_oracles.ts`. Graph executables are explicitly uploaded before first launch to avoid an observed multi-GPU launch stall. The loader requires `--arena <GiB>` and rejects Qwen3.5 and FP8 checkpoints other than the explicitly supported DeepSeek V4.1 format.
 
 ## Start the Loader
 

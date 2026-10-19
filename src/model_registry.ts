@@ -5,6 +5,7 @@ import { resolveCheckpointConfigDir } from "./checkpoint_source";
 import type { DeviceOps } from "./device_ops";
 import { Glm51Model } from "./glm51_model";
 import { Glm53FlashModel } from "./glm53_flash_model";
+import { DeepseekV41Model } from "./deepseek_v41_model";
 import { Qwen3Model } from "./qwen3_model";
 import { Qwen35Model } from "./qwen35_model";
 
@@ -22,6 +23,10 @@ export interface ModelRegistration {
 }
 
 export const modelRegistry = {
+  deepseek_v41: {
+    phasedPrefill: false, contextParallel: false, mtp: false, persistentLoader: true,
+    load: (ops, dir) => DeepseekV41Model.fromPretrained(ops, dir),
+  },
   glm_moe_dsa: {
     phasedPrefill: true, contextParallel: true, mtp: true, persistentLoader: true,
     load: (ops, dir, options) => Glm51Model.fromPretrained(ops, dir, options.cp, options.mtp > 0),

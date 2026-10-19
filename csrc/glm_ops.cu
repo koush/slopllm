@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <cstring>
+#include <type_traits>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include "glm_nvfp4.cuh"
@@ -3244,22 +3245,29 @@ __global__ void __launch_bounds__(256) scatter_add_rows_kernel(
     out[idx] = __float2bfloat16(accum);
 }
 
+template <typename Output, typename Scale>
 __global__ void __launch_bounds__(256, 4) scatter_add_rows_batched_kernel(
-    __nv_bfloat16* out,
+    Output* out,
     const __nv_bfloat16* input,
-    const __nv_bfloat16* scales,
-    int top_k, int dim, int num_rows) {
+    const Scale* scales,
+    int top_k, int dim, int num_rows, const __nv_bfloat16* residual = nullptr) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = num_rows * dim;
     if (idx >= total) return;
     int row = idx / dim;
     int d = idx % dim;
-    float accum = 0.0f;
+    float accum = residual ? __bfloat162float(residual[idx]) : 0.0f;
     int base = row * top_k;
     for (int j = 0; j < top_k; j++) {
-        accum += __bfloat162float(scales[base + j]) * __bfloat162float(input[(size_t)(base + j) * dim + d]);
+        const float value = __bfloat162float(input[(size_t)(base + j) * dim + d]);
+        if constexpr (std::is_same_v<Scale, double>) {
+            accum = float(__dadd_rn(double(accum), __dmul_rn(scales[base + j], double(value))));
+        } else {
+            accum += float(scales[base + j]) * value;
+        }
     }
-    out[idx] = __float2bfloat16(accum);
+    if constexpr (std::is_same_v<Output, float>) out[idx] = accum;
+    else out[idx] = __float2bfloat16(accum);
 }
 
 // Four independent output channels per thread provide ILP without changing
@@ -3335,10 +3343,29 @@ extern "C" {
 
 void glm_scatter_add_rows(GlmCtx* ctx, void* out, const void* input,
                             const void* scales, int top_k,
-                            int dim, int num_rows, void* workspace) {
+                            int dim, int num_rows, void* workspace,
+                            int scale_type, bool output_f32, const void* residual) {
     cudaSetDevice(ctx->device_id);
     (void)workspace;
     int block_size = 256;
+    if (output_f32 || scale_type != 0 || residual) {
+        const int grid = (num_rows * dim + block_size - 1) / block_size;
+        #define SCATTER_TYPED(Out, Scale) \
+            scatter_add_rows_batched_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>( \
+                (Out*)out, (const __nv_bfloat16*)input, (const Scale*)scales, \
+                top_k, dim, num_rows, (const __nv_bfloat16*)residual)
+        if (output_f32) {
+            if (scale_type == 2) { SCATTER_TYPED(float, double); }
+            else if (scale_type == 1) { SCATTER_TYPED(float, float); }
+            else { SCATTER_TYPED(float, __nv_bfloat16); }
+        } else {
+            if (scale_type == 2) { SCATTER_TYPED(__nv_bfloat16, double); }
+            else if (scale_type == 1) { SCATTER_TYPED(__nv_bfloat16, float); }
+            else { SCATTER_TYPED(__nv_bfloat16, __nv_bfloat16); }
+        }
+        #undef SCATTER_TYPED
+        return;
+    }
     if (num_rows == 1) {
         int grid = (dim + block_size - 1) / block_size;
         scatter_add_rows_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(

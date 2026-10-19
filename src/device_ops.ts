@@ -101,7 +101,24 @@ export function validateCsfScaleDecode(output: Tensor, fixed: Tensor, exceptions
   }
 }
 
+export interface Dsv4CacheSelection {
+  /** U8 [pages,64,584], physical token indices, and optional per-query lengths. */
+  cache: Tensor;
+  indices: Tensor;
+  lengths?: Tensor;
+}
+
 export interface DeviceOps extends Disposable {
+  dsv41Hash(tokens: Tensor, lookback: Tensor, map: Tensor, primes: Tensor, offsets: Tensor, qoIndptr?: Tensor): Tensor;
+  dsv41IndexQuantize(output: Tensor, input: Tensor, positions: Tensor): void;
+  dsv4IndexScores(query: Tensor, keys: Tensor, weights: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, capacity: number, batchIndices?: Tensor): Tensor;
+  dsv41Candidates(scores: Tensor, positions: Tensor): Tensor;
+  dsv41Select(scores: Tensor, positions: Tensor, ratio: number, candidates?: Tensor): Tensor;
+  dsv4LocalSlots(positions: Tensor, pages: Tensor, batchIndices?: Tensor): Tensor;
+  dsv4TopkToSlots(selected: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, batchIndices?: Tensor): Tensor;
+  dsv4CacheAppend(cache: Tensor, input: Tensor, positions: Tensor, pages: Tensor, ratio?: 1 | 2, batchIndices?: Tensor): void;
+  dsv4IndexAppend(cache: Tensor, input: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, batchIndices?: Tensor): void;
+  dsv4SparseAttention(q: Tensor, local: Dsv4CacheSelection, global?: Dsv4CacheSelection, sinks?: Tensor, mode?: "auto" | "prefill" | "decode"): { output: Tensor; lse: Tensor };
   readonly worldSize: number;
   synchronizeListeners: WeakRef<WorkspaceBase>[];
   currentStream: number;

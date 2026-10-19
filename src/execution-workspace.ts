@@ -116,7 +116,7 @@ export class ExecutionState {
     public readonly model: ChatModel,
     public readonly batchSize: number, public readonly totalTokens: number, public readonly seqLens: number[],
     public readonly isDecode: boolean, public readonly ws: ExecutionWorkspace, public readonly cache: ChatCache,
-    slot: number,
+    public readonly slot: number,
     public readonly customMask?: {
       indptr?: Tensor;
       mask?: Tensor;
@@ -168,7 +168,7 @@ export class ExecutionState {
   }
 
   computeLogits(hiddenStates: Tensor, model: ChatModel, allTokens: boolean = false): Tensor {
-    const lmHead = model.tensors.get("lm_head.weight")!;
+    const lmHead = model.outputWeight;
     if (this.isDecode) {
       return hiddenStates.linear(lmHead);
     }

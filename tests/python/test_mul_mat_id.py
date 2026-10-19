@@ -319,6 +319,25 @@ class TestMulMatId:
         torch.testing.assert_close(output_bf16.cpu().float(), ref.cpu(), atol=2e-2, rtol=2e-2)
 
 class TestScatterAddRows:
+    @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32, torch.float64])
+    @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize("with_shared", [False, True])
+    def test_scatter_add_rows_dtypes_and_shared(self, glm, device, weight_dtype, output_dtype, with_shared):
+        values = torch.tensor([2**24, 1, -2**24, .5, .25, -.75], device=device, dtype=torch.bfloat16).reshape(1, 6, 1).expand(2, 6, 64).contiguous()
+        weights = torch.ones(2, 6, device=device, dtype=weight_dtype)
+        weights[1] = torch.tensor([.25, .75, -.5, 1.5, -.25, 2.], device=device, dtype=weight_dtype)
+        shared = torch.ones(2, 64, device=device, dtype=torch.bfloat16) if with_shared else None
+        out = torch.empty(2, 64, device=device, dtype=output_dtype)
+        expected = shared.float() if with_shared else torch.zeros(2, 64, device=device)
+        for slot in range(6):
+            expected = (expected.double() + values[:, slot].double() * weights[:, slot, None].double()).float()
+        torch.cuda.synchronize(device)
+        glm.scatter_add_rows(out, values, weights, 6, 64, 2, 0,
+                             [torch.bfloat16, torch.float32, torch.float64].index(weight_dtype),
+                             output_dtype == torch.float32, shared if with_shared else 0)
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(out, expected.to(output_dtype), atol=0, rtol=0)
+
     @pytest.mark.parametrize("rows,dim,topk,input_offset,output_offset", [
         (128, 6144, 8, 0, 0),
         (129, 1028, 8, 0, 0),  # Partial final vectorized block.

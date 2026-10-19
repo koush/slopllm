@@ -69,7 +69,7 @@ void glm_silu_and_mul(GlmCtx* ctx, void* out, const void* gate,
 
 void glm_linear(GlmCtx* ctx, void* out, const void* input,
                 const void* weight, int batch, int n, int k,
-                void* workspace, size_t workspace_size);
+                void* workspace, size_t workspace_size, bool output_f32);
 
 void glm_layernorm(GlmCtx* ctx, void* out, const void* input,
                    const void* weight, const void* bias, float eps, int dim, int batch);
@@ -269,9 +269,12 @@ void glm_nvfp4_mul_mat_id_reduce(GlmCtx* ctx, void* output, const void* input,
                                 const void* const* scale2_ptrs, const int* expert_ids,
                                 const void* routing_weights, int num_rows);
 
+// BF16 input rows; scale_type: 0=BF16, 1=F32, 2=F64. FP32 accumulation,
+// optional BF16 residual, and BF16/F32 output selected by output_f32.
 void glm_scatter_add_rows(GlmCtx* ctx, void* out, const void* input,
                              const void* scales, int top_k,
-                             int dim, int num_rows, void* workspace);
+                             int dim, int num_rows, void* workspace,
+                             int scale_type, bool output_f32, const void* residual);
 
 // Rotate input IDs for MTP prefill: shifts each sequence left by 1,
 // appends new_token at the last position.
@@ -855,6 +858,46 @@ void glm_kda_scan(GlmCtx* ctx, void* out, float* state, const void* q, const voi
                   const void* v, const void* forget, const void* beta, const float* a_log,
                   const float* dt_bias, const int* cu, int heads, int batch, float lower_bound);
 void glm_kda_norm(GlmCtx* ctx, void* out, const void* x, const void* gate, const void* weight, int rows, float eps);
+bool glm_dsv4_sparse_attention(
+    GlmCtx* ctx, const void* q, const uint8_t* kv, const int32_t* indices,
+    const int32_t* lengths, const uint8_t* extra_kv, const int32_t* extra_indices,
+    const int32_t* extra_lengths, const float* sinks, void* output, float* lse,
+    void* mid_out, float* mid_lse, int tokens, int heads, int topk, int extra_topk,
+    int extra_page_size, int splits, float scale);
+
+void glm_dsv41_mhc_pre(GlmCtx* ctx, void* out, float* pre, float* post, float* comb,
+    const void* x, const float* fn, const float* base, const float* scale,
+    const float* previous_pre, int rows, int dim, float norm_eps, float hc_eps, int iters, float* partials);
+
+void glm_dsv41_rope(GlmCtx*, void*, const void*, const int32_t*, int, int, int, int, int, int);
+void glm_dsv41_swiglu(GlmCtx*, void*, const void*, const void*, int);
+void glm_dsv41_route(GlmCtx*, int32_t*, double*, const float*, const float*, int);
+void glm_dsv41_collapse(GlmCtx*, void*, const void*, const float*, int, int);
+void glm_dsv41_cache_insert(GlmCtx*, uint8_t*, const void*, const int32_t*, int, int, const int32_t*);
+void glm_dsv41_embedding(GlmCtx*, void*, const void*, const int32_t*, int, int, int);
+void glm_dsv41_hash(GlmCtx*, int32_t*, const int32_t*, const int32_t*, const int32_t*, const int32_t*, const int32_t*, int, const int32_t*, int);
+void glm_dsv41_index_quantize(GlmCtx*, float*, const void*, const int32_t*, int, int, int, const int32_t*);
+void glm_dsv41_index_scores(GlmCtx*, float*, const float*, const float*, const void*, const int32_t*, int, int, int, const int32_t*, const int32_t*, int);
+void glm_dsv41_candidates(GlmCtx*, int32_t*, const float*, const int32_t*, int, int);
+void glm_dsv41_select(GlmCtx*, int32_t*, const float*, const int32_t*, const int32_t*, int, int, int);
+void glm_dsv41_to_bf16(GlmCtx*, void*, const float*, int);
+void glm_dsv4_paged_slots(GlmCtx*, int32_t*, const int32_t*, const int32_t*, const int32_t*, int, int, int, int, const int32_t*, int);
+int glm_mxfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
+    const void* pointer_table, const int* expert_ids, int top_k, int count, int N, int K);
+int glm_fp8_linear_lt(GlmCtx* ctx, void* output, const void* input,
+    const void* weight, const void* scales, void* quantized, void* input_scales,
+    void* weight_scales, void* scratch, int m, int n, int k, int groups);
+int glm_fp8_block_linear(GlmCtx* ctx, void* output, const void* input,
+    const void* weight, const void* scales, int M, int N, int K, int block_size, int scale_kind, int groups);
+
+void glm_dsv41_engram_lookup(GlmCtx* ctx, void* out, const int32_t* ids,
+    const uint8_t* table, const uint8_t* scales, int count, int row_start, int row_end);
+void glm_dsv41_engram_gate(GlmCtx* ctx, void* out, const void* x, const void* kv,
+    const void* qw, const void* kw, int tokens, int dim, float eps);
+void glm_dsv41_compress(GlmCtx* ctx, void* out, int32_t* valid, float* state,
+    int32_t* state_position, const float* raw, const int32_t* positions, const int32_t* cu,
+    const void* weight, int batch, int ratio, float eps);
+
 void glm_mhc_pre(GlmCtx* ctx, void* out, float* post, float* comb, const void* x,
                  const void* fn, const float* base, const float* scale,
                  int rows, int dim, float norm_eps, float hc_eps, int iters);

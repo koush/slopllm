@@ -207,7 +207,7 @@ function freeResources(model: ChatModel | undefined, cache: ChatCache | undefine
   if (cleanupError) throw cleanupError;
 }
 
-async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, cache: ChatCache, args: Args, captureManager: CaptureManager): Promise<void> {
+async function runBatch(model: ChatModel, ws: ExecutionWorkspace, cache: ChatCache, args: Args, captureManager: CaptureManager): Promise<void> {
   const { prompts, inputIds } = prepareInputs(model.tokenizer, args);
   const longestPrompt = Math.max(...inputIds.map(ids => ids.length));
   if (longestPrompt + args.maxNewTokens > args.maxSeqLen) {
@@ -261,7 +261,7 @@ async function runBatch(model: Glm51Model, ws: ExecutionWorkspace, cache: ChatCa
   if (!finished.some(Boolean)) {
     const generator = args.noMtp
       ? model.generateDecode(ws, cache, captureManager)
-      : model.generateMtpDecode(ws, cache, args.mtp, captureManager);
+      : model.generateMtpDecode!(ws, cache, args.mtp, captureManager);
     for await (const step of generator) {
       const completedAt = performance.now();
       const { warmup, tokens: stepTokens, numAccepted, numDraftTokens } = step;
@@ -327,20 +327,20 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   Error.stackTraceLimit = 20;
   const args = parseArgs(argv);
   const { modelDir, modelType } = resolveModelSelection(args);
-  if (modelType !== "glm_moe_dsa") throw new Error("run_glm51_multiple_mtp requires a glm_moe_dsa checkpoint");
+  if (!args.noMtp && modelType !== "glm_moe_dsa") throw new Error("MTP requires a glm_moe_dsa checkpoint; use --no-mtp for other models");
   const { ops, gpuDevices } = createDeviceOps(args);
-  let model: Glm51Model | undefined;
+  let model: ChatModel | undefined;
   let cache: ChatCache | undefined;
   let ws: ExecutionWorkspace | undefined;
 
   try {
     const loadedModel = await loadModel(ops, args, modelDir);
-    if (!(loadedModel instanceof Glm51Model)) throw new Error("run_glm51_multiple_mtp requires a GLM-5.1 model");
+    if (!args.noMtp && !(loadedModel instanceof Glm51Model)) throw new Error("MTP requires a GLM-5.1 model");
     model = loadedModel;
     const workspaceSeqLen = args.file ? Math.min(args.maxSeqLen, PREFILL_CHUNK_SIZE + 1) : args.maxSeqLen;
     cache = model.createChatCache(args.maxPages, args.batchSize, workspaceSeqLen);
     ws = new ExecutionWorkspace(ops, args.batchSize, workspaceSeqLen);
-    console.log(`GLM-5.1 batched ${args.noMtp ? "decode" : "MTP"}: batch=${args.batchSize}, max_tokens=${args.maxNewTokens}, depth=${args.noMtp ? "off" : args.mtp}, cuda_graph=${args.noCudaGraph ? "off" : "on"}`);
+    console.log(`${modelType} batched ${args.noMtp ? "decode" : "MTP"}: batch=${args.batchSize}, max_tokens=${args.maxNewTokens}, depth=${args.noMtp ? "off" : args.mtp}, cuda_graph=${args.noCudaGraph ? "off" : "on"}`);
     using captureManager = new CaptureManager(ops);
     captureManager.disabled = args.noCudaGraph;
     for (let run = 0; run <= args.warmupRuns; run++) {

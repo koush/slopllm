@@ -363,6 +363,17 @@ void* glm_graph_instantiate(GlmCtx* ctx, void* graph) {
         fprintf(stderr, "glm_graph_instantiate failed: %s\n", cudaGetErrorString(err));
         return nullptr;
     }
+    // Prepare device-side execution state before launching any GPU's graph.
+    // Explicit upload avoids a first-launch host stall observed with large
+    // multi-GPU graphs. Upload and launch are ordered on the same stream;
+    // no host synchronization is needed. The implicit-upload stall's root
+    // cause is not yet established.
+    err = cudaGraphUpload(graph_exec, GLM_STREAM(ctx));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "glm_graph_upload failed: %s\n", cudaGetErrorString(err));
+        cudaGraphExecDestroy(graph_exec);
+        return nullptr;
+    }
     return reinterpret_cast<void*>(graph_exec);
 }
 

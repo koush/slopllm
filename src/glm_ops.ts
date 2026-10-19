@@ -1,9 +1,10 @@
 import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StreamResult, StridedMmap, TensorParallelism, type MemcpyBatchEntry } from "./device_ops";
 import { Heap, type HeapAllocation, type HeapKey } from "./heap";
+import type { Dsv4CacheSelection } from "./device_ops";
 import type { ExecutionState } from "./execution-workspace";
 import { CaptureManager } from "./capture-manager";
 import { SafeTensorFile } from "./safetensors";
-import { Tensor, type MoeRoutingOptions, type MoeRoutingResult } from "./tensor";
+import { Tensor, type EmbeddingOptions, type LinearOptions, type MoeRoutingOptions, type MoeRoutingResult } from "./tensor";
 import type { WorkspaceBase } from "./workspace";
 import { MemcpyKind } from "./enums";
 import { getNativeAddon } from "./native-addon";
@@ -171,16 +172,45 @@ export class GlmTensor extends Tensor {
     getNativeAddon().d2h(this.ops.ctx, buf, this.data, size ?? buf.length);
   }
 
-  linear(weight: Tensor): Tensor {
-    super.linear(weight);
+  // Parallel dispatch can supply scales paired with an unnamed gathered weight.
+  linear(weight: Tensor, options: LinearOptions = {}, resolvedScales?: Tensor): Tensor {
+    super.linear(weight, options);
+    const scales = weight.type === "F8_E4M3" ? resolvedScales ?? weight.quantizationScales() : undefined;
+    if (scales?.type === "F8_E8M0") {
+      const [n, k] = weight.shape, m = this.shape[0], groups = options.groups ?? 1;
+      if (scales.shape.length !== 2 || scales.shape[0] !== Math.ceil(n / 32) || scales.shape[1] !== Math.ceil(k / 32)
+        || scales.workspace.ops !== this.ops || [m, n, k].some(d => !Number.isSafeInteger(d) || d < 1)) {
+        throw new Error("Invalid local FP8 linear operands");
+      }
+      const out = this.workspace.alloc([m, n], "BF16");
+      try {
+        if (m <= 8 || k % 32 || (n / groups) % 32) {
+          getNativeAddon().fp8BlockLinear(this.ops.ctx, out.data, this.data, weight.data, scales.data, m, n, k, 32, 1, groups);
+        } else {
+          // TODO: a custom MXFP8 kernel can load compact checkpoint scales directly,
+          // avoiding this temporary scale expansion and its preparation launch.
+          const paddedK = Math.ceil(k / 128) * 128;
+          using quantized = this.workspace.alloc([m, paddedK], "F8_E4M3");
+          using inputScales = this.workspace.alloc([Math.ceil(m / 128) * 128, paddedK / 32], "F8_E8M0");
+          using weightScales = this.workspace.alloc([Math.ceil(n / groups / 128) * 128, paddedK / 32], "F8_E8M0");
+          // The tail holds a padded FP8 weight group only when K is not 128-aligned.
+          using scratch = this.workspace.allocRaw(32 * 1024 * 1024 + (paddedK === k ? 0 : n / groups * paddedK));
+          getNativeAddon().fp8LinearLt(this.ops.ctx, out.data, this.data, weight.data, scales.data,
+            quantized.data, inputScales.data, weightScales.data, scratch.data, m, n, k, groups);
+        }
+        return out;
+      } catch (error) { out[Symbol.dispose](); throw error; }
+    }
+    if (scales && (scales.type !== "BF16" || scales.shape.length !== 2 || scales.shape[0] !== Math.ceil(weight.shape[0] / 128)
+      || scales.shape[1] !== Math.ceil(weight.shape[1] / 128))) throw new Error("linear: legacy FP8 requires BF16 128x128 scales");
+    if ((options.groups ?? 1) !== 1) throw new Error("Grouped linear requires E8M0-scaled FP8 weights");
     const batch = this.shape[0];
     const n = weight.shape[0];
     let k = weight.shape[1];
     const outShape = [batch, n];
-    const out = this.workspace.alloc(outShape, this.type);
+    const out = this.workspace.alloc(outShape, options.outputType ?? this.type);
     if (weight.type === "F8_E4M3") {
-      const scale = weight.workspace.tensors.get(weight.name! + "_scale_inv")!;
-      getNativeAddon().fp8LinearDecode(this.ops.ctx, out.data, this.data, weight.data, scale.data, batch, n, k);
+      getNativeAddon().fp8LinearDecode(this.ops.ctx, out.data, this.data, weight.data, scales!.data, batch, n, k);
     } else if (weight.type === "U8_NVFP4") {
       k = k * 2; // NVFP4: weight is [N, K/2] packed, kernel expects K
       const scale = weight.workspace.tensors.get(weight.name! + "_weight_scale")!;
@@ -188,7 +218,7 @@ export class GlmTensor extends Tensor {
       getNativeAddon().nvfp4LinearDecode(this.ops.ctx, out.data, this.data, weight.data, scale.data, scale2.data, batch, n, k, 0);
     } else {
       using workspace = batch >= 3 ? this.workspace.allocRaw(CUBLASLT_WORKSPACE_BYTES) : undefined;
-      getNativeAddon().linear(this.ops.ctx, out.data, this.data, weight.data, batch, n, k, workspace?.data ?? 0, workspace?.bytes ?? 0);
+      getNativeAddon().linear(this.ops.ctx, out.data, this.data, weight.data, batch, n, k, workspace?.data ?? 0, workspace?.bytes ?? 0, out.type === "F32");
     }
     return out;
   }
@@ -270,21 +300,35 @@ export class GlmTensor extends Tensor {
     return out;
   }
 
-  embedding(ids: Tensor): Tensor {
-    super.embedding(ids);
+  embedding(ids: Tensor, options: EmbeddingOptions = {}): Tensor {
+    super.embedding(ids, options);
+    if (this.type === "F8_E4M3") return this.quantizedEmbedding(ids, options.originalRows ?? this.shape[0], options.rowStart ?? 0);
     const hidden = this.shape[1];
     const seqLen = ids.numElements;
+    if (options.streams === 4) {
+      const out = ids.workspace.alloc([seqLen, 4, hidden], "BF16");
+      getNativeAddon().dsv41Embedding(this.ops.ctx, out.data, this.data, ids.data, options.rowStart ?? 0, this.shape[0], seqLen);
+      return out;
+    }
     const out = ids.workspace.alloc([seqLen, hidden], this.type);
     getNativeAddon().indexSelect(this.ops.ctx, out.data, this.data, ids.data, hidden, seqLen, 0);
     return out;
   }
 
-  siluAndMul(up: Tensor): Tensor {
-    super.siluAndMul(up);
+  toType(type: "BF16"): Tensor {
+    if (this.type !== "F32" || type !== "BF16") return super.toType(type);
+    const output = this.workspace.alloc(this.shape, type);
+    getNativeAddon().dsv41ToBf16(this.ops.ctx, output.data, this.data, this.numElements);
+    return output;
+  }
+
+  siluAndMul(up: Tensor, limit?: number): Tensor {
+    super.siluAndMul(up, limit);
     const batch = this.shape[0];
     const intermediate = this.shape[1];
     const out = this.workspace.alloc([batch, intermediate], this.type);
-    getNativeAddon().siluAndMul(this.ops.ctx, out.data, this.data, up.data, intermediate, batch);
+    if (limit === 10) getNativeAddon().dsv41SwiGlu(this.ops.ctx, out.data, this.data, up.data, this.numElements);
+    else getNativeAddon().siluAndMul(this.ops.ctx, out.data, this.data, up.data, intermediate, batch);
     return out;
   }
 
@@ -361,7 +405,9 @@ export class GlmTensor extends Tensor {
 
   fill(value: number, n: number): void {
     super.fill(value, n);
-    getNativeAddon().fill(this.ops.ctx, this.data, value, n, this.type);
+    // Packed weights and exponent scales expose encoded byte storage to fill.
+    const type = ["U8_NVFP4", "U8_MXFP4", "F8_E8M0"].includes(this.type) ? "U8" : this.type;
+    getNativeAddon().fill(this.ops.ctx, this.data, value, n, type);
   }
 
   async mmapLoad(mmapPtr: number, offset: number, nbytes: number, strided?: StridedMmap): Promise<void> {
@@ -511,6 +557,12 @@ export class GlmTensor extends Tensor {
 
   moeRoute(options: MoeRoutingOptions): MoeRoutingResult {
     const [rows, experts] = this.shape;
+    if (options.scoring === "sqrt_softplus") {
+      this.validateMoeRoute(options);
+      const indices = this.workspace.alloc([rows, 6], "I32"), weights = this.workspace.alloc([rows, 6], "F64");
+      getNativeAddon().dsv41Route(this.ops.ctx, indices.data, weights.data, this.data, options.correctionBias!.data, rows);
+      return { indices, normalizedWeightsStream: { result: weights, streamWaitEvent() {}, [Symbol.dispose]() {} } };
+    }
     // Larger batches retain the default path's overlap with expert computation.
     if (process.env.SLOPLLM_ROUTING_FUSION === "0" || rows > 32 || experts !== 256
       || options.numExpertsPerToken !== 8 || !options.correctionBias) {
@@ -702,6 +754,27 @@ export class GlmTensor extends Tensor {
   }
 
   mulMatId(weights: Tensor[], expertIds: Tensor, topK: number, count: number, N: number, K: number, name: string): Tensor {
+    if (weights[0]?.type === "U8_MXFP4") {
+      if (this.type !== "BF16" || this.shape.length !== 2 || this.shape[0] * topK !== count || this.shape[1] !== K || K % 32
+        || !Number.isInteger(topK) || topK < 1 || expertIds.type !== "I32" || expertIds.shape.length !== 1 || expertIds.numElements !== count
+        || weights.some(w => w.type !== "U8_MXFP4" || w.shape.length !== 2 || w.shape[0] !== N || w.shape[1] * 2 !== K || w.workspace.ops !== this.ops)) {
+        throw new Error("mulMatId: invalid MXFP4 operands or routing IDs");
+      }
+      const ptrName = `__moe_mxfp4_ptrs.${name}`;
+      let table = this.workspace.tensors.get(ptrName);
+      if (!table) {
+        const pointers = weights.flatMap(w => {
+          const scale = w.quantizationScales();
+          if (scale.type !== "F8_E8M0" || scale.shape[0] !== N || scale.shape[1] !== K / 32) throw new Error("mulMatId: invalid MXFP4 scales");
+          return [w, scale];
+        });
+        table = this.workspace.alloc([pointers.length], "I64", ptrName);
+        table.writePointers(pointers);
+      }
+      const out = this.workspace.alloc([count, N], "BF16");
+      getNativeAddon().mxfp4MulMatId(this.ops.ctx, out.data, this.data, table.data, expertIds.data, topK, count, N, K);
+      return out;
+    }
     if (weights[0]?.type !== "BF16" && weights[0]?.type !== "U8_NVFP4") {
       throw new Error(`mulMatId: unsupported weight type ${weights[0]?.type}`);
     }
@@ -755,6 +828,8 @@ export class GlmTensor extends Tensor {
   ): Tensor {
     // 512 routed entries cover 64 tokens (batch 16 with four-position MTP verification).
     const fuseDown = FUSED_MOE_DOWN_REDUCE && this.type === "BF16" &&
+      inputs.activationLimit === undefined && (inputs.outputType ?? this.type) === "BF16" && !inputs.shared &&
+      inputs.normalizedWeightsStream.result.type === "BF16" &&
       inputs.down[0]?.type === "U8_NVFP4" && hs === 6144 && moeIntermediate === 256 &&
       inputs.down[0].shape[0] === hs && inputs.down[0].shape[1] === moeIntermediate / 2 &&
       topK === 8 && count > 0 && count <= 512 && count % topK === 0;
@@ -762,8 +837,15 @@ export class GlmTensor extends Tensor {
       using downOut = this.swiGluMlpMoe(inputs, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
       inputs.normalizedWeightsStream.streamWaitEvent();
       using scales = inputs.normalizedWeightsStream.result.reshape([count]);
-      const out = this.workspace.alloc([count / topK, hs], this.type);
-      getNativeAddon().scatterAddRows(this.ops.ctx, out.data, downOut.data, scales.data, topK, hs, count / topK, 0);
+      const outputType = inputs.outputType ?? this.type;
+      const scaleType = ["BF16", "F32", "F64"].indexOf(scales.type);
+      const shared = inputs.shared;
+      if (scaleType < 0 || scales.numElements !== count || !["BF16", "F32"].includes(outputType)
+        || (shared && (shared.type !== "BF16" || shared.shape.length !== 2 || shared.shape[0] !== count / topK
+          || shared.shape[1] !== hs || shared.workspace.ops !== this.ops))) throw new Error("swiGluMlpMoeReduce: invalid routing weights or shared output");
+      const out = this.workspace.alloc([count / topK, hs], outputType);
+      getNativeAddon().scatterAddRows(this.ops.ctx, out.data, downOut.data, scales.data, topK, hs, count / topK, 0,
+        scaleType, outputType === "F32", shared?.data ?? 0);
       return out;
     }
     super.swiGluMlpMoe(inputs, topkIndicesFlat, topK, count, moeIntermediate, hs, pfx);
@@ -874,7 +956,7 @@ export class GlmTensor extends Tensor {
   }
 
   swiGluMlpMoe(
-    weights: { gate: Tensor[], up: Tensor[], down: Tensor[] },
+    weights: Parameters<Tensor["swiGluMlpMoe"]>[0],
     topkIndicesFlat: Tensor,
     topK: number, count: number,
     moeIntermediate: number, hs: number,
@@ -887,7 +969,7 @@ export class GlmTensor extends Tensor {
       using upOut = this.mulMatId(weights.up, topkIndicesFlat, topK, count, moeIntermediate, hs, `${pfx}.up_proj`);
       gateOutStream.streamWaitEvent();
       using gateOut = gateOutStream.result;
-      using siluOut = gateOut.siluAndMul(upOut);
+      using siluOut = gateOut.siluAndMul(upOut, weights.activationLimit);
       return siluOut.mulMatId(weights.down, topkIndicesFlat, 1, count, hs, moeIntermediate, `${pfx}.down_proj`);
     }
 
@@ -918,7 +1000,7 @@ export class GlmTensor extends Tensor {
 
     gateStream.streamWaitEvent();
     using gateOut = gateStream.result;
-    using siluOut = gateOut.siluAndMul(upOut);
+    using siluOut = gateOut.siluAndMul(upOut, weights.activationLimit);
     using downGemmWs = this.workspace.allocRaw(getNativeAddon().mmaMoeCoopGemmWorkspaceSize(count, hs));
     const downOut = this.workspace.alloc([count, hs], this.type);
     getNativeAddon().mmaMoeCoopGemm(ctx, downPtrs.weightPtrs.data, downPtrs.scalePtrs.data, downPtrs.scale2Ptrs.data,
@@ -927,9 +1009,196 @@ export class GlmTensor extends Tensor {
     return downOut;
   }
 
+  private checkDsv41Tensors(...tensors: (Tensor | undefined)[]): void {
+    if (tensors.some(t => t && t.workspace.ops !== this.ops)) throw new Error("DSV4 tensors must belong to the same backend");
+  }
+
+  dsv41Rope(positions: Tensor, compressed: boolean, inverse = false, dim = 512, ratio = 0): Tensor {
+    const input = this;
+    this.checkDsv41Tensors(positions);
+    if (input.type !== "BF16" || positions.type !== "I32" || dim < 64 || dim % 2
+      || !positions.numElements || input.numElements % (dim * positions.numElements)) throw new Error("Invalid V4.1 rotary input");
+    const output = input.workspace.alloc(input.shape, "BF16");
+    getNativeAddon().dsv41Rope(this.ops.ctx, output.data, input.data, positions.data, input.numElements / dim,
+      dim, +compressed, +inverse, ratio, input.numElements / dim / positions.numElements);
+    return output;
+  }
+
+  dsv41Collapse(pre: Tensor): Tensor {
+    this.checkDsv41Tensors(pre);
+    if (this.type !== "BF16" || this.shape.length !== 3 || this.shape[1] !== 4 || pre.type !== "F32"
+      || pre.numElements !== this.shape[0] * 4) throw new Error("Invalid V4.1 collapse inputs");
+    const output = this.workspace.alloc([this.shape[0], this.shape[2]], "BF16");
+    getNativeAddon().dsv41Collapse(this.ops.ctx, output.data, this.data, pre.data, output.shape[1], output.shape[0]);
+    return output;
+  }
+
+
+  dsv41MhcPre(fn: Tensor, base: Tensor, scale: Tensor, previousPre?: Tensor, normEps = 1e-20, hcEps = 1e-6, iters = 20): { input: Tensor; pre: Tensor; post: Tensor; comb: Tensor } {
+    const x = this;
+    this.checkDsv41Tensors(fn, base, scale, previousPre);
+    if (x.type !== "BF16" || x.shape.length !== 3 || x.shape[1] !== 4 || x.shape[2] < 1 || !Number.isFinite(normEps)
+      || normEps <= 0 || !Number.isFinite(hcEps) || hcEps <= 0 || !Number.isSafeInteger(iters) || iters < 1) throw new Error("Invalid V4.1 mHC inputs");
+    const [rows, , dim] = x.shape;
+    for (const [t, shape] of [[fn, [24, 4 * dim]], [base, [24]], [scale, [3]], ...(previousPre ? [[previousPre, [rows, 4]]] : [])] as [Tensor, number[]][]) {
+      if (t.type !== "F32" || JSON.stringify(t.shape) !== JSON.stringify(shape)) throw new Error(`V4.1 mHC requires F32 [${shape}]`);
+    }
+    const input = x.workspace.alloc([rows, dim], "BF16"), pre = x.workspace.alloc([rows, 4], "F32");
+    const post = x.workspace.alloc([rows, 4], "F32"), comb = x.workspace.alloc([rows, 4, 4], "F32");
+    using partials = x.workspace.alloc([rows, 25, 8], "F32");
+    getNativeAddon().dsv41MhcPre(this.ops.ctx, input.data, pre.data, post.data, comb.data, x.data, fn.data, base.data, scale.data,
+      previousPre?.data ?? 0, x.shape[0], x.shape[2], normEps, hcEps, iters, partials.data);
+    return { input, pre, post, comb };
+  }
+
+  dsv41Compress(positions: Tensor, cu: Tensor, weight: Tensor, ratio: 1 | 2, pending?: Tensor, pendingPosition?: Tensor, eps = 1e-20): { latent: Tensor; valid: Tensor } {
+    const raw = this;
+    this.checkDsv41Tensors(positions, cu, weight, pending, pendingPosition);
+    if (![1, 2].includes(ratio) || raw.type !== "F32" || raw.shape.length !== 2 || raw.shape[1] !== 512 * ratio
+      || positions.type !== "I32" || positions.shape.length !== 1 || positions.numElements !== raw.shape[0]
+      || cu.type !== "I32" || cu.shape.length !== 1 || cu.numElements < 2 || weight.type !== "BF16" || weight.shape.length !== 1 || weight.numElements !== 512
+      || !Number.isFinite(eps) || eps <= 0 || (ratio === 2 && (!pending || pending.type !== "F32" || pending.shape[0] < cu.numElements - 1
+        || pending.shape[1] !== 1024 || !pendingPosition || pendingPosition.type !== "I32" || pendingPosition.numElements < cu.numElements - 1))) throw new Error("Invalid V4.1 compressor inputs/state");
+    const latent = raw.workspace.alloc([raw.shape[0], 512], "BF16"), valid = raw.workspace.alloc([raw.shape[0]], "I32");
+    getNativeAddon().dsv41Compress(this.ops.ctx, latent.data, valid.data, pending?.data ?? 0, pendingPosition?.data ?? 0,
+      raw.data, positions.data, cu.data, weight.data, cu.shape[0] - 1, ratio, eps);
+    return { latent, valid };
+  }
+
+  private quantizedEmbedding(ids: Tensor, originalRows: number, rowStart: number): Tensor {
+    const table = this, scales = this.quantizationScales();
+    this.checkDsv41Tensors(ids, scales);
+    if (ids.type !== "I32" || ![1, 2].includes(ids.shape.length) || table.type !== "F8_E4M3" || table.shape.length !== 2 || table.shape[1] !== 256
+      || scales.type !== "F8_E8M0" || scales.shape.length !== 2 || scales.shape[0] !== table.shape[0] || scales.shape[1] !== 8
+      || !Number.isSafeInteger(originalRows) || originalRows < 1) throw new Error("Invalid V4.1 Engram lookup");
+    const output = ids.workspace.alloc([ids.shape[0], (ids.shape[1] ?? 1) * 256], "BF16");
+    getNativeAddon().dsv41EngramLookup(this.ops.ctx, output.data, ids.data, table.data, scales.data,
+      ids.numElements, rowStart, Math.min(originalRows, rowStart + table.shape[0]));
+    return output;
+  }
+
+  dsv41EngramGate(kv: Tensor, qw: Tensor, kw: Tensor, eps = 1e-20): Tensor {
+    const x = this;
+    this.checkDsv41Tensors(kv, qw, kw);
+    if (x.shape.length !== 3 || x.shape[1] !== 4 || x.shape[2] < 1 || !Number.isFinite(eps) || eps <= 0) throw new Error("Invalid Engram residual/epsilon");
+    const [tokens, , dim] = x.shape;
+    for (const [t, shape] of [[x, x.shape], [kv, [tokens, 5 * dim]], [qw, [4, dim]], [kw, [4, dim]]] as [Tensor, number[]][]) {
+      if (t.type !== "BF16" || JSON.stringify(t.shape) !== JSON.stringify(shape)) throw new Error("Invalid Engram gate tensors");
+    }
+    const output = x.workspace.alloc(x.shape, "BF16");
+    getNativeAddon().dsv41EngramGate(this.ops.ctx, output.data, x.data, kv.data, qw.data, kw.data, x.shape[0], x.shape[2], eps);
+    return output;
+  }
+
 }
 
 export class GlmOps implements DeviceOps {
+  private checkDsv41Tensors(...tensors: (Tensor | undefined)[]): void {
+    if (tensors.some(t => t && t.workspace.ops !== this)) throw new Error("DSV4 tensors must belong to the same backend");
+  }
+  dsv41Hash(tokens: Tensor, lookback: Tensor, map: Tensor, primes: Tensor, offsets: Tensor, qoIndptr?: Tensor): Tensor {
+    this.checkDsv41Tensors(tokens, lookback, map, primes, offsets, qoIndptr);
+    const batchSize = qoIndptr ? qoIndptr.numElements - 1 : 1;
+    if ([tokens, lookback, map, primes, offsets].some(t => t.type !== "I32")
+      || (qoIndptr ? qoIndptr.type !== "I32" || qoIndptr.shape.length !== 1 || batchSize < 1
+        || lookback.shape.length !== 2 || lookback.shape[1] !== 3 || lookback.shape[0] < batchSize : lookback.numElements !== 3)
+      || primes.numElements !== 48 || offsets.numElements !== 48) throw new Error("Invalid Engram hash inputs");
+    const output = tokens.workspace.alloc([2, tokens.numElements, 24], "I32");
+    getNativeAddon().dsv41Hash(this.ctx, output.data, lookback.data, tokens.data, map.data, primes.data, offsets.data, tokens.numElements, qoIndptr?.data ?? 0, batchSize);
+    return output;
+  }
+  dsv41IndexQuantize(output: Tensor, input: Tensor, positions: Tensor): void {
+    this.checkDsv41Tensors(output, input, positions);
+    if (input.type !== "BF16" || output.type !== "F32" || positions.type !== "I32" || !positions.numElements
+      || input.numElements % (positions.numElements * 128) || output.numElements !== input.numElements) throw new Error("Invalid V4.1 index quantization");
+    getNativeAddon().dsv41IndexQuantize(this.ctx, output.data, input.data, positions.data,
+      input.numElements / positions.numElements / 128, 0, positions.numElements, 0);
+  }
+  dsv4IndexScores(query: Tensor, keys: Tensor, weights: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, capacity: number, batchIndices?: Tensor): Tensor {
+    this.validateDsv4Pages(positions, pages, ratio, batchIndices);
+    this.checkDsv41Tensors(query, keys, weights);
+    if (query.type !== "F32" || query.numElements !== positions.numElements * 32 * 128 || keys.type !== "F32"
+      || keys.shape.length !== 3 || keys.shape[1] !== 64 || keys.shape[2] !== 128 || weights.type !== "BF16"
+      || weights.numElements !== positions.numElements * 32 || !Number.isSafeInteger(capacity) || capacity < 1) throw new Error("Invalid DSV4 paged index scoring");
+    const output = query.workspace.alloc([positions.numElements, capacity], "F32");
+    getNativeAddon().dsv41IndexScores(this.ctx, output.data, query.data, keys.data, weights.data, positions.data,
+      output.shape[1], ratio, positions.numElements, pages.data, batchIndices?.data ?? 0, pages.shape[1] ?? 0);
+    return output;
+  }
+  dsv41Candidates(scores: Tensor, positions: Tensor): Tensor {
+    this.checkDsv41Tensors(scores, positions);
+    if (scores.type !== "F32" || scores.shape.length !== 2 || positions.type !== "I32" || positions.numElements !== scores.shape[0]) throw new Error("Invalid candidate scores");
+    const output = scores.workspace.alloc([scores.shape[0], Math.ceil(scores.shape[1] / 8)], "I32");
+    getNativeAddon().dsv41Candidates(this.ctx, output.data, scores.data, positions.data, scores.shape[1], scores.shape[0]);
+    return output;
+  }
+  dsv41Select(scores: Tensor, positions: Tensor, ratio: number, candidates?: Tensor): Tensor {
+    this.checkDsv41Tensors(scores, positions, candidates);
+    if (scores.type !== "F32" || scores.shape.length !== 2 || positions.type !== "I32" || positions.numElements !== scores.shape[0]
+      || ![1, 2].includes(ratio) || (candidates && (candidates.type !== "I32" || candidates.numElements !== scores.shape[0] * Math.ceil(scores.shape[1] / 8)))) throw new Error("Invalid index selection");
+    const output = scores.workspace.alloc([scores.shape[0], 512], "I32");
+    getNativeAddon().dsv41Select(this.ctx, output.data, scores.data, candidates?.data ?? 0, positions.data, scores.shape[1], ratio, scores.shape[0]);
+    return output;
+  }
+  private validateDsv4Pages(positions: Tensor, pages: Tensor, ratio: number, batchIndices?: Tensor): void {
+    this.checkDsv41Tensors(positions, pages, batchIndices);
+    if (positions.type !== "I32" || positions.shape.length !== 1 || !positions.numElements || pages.type !== "I32"
+      || pages.shape.length !== (batchIndices ? 2 : 1) || !pages.numElements || ![1, 2].includes(ratio)
+      || (batchIndices && (batchIndices.type !== "I32" || batchIndices.shape.length !== 1 || batchIndices.numElements !== positions.numElements))) throw new Error("Invalid DSV4 paged addressing");
+  }
+  private dsv4PagedSlots(positions: Tensor, pages: Tensor, ratio: number, mode: number, selected?: Tensor, batchIndices?: Tensor): Tensor {
+    this.validateDsv4Pages(positions, pages, ratio, batchIndices);
+    this.checkDsv41Tensors(selected);
+    if (selected && (selected.type !== "I32" || selected.shape.length !== 2 || selected.shape[0] !== positions.numElements)) throw new Error("Invalid DSV4 top-k indices");
+    const width = mode === 0 ? 1 : mode === 1 ? 128 : selected!.shape[1];
+    const output = positions.workspace.alloc([positions.numElements, width], "I32");
+    getNativeAddon().dsv4PagedSlots(this.ctx, output.data, positions.data, pages.data, selected?.data ?? 0, output.shape[1], ratio, positions.numElements, mode, batchIndices?.data ?? 0, pages.shape[1] ?? 0);
+    return output;
+  }
+  dsv4LocalSlots(positions: Tensor, pages: Tensor, batchIndices?: Tensor): Tensor { return this.dsv4PagedSlots(positions, pages, 1, 1, undefined, batchIndices); }
+  dsv4TopkToSlots(selected: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, batchIndices?: Tensor): Tensor { return this.dsv4PagedSlots(positions, pages, ratio, 2, selected, batchIndices); }
+  private validateDsv4Append(cache: Tensor, input: Tensor, positions: Tensor, pages: Tensor, ratio: number, keys: boolean, batchIndices?: Tensor): void {
+    this.validateDsv4Pages(positions, pages, ratio, batchIndices);
+    this.checkDsv41Tensors(cache, input);
+    if (cache.type !== (keys ? "F32" : "U8") || cache.shape.length !== 3 || cache.shape[1] !== 64 || cache.shape[2] !== (keys ? 128 : 584)
+      || input.type !== "BF16" || input.shape.length !== 2 || input.shape[0] !== positions.numElements || input.shape[1] !== (keys ? 128 : 512)) throw new Error("Invalid DSV4 paged append tensors");
+  }
+  dsv4CacheAppend(cache: Tensor, input: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2 = 1, batchIndices?: Tensor): void {
+    this.validateDsv4Append(cache, input, positions, pages, ratio, false, batchIndices);
+    using slots = this.dsv4PagedSlots(positions, pages, ratio, 0, undefined, batchIndices);
+    getNativeAddon().dsv41CacheInsert(this.ctx, cache.data, input.data, positions.data, ratio, positions.numElements, slots.data);
+  }
+  dsv4IndexAppend(cache: Tensor, input: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, batchIndices?: Tensor): void {
+    this.validateDsv4Append(cache, input, positions, pages, ratio, true, batchIndices);
+    using slots = this.dsv4PagedSlots(positions, pages, ratio, 0, undefined, batchIndices);
+    getNativeAddon().dsv41IndexQuantize(this.ctx, cache.data, input.data, positions.data, 1, ratio, positions.numElements, slots.data);
+  }
+  dsv4SparseAttention(q: Tensor, local: Dsv4CacheSelection, global?: Dsv4CacheSelection, sinks?: Tensor, mode: "auto" | "prefill" | "decode" = "auto"): { output: Tensor; lse: Tensor } {
+    this.checkDsv41Tensors(q, sinks);
+    if (q.type !== "BF16" || q.shape.length !== 3 || q.shape[2] !== 512 || q.shape[0] < 1) throw new Error("Invalid DSV4 queries");
+    for (const selection of [local, ...(global ? [global] : [])]) {
+      const { cache, indices, lengths } = selection;
+      this.checkDsv41Tensors(cache, indices, lengths);
+      if (cache.type !== "U8" || cache.shape.length !== 3 || cache.shape[1] !== 64 || cache.shape[2] !== 584
+        || indices.type !== "I32" || indices.shape.length !== 2 || indices.shape[0] !== q.shape[0] || indices.shape[1] < 64 || indices.shape[1] % 64
+        || (lengths && (lengths.type !== "I32" || lengths.shape.length !== 1 || lengths.shape[0] !== q.shape[0]))) throw new Error("Invalid DSV4 cache selection");
+    }
+    if (sinks && (sinks.type !== "F32" || sinks.shape.length !== 1 || sinks.numElements !== q.shape[1])) throw new Error("Invalid DSV4 sinks");
+    const decode = mode === "decode" || (mode === "auto" && q.shape[0] <= 64);
+    if (decode && q.shape[0] > 64) throw new Error("DSV4 decode supports at most 64 tokens");
+    const heads = q.shape[1];
+    if (heads < 1 || heads > 128) throw new Error("DSV4 attention supports 1..128 heads per GPU");
+    const output = q.workspace.alloc(q.shape, "BF16"), lse = q.workspace.alloc(q.shape.slice(0, 2), "F32");
+    const splits = decode ? Math.ceil((local.indices.shape[1] + (global?.indices.shape[1] ?? 0)) / 64) : 0;
+    const paddedHeads = Math.ceil(heads / 16) * 16;
+    using midOut = splits ? q.workspace.alloc([q.shape[0], paddedHeads, splits, 512], "BF16") : undefined;
+    using midLse = splits ? q.workspace.alloc([q.shape[0], paddedHeads, splits], "F32") : undefined;
+    getNativeAddon().dsv4SparseAttention(this.ctx, q.data, local.cache.data, local.indices.data, local.lengths?.data ?? 0,
+      global?.cache.data ?? 0, global?.indices.data ?? 0, global?.lengths?.data ?? 0, sinks?.data ?? 0,
+      output.data, lse.data, midOut?.data ?? 0, midLse?.data ?? 0, q.shape[0], heads, local.indices.shape[1],
+      global?.indices.shape[1] ?? 0, global ? 64 : 0, splits, 512 ** -0.5);
+    return { output, lse };
+  }
   kdaScan(query: Tensor, state: Tensor, key: Tensor, value: Tensor, forget: Tensor, beta: Tensor, aLog: Tensor, dtBias: Tensor, cuSeqlens: Tensor, lowerBound = -5): Tensor {
     validateKdaScan(this, query, state, key, value, forget, beta, aLog, dtBias, cuSeqlens, lowerBound);
     const out = query.workspace.alloc(query.shape, "BF16");

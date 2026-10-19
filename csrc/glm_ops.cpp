@@ -327,8 +327,8 @@ static Napi::Value SiluAndMul(const Napi::CallbackInfo& info) {
 
 static Napi::Value Linear(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 9) {
-        Napi::TypeError::New(env, "Expected (ctx, out, input, weight, batch, n, k, workspace, workspace_size)").ThrowAsJavaScriptException();
+    if (info.Length() < 10) {
+        Napi::TypeError::New(env, "Expected (ctx, out, input, weight, batch, n, k, workspace, workspace_size, output_f32)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     uintptr_t ctx_ptr = info[0].As<Napi::Number>().Int64Value();
@@ -345,7 +345,7 @@ static Napi::Value Linear(const Napi::CallbackInfo& info) {
                reinterpret_cast<const void*>(in_ptr),
                reinterpret_cast<const void*>(wt_ptr),
                batch, n, k,
-               reinterpret_cast<void*>(workspace_ptr), workspace_size);
+               reinterpret_cast<void*>(workspace_ptr), workspace_size, info[9].As<Napi::Boolean>().Value());
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("linear failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
@@ -1488,7 +1488,10 @@ static Napi::Value ScatterAddRows(const Napi::CallbackInfo& info) {
                           reinterpret_cast<const void*>(in_ptr),
                           reinterpret_cast<const void*>(scales_ptr),
                           top_k, dim, num_rows,
-                          reinterpret_cast<void*>(ws_ptr));
+                          reinterpret_cast<void*>(ws_ptr),
+                          info.Length() > 8 ? info[8].As<Napi::Number>().Int32Value() : 0,
+                          info.Length() > 9 ? info[9].As<Napi::Boolean>().Value() : false,
+                          info.Length() > 10 ? reinterpret_cast<const void*>(info[10].As<Napi::Number>().Int64Value()) : nullptr);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("scatterAddRows failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
@@ -2859,6 +2862,135 @@ static Napi::Value QuantizeFp8(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value Dsv4SparseAttention(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() != 20) {
+        Napi::TypeError::New(env, "dsv4SparseAttention expects 20 arguments").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    auto ptr = [&](int i) { return info[i].As<Napi::Number>().Int64Value(); };
+    auto integer = [&](int i) { return info[i].As<Napi::Number>().Int32Value(); };
+    bool ok = glm_dsv4_sparse_attention((GlmCtx*)ptr(0), (void*)ptr(1), (uint8_t*)ptr(2),
+        (int32_t*)ptr(3), (int32_t*)ptr(4), (uint8_t*)ptr(5), (int32_t*)ptr(6),
+        (int32_t*)ptr(7), (float*)ptr(8), (void*)ptr(9), (float*)ptr(10),
+        (void*)ptr(11), (float*)ptr(12), integer(13), integer(14), integer(15),
+        integer(16), integer(17), integer(18), info[19].As<Napi::Number>().FloatValue());
+    cudaError_t err = cudaGetLastError();
+    if (!ok || err != cudaSuccess) {
+        Napi::Error::New(env, std::string("dsv4SparseAttention: ") +
+            (ok ? cudaGetErrorString(err) : "unsupported dispatch geometry")).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
+static Napi::Value Dsv41MhcPre(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() != 16) {
+        Napi::TypeError::New(env, "dsv41MhcPre expects 16 arguments").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    auto ptr = [&](int i) { return info[i].As<Napi::Number>().Int64Value(); };
+    glm_dsv41_mhc_pre((GlmCtx*)ptr(0), (void*)ptr(1), (float*)ptr(2), (float*)ptr(3),
+        (float*)ptr(4), (void*)ptr(5), (float*)ptr(6), (float*)ptr(7), (float*)ptr(8),
+        (float*)ptr(9), info[10].As<Napi::Number>().Int32Value(), info[11].As<Napi::Number>().Int32Value(),
+        info[12].As<Napi::Number>().FloatValue(), info[13].As<Napi::Number>().FloatValue(),
+        info[14].As<Napi::Number>().Int32Value(), (float*)ptr(15));
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) Napi::Error::New(env, cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    return env.Undefined();
+}
+
+// Each binding has its own native signature; only numeric argument conversion
+// and CUDA error reporting are shared. No opcode or packed argument ABI.
+template<auto Function> struct CudaBinding;
+template<typename R, typename... Args, R (*Function)(Args...)>
+struct CudaBinding<Function> {
+    template<typename T> static T arg(const Napi::Value& value) {
+        if constexpr (std::is_pointer_v<T>) return reinterpret_cast<T>(value.As<Napi::Number>().Int64Value());
+        else return static_cast<T>(value.As<Napi::Number>().Int32Value());
+    }
+    template<size_t... I> static int invoke(const Napi::CallbackInfo& info, std::index_sequence<I...>) {
+        if constexpr (std::is_void_v<R>) {
+            Function(arg<Args>(info[I])...);
+            return cudaGetLastError();
+        } else return Function(arg<Args>(info[I])...);
+    }
+    static Napi::Value call(const Napi::CallbackInfo& info) {
+        auto env = info.Env();
+        if (info.Length() != sizeof...(Args)) {
+            Napi::TypeError::New(env, "Invalid CUDA operation argument count").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        for (size_t i = 0; i < info.Length(); ++i) if (!info[i].IsNumber()) {
+            Napi::TypeError::New(env, "CUDA operation arguments must be numbers").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        int status = invoke(info, std::index_sequence_for<Args...>{});
+        if (status) Napi::Error::New(env, cudaGetErrorString((cudaError_t)status)).ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+};
+
+static Napi::Value Fp8LinearLt(const Napi::CallbackInfo& info) {
+    auto env = info.Env();
+    if (info.Length() != 13) {
+        Napi::TypeError::New(env, "fp8LinearLt expects 13 arguments").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    auto p = [&](int i) { return (void*)info[i].As<Napi::Number>().Int64Value(); };
+    auto d = [&](int i) { return info[i].As<Napi::Number>().Int32Value(); };
+    int status = glm_fp8_linear_lt((GlmCtx*)info[0].As<Napi::Number>().Int64Value(),
+        p(1), p(2), p(3), p(4), p(5), p(6), p(7), p(8), d(9), d(10), d(11), d(12));
+    if (status) Napi::Error::New(env, "fp8LinearLt status " + std::to_string(status)).ThrowAsJavaScriptException();
+    return env.Undefined();
+}
+
+static Napi::Value Dsv41EngramLookup(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() != 8) {
+        Napi::TypeError::New(env, "dsv41EngramLookup expects 8 arguments").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    auto ptr = [&](int i) { return info[i].As<Napi::Number>().Int64Value(); };
+    glm_dsv41_engram_lookup((GlmCtx*)ptr(0), (void*)ptr(1), (int32_t*)ptr(2), (uint8_t*)ptr(3),
+        (uint8_t*)ptr(4), info[5].As<Napi::Number>().Int32Value(), info[6].As<Napi::Number>().Int32Value(),
+        info[7].As<Napi::Number>().Int32Value());
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) Napi::Error::New(env, cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    return env.Undefined();
+}
+
+static Napi::Value Dsv41EngramGate(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() != 9) {
+        Napi::TypeError::New(env, "dsv41EngramGate expects 9 arguments").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    auto ptr = [&](int i) { return info[i].As<Napi::Number>().Int64Value(); };
+    glm_dsv41_engram_gate((GlmCtx*)ptr(0), (void*)ptr(1), (void*)ptr(2), (void*)ptr(3),
+        (void*)ptr(4), (void*)ptr(5), info[6].As<Napi::Number>().Int32Value(),
+        info[7].As<Napi::Number>().Int32Value(), info[8].As<Napi::Number>().FloatValue());
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) Napi::Error::New(env, cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    return env.Undefined();
+}
+
+static Napi::Value Dsv41Compress(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() != 12) {
+        Napi::TypeError::New(env, "dsv41Compress expects 12 arguments").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    auto ptr = [&](int i) { return info[i].As<Napi::Number>().Int64Value(); };
+    glm_dsv41_compress((GlmCtx*)ptr(0), (void*)ptr(1), (int32_t*)ptr(2), (float*)ptr(3),
+        (int32_t*)ptr(4), (float*)ptr(5), (int32_t*)ptr(6), (int32_t*)ptr(7), (void*)ptr(8),
+        info[9].As<Napi::Number>().Int32Value(), info[10].As<Napi::Number>().Int32Value(),
+        info[11].As<Napi::Number>().FloatValue());
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) Napi::Error::New(env, cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    return env.Undefined();
+}
+
 static Napi::Value SparseMlaPrefill(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 13) {
@@ -3118,7 +3250,7 @@ static Napi::Value GraphExecDestroy(const Napi::CallbackInfo& info) {
 
 static Napi::Value Fp8LinearDecode(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() < 7) {
+    if (info.Length() < 8) {
         Napi::TypeError::New(env, "Expected (ctx, bf16_out, bf16_input, fp8_weight, weight_scale, m, n, k)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
@@ -3130,13 +3262,12 @@ static Napi::Value Fp8LinearDecode(const Napi::CallbackInfo& info) {
     int m = info[5].As<Napi::Number>().Int32Value();
     int n = info[6].As<Napi::Number>().Int32Value();
     int k = info[7].As<Napi::Number>().Int32Value();
-    glm_fp8_linear_decode(reinterpret_cast<GlmCtx*>(ctx_ptr),
+    cudaError_t err = static_cast<cudaError_t>(glm_fp8_block_linear(reinterpret_cast<GlmCtx*>(ctx_ptr),
                            reinterpret_cast<void*>(out_ptr),
                            reinterpret_cast<const void*>(input_ptr),
                            reinterpret_cast<const void*>(weight_ptr),
-                           reinterpret_cast<const float*>(scale_ptr),
-                           m, n, k);
-    cudaError_t err = cudaGetLastError();
+                            reinterpret_cast<const void*>(scale_ptr),
+                            m, n, k, 128, 0, 1));
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("fp8LinearDecode failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
     }
@@ -4342,6 +4473,27 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "indexerKvCacheAppendFlat"), Napi::Function::New(env, IndexerKvCacheAppendFlat));
     exports.Set(Napi::String::New(env, "concatAndCacheDsMla"), Napi::Function::New(env, ConcatAndCacheDsMla));
     exports.Set(Napi::String::New(env, "sparseMlaPrefill"), Napi::Function::New(env, SparseMlaPrefill));
+    exports.Set(Napi::String::New(env, "dsv4SparseAttention"), Napi::Function::New(env, Dsv4SparseAttention));
+    exports.Set(Napi::String::New(env, "dsv41MhcPre"), Napi::Function::New(env, Dsv41MhcPre));
+    exports.Set("dsv41Rope", Napi::Function::New(env, CudaBinding<glm_dsv41_rope>::call));
+    exports.Set("dsv41SwiGlu", Napi::Function::New(env, CudaBinding<glm_dsv41_swiglu>::call));
+    exports.Set("dsv41Route", Napi::Function::New(env, CudaBinding<glm_dsv41_route>::call));
+    exports.Set("dsv41Collapse", Napi::Function::New(env, CudaBinding<glm_dsv41_collapse>::call));
+    exports.Set("dsv41CacheInsert", Napi::Function::New(env, CudaBinding<glm_dsv41_cache_insert>::call));
+    exports.Set("dsv41Embedding", Napi::Function::New(env, CudaBinding<glm_dsv41_embedding>::call));
+    exports.Set("dsv41Hash", Napi::Function::New(env, CudaBinding<glm_dsv41_hash>::call));
+    exports.Set("dsv41IndexQuantize", Napi::Function::New(env, CudaBinding<glm_dsv41_index_quantize>::call));
+    exports.Set("dsv41IndexScores", Napi::Function::New(env, CudaBinding<glm_dsv41_index_scores>::call));
+    exports.Set("dsv41Candidates", Napi::Function::New(env, CudaBinding<glm_dsv41_candidates>::call));
+    exports.Set("dsv41Select", Napi::Function::New(env, CudaBinding<glm_dsv41_select>::call));
+    exports.Set("dsv41ToBf16", Napi::Function::New(env, CudaBinding<glm_dsv41_to_bf16>::call));
+    exports.Set("dsv4PagedSlots", Napi::Function::New(env, CudaBinding<glm_dsv4_paged_slots>::call));
+    exports.Set("mxfp4MulMatId", Napi::Function::New(env, CudaBinding<glm_mxfp4_mul_mat_id>::call));
+    exports.Set("fp8BlockLinear", Napi::Function::New(env, CudaBinding<glm_fp8_block_linear>::call));
+    exports.Set(Napi::String::New(env, "fp8LinearLt"), Napi::Function::New(env, Fp8LinearLt));
+    exports.Set(Napi::String::New(env, "dsv41EngramLookup"), Napi::Function::New(env, Dsv41EngramLookup));
+    exports.Set(Napi::String::New(env, "dsv41EngramGate"), Napi::Function::New(env, Dsv41EngramGate));
+    exports.Set(Napi::String::New(env, "dsv41Compress"), Napi::Function::New(env, Dsv41Compress));
     exports.Set(Napi::String::New(env, "quantizeFp8"), Napi::Function::New(env, QuantizeFp8));
     exports.Set(Napi::String::New(env, "sparseMlaDecode"), Napi::Function::New(env, SparseMlaDecode));
     exports.Set(Napi::String::New(env, "gatherTopkCkv"), Napi::Function::New(env, GatherTopkCkv));

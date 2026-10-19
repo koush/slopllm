@@ -53,7 +53,7 @@ export class WorkspaceBase implements Disposable {
 
   assertClear(keep: TensorTree = undefined) {
     this._runClear(collectTensors(keep), (t) => {
-      // console.warn(t.stack);
+      console.warn(t.stack);
       throw new Error("assertClear was called with tensors already allocated that were not in keepExports, this may result in non-deterministic allocations.");
     });
   }
@@ -67,7 +67,7 @@ export class WorkspaceBase implements Disposable {
     }
     this._runClear(keepExports, tracked => {
       console.warn(new Error("clearTracking was called with tensors already allocated that were not in keepExports, this may result in non-deterministic allocations."));
-      // console.warn(tracked.shape, this.tracked.size, tracked.stack);
+      console.warn(tracked.shape, this.tracked.size, tracked.stack);
       tracked[Symbol.dispose]();
       return true;
     });

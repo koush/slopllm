@@ -50,7 +50,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
 
   getPagedKV(): PagedKVCache { return this; }
 
-  constructor(ops: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, physicalPageSize = PAGE_SIZE, kvLoraRank = 0, qkRopeDim = 0, contextParallel = false, indexHeadDim = 0, sharedLayers: boolean[] = [], pinned = false, recurrentLayers: readonly (RecurrentLayerLayout | undefined)[] = []) {
+  constructor(ops: DeviceOps, nKv: number, hd: number, nLayers: number, maxPages: number, maxBatch: number, physicalPageSize = PAGE_SIZE, kvLoraRank = 0, qkRopeDim = 0, contextParallel = false, indexHeadDim = 0, sharedLayers: boolean[] = [], pinned = false, recurrentLayers: readonly (RecurrentLayerLayout | undefined)[] = [], readonly packedFormat: "glm" | "dsv4" = "glm") {
     super(ops);
     this.pinned = pinned;
     this.nKv = nKv;
@@ -61,7 +61,10 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.pageSize = contextParallel ? physicalPageSize * ops.worldSize : physicalPageSize;
     this.contextParallel = contextParallel;
     this.sparseMode = indexHeadDim > 0 && kvLoraRank > 0;
-    this.bytesPerToken = kvLoraRank > 0
+    if (packedFormat === "dsv4" && (contextParallel || physicalPageSize !== 64 || !this.sparseMode)) {
+      throw new Error("DSV4 packed caches require replicated 64-token sparse pages");
+    }
+    this.bytesPerToken = packedFormat === "dsv4" ? 584 : kvLoraRank > 0
       ? kvLoraRank + (kvLoraRank / 128) * 4 + qkRopeDim * 2
       : 0;
     this.kData = [];
@@ -95,8 +98,8 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
             this.kScaleData.push(undefined!);
           } else {
             const parallelism = contextParallel ? TensorParallelism.Row : undefined;
-            this.kData.push(alloc([maxPages, this.pageSize, indexHeadDim], "U8", "k" + i, parallelism));
-            this.kScaleData.push(alloc([maxPages, this.pageSize], "F32", "kScale" + i, parallelism));
+            this.kData.push(alloc([maxPages, this.pageSize, indexHeadDim], packedFormat === "dsv4" ? "F32" : "U8", "k" + i, parallelism));
+            this.kScaleData.push(packedFormat === "dsv4" ? undefined! : alloc([maxPages, this.pageSize], "F32", "kScale" + i, parallelism));
           }
         }
       } else {
@@ -256,7 +259,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     if (src.nLayers !== this.nLayers) {
       throw new Error(`copyPrefixFrom: nLayers mismatch (dst ${this.nLayers}, src ${src.nLayers})`);
     }
-    if (src.sparseMode !== this.sparseMode || src.bytesPerToken !== this.bytesPerToken) {
+    if (src.sparseMode !== this.sparseMode || src.bytesPerToken !== this.bytesPerToken || src.packedFormat !== this.packedFormat) {
       throw new Error("copyPrefixFrom: KV packing mismatch (sparse/dense or bytesPerToken)");
     }
     for (let i = 0; i < this.nLayers; i++) {

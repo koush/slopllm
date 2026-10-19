@@ -63,7 +63,22 @@ export interface NativeAddon {
   fusedAddRmsnorm(ctx: number, out: number, residual: number, inputA: number, inputB: number, weight: number, eps: number, dim: number, batch: number): void;
   fusedNormRope(ctx: number, out: number, input: number, weight: number, cos: number, sin: number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number, interleaved?: boolean): void;
   siluAndMul(ctx: number, out: number, gate: number, up: number, intermediate: number, batch: number): void;
-  linear(ctx: number, out: number, input: number, weight: number, batch: number, n: number, k: number, workspace: number, workspaceSize: number): void;
+  dsv41Rope(ctx: number, out: number, input: number, positions: number, rows: number, dim: number, compressed: number, inverse: number, ratio: number, heads: number): void;
+  dsv41SwiGlu(ctx: number, out: number, gate: number, up: number, count: number): void;
+  dsv41Route(ctx: number, ids: number, weights: number, logits: number, bias: number, tokens: number): void;
+  dsv41Collapse(ctx: number, out: number, hidden: number, pre: number, dim: number, tokens: number): void;
+  dsv41CacheInsert(ctx: number, cache: number, input: number, positions: number, ratio: number, tokens: number, slots: number): void;
+  dsv41Embedding(ctx: number, out: number, weight: number, tokens: number, start: number, rows: number, count: number): void;
+  dsv41Hash(ctx: number, out: number, lookback: number, tokens: number, map: number, primes: number, offsets: number, count: number, qoIndptr: number, batchSize: number): void;
+  dsv41IndexQuantize(ctx: number, out: number, input: number, positions: number, heads: number, ratio: number, tokens: number, slots: number): void;
+  dsv41IndexScores(ctx: number, out: number, query: number, keys: number, weights: number, positions: number, capacity: number, ratio: number, tokens: number, pages: number, batchIndices: number, pageStride: number): void;
+  dsv41Candidates(ctx: number, out: number, scores: number, positions: number, capacity: number, tokens: number): void;
+  dsv41Select(ctx: number, out: number, scores: number, candidates: number, positions: number, capacity: number, ratio: number, tokens: number): void;
+  dsv41ToBf16(ctx: number, out: number, input: number, count: number): void;
+  dsv4PagedSlots(ctx: number, out: number, positions: number, pages: number, selected: number, width: number, ratio: number, tokens: number, mode: number, batchIndices: number, pageStride: number): void;
+  mxfp4MulMatId(ctx: number, out: number, input: number, pointers: number, ids: number, topK: number, count: number, n: number, k: number): void;
+  fp8BlockLinear(ctx: number, out: number, input: number, weight: number, scales: number, m: number, n: number, k: number, block: number, scaleKind: number, groups: number): void;
+  linear(ctx: number, out: number, input: number, weight: number, batch: number, n: number, k: number, workspace: number, workspaceSize: number, outputF32: boolean): void;
   fill(ctx: number, out: number, value: number, n: number, dtype: string): void;
   decodeCsf(ctx: number, out: number, fixed: number, exceptions: number, status: number,
     rows: number, columns: number, exceptionCount: number, rowOffset: number, columnOffset: number,
@@ -115,6 +130,8 @@ export interface NativeAddon {
   memcpy2dHostToDeviceAsync(ctx: number, dst: number, dpitch: number, src: number, spitch: number, width: number, height: number): Promise<void>;
   mmapClose(mmapPtr: number, size: number): void;
   fp8LinearDecode(ctx: number, bf16Out: number, bf16Input: number, fp8Weight: number, weightScale: number, m: number, n: number, k: number): void;
+  fp8LinearLt(ctx: number, output: number, input: number, weight: number, scales: number,
+    quantized: number, inputScales: number, weightScales: number, scratch: number, m: number, n: number, k: number, groups: number): void;
   nvfp4LinearDecode(ctx: number, bf16Out: number, bf16Input: number, fp4Weight: number, weightScale: number, weightScale2: number, m: number, n: number, k: number, bf16Workspace?: number): void;
   gdnRecurrentStep(ctx: number, output: number, state: number, qkv: number, aRaw: number, bRaw: number, aLog: number, dtBias: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void;
   gdnPrefill(ctx: number, output: number, state: number, qkv: number, aRaw: number, bRaw: number, aLog: number, dtBias: number, cuSeqlens: number, totalSeqLen: number, numHeads: number, dK: number, dV: number, batchSize: number, stateStride: number, qkvChStride: number, qkvSeqStride: number): void;
@@ -126,6 +143,19 @@ export interface NativeAddon {
   indexerKvCacheAppendFlat(ctx: number, kData: number, kScaleData: number, appendK: number, kvTokenIndptr: number, batchIndices: number, positions: number, nnz: number, headDim: number, appendStrideN: number): void;
   concatAndCacheDsMla(ctx: number, kvCache: number, appendCkv: number, appendKpe: number, indices: number, indptr: number, batchIndices: number, positions: number, nnz: number, pageSize: number, kvLoraRank: number, peDim: number, appendCkvStrideN: number, appendKpeStrideN: number, cpWorldSize: number, cpRank: number): void;
   quantizeFp8(ctx: number, input: number, values: number, scales: number, numBlocks: number, blockSize: number): void;
+  dsv4SparseAttention(ctx: number, q: number, kv: number, indices: number, lengths: number,
+    extraKv: number, extraIndices: number, extraLengths: number, sinks: number, output: number,
+    lse: number, midOut: number, midLse: number, tokens: number, heads: number, topk: number,
+    extraTopk: number, extraPageSize: number, splits: number, scale: number): void;
+  dsv41MhcPre(ctx: number, output: number, pre: number, post: number, comb: number,
+    x: number, fn: number, base: number, scale: number, previousPre: number,
+    rows: number, dim: number, normEps: number, hcEps: number, iters: number, partials: number): void;
+  dsv41EngramLookup(ctx: number, output: number, ids: number, table: number, scales: number,
+    count: number, rowStart: number, rowEnd: number): void;
+  dsv41EngramGate(ctx: number, output: number, x: number, kv: number, qw: number, kw: number,
+    tokens: number, dim: number, eps: number): void;
+  dsv41Compress(ctx: number, output: number, valid: number, state: number, statePosition: number,
+    raw: number, positions: number, cu: number, weight: number, batch: number, ratio: number, eps: number): void;
   sparseMlaPrefill(ctx: number, qNope: number, qRope: number, kvCache: number, indices: number, output: number, outLse: number, numTokens: number, numHeads: number, topk: number, smScale: number, strideKvBlock: number, topkLength: number, qScales?: number): void;
   sparseMlaDecode(ctx: number, qNope: number, qRope: number, kvCache: number, indices: number, midOut: number, midLse: number, output: number, outLse: number, numTokens: number, numHeads: number, topk: number, numSplits: number, smScale: number, strideKvBlock: number, chunksPerBlock: number, topkLength?: number, qScales?: number): void;
   gatherTopkCkv(ctx: number, flatPtrs: Float64Array, localKvCache: number, topkIdx: number, batchIndices: number, pageIndices: number, pageIndptr: number, kvTokenIndptr: number, N: number, cpWorldSize: number, cpRank: number, effPageSize: number, bptBytes: number, numTokens: number, topk: number, paddedKvLen: number, scratchBitmap: number, scratchUnique: number, scratchCounter: number): void;
@@ -206,6 +236,7 @@ export interface NativeAddon {
   mmaMoeCoopScatter(ctx: number, input: number, expertIds: number, topK: number, count: number, K: number, numExperts: number, workspace: number): void;
   mmaMoeCoopGemm(ctx: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, numExperts: number, N: number, K: number, count: number, scatterK: number, scatterWorkspace: number, sortedInput: number, outputSorted: boolean, gemmWorkspace: number, output: number): void;
   bf16MulMatIdGroupedMma(ctx: number, output: number, input: number, weightPtrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
-  scatterAddRows(ctx: number, out: number, input: number, scales: number, topK: number, dim: number, numRows: number, workspace: number): void;
+  scatterAddRows(ctx: number, out: number, input: number, scales: number, topK: number, dim: number, numRows: number, workspace: number,
+    scaleType?: number, outputF32?: boolean, residual?: number): void;
   rotateInputIds(ctx: number, outputIds: number, inputIds: number, qoIndptr: number, newTokens: number, batchSize: number): void;
 }

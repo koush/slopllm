@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { CsfContractError } from "./csf_codec";
+import { MXFP4_CSF_CODEC } from "./mxfp4_csf_codec";
 import {
   CsfContainer,
   detectCsfContainer,
@@ -183,7 +184,7 @@ class SafetensorsCheckpointSource implements CheckpointSource {
         return entry.shard.st.readTensor(name);
       },
       readSlice(extent: TensorExtent): Buffer {
-        return readRowMajorSlice(entry.shard.st.readTensor(name), entry.meta, extent, name);
+        return readRowMajorSlice((offset, size) => entry.shard.st.readTensorRange(name, offset, size), entry.meta, extent, name);
       },
     };
   }
@@ -201,13 +202,13 @@ class SafetensorsCheckpointSource implements CheckpointSource {
 }
 
 /** Row-major logical slice over the leading two dimensions (inner dims full). */
-export function readRowMajorSlice(data: Buffer, meta: TensorMeta, extent: TensorExtent, name: string): Buffer {
+export function readRowMajorSlice(data: Buffer | ((offset: number, size: number) => Buffer), meta: TensorMeta, extent: TensorExtent, name: string): Buffer {
   const rank = meta.shape.length;
   if (extent.shape.length !== rank || extent.offsets.length !== rank) {
     throw new Error(`slice rank mismatch for ${name}`);
   }
   for (let d = 0; d < rank; d++) {
-    if (extent.offsets[d] < 0 || extent.shape[d] < 0
+    if (!Number.isSafeInteger(extent.offsets[d]) || !Number.isSafeInteger(extent.shape[d]) || extent.offsets[d] < 0 || extent.shape[d] < 0
       || extent.offsets[d] + extent.shape[d] > meta.shape[d]) {
       throw new Error(`slice for ${name} is out of bounds`);
     }
@@ -225,7 +226,8 @@ export function readRowMajorSlice(data: Buffer, meta: TensorMeta, extent: Tensor
   const out = Buffer.allocUnsafe(extent.shape.reduce((a, b) => a * b, 1) * dtypeBytes);
   for (let r = 0; r < extent.shape[0]; r++) {
     const src = srcBase + r * rowBytes;
-    data.copy(out, r * innerBytes, src, src + innerBytes);
+    if (typeof data === "function") data(src, innerBytes).copy(out, r * innerBytes);
+    else data.copy(out, r * innerBytes, src, src + innerBytes);
   }
   return out;
 }
@@ -261,7 +263,9 @@ class CsfCheckpointSource implements CheckpointSource {
     const located = this.container.locate(name);
     const container = this.container;
     const self = this;
-    const planes = container.compressedPlanes(name);
+    // MXFP4 scales expand on the host at load time. The exposed GPU plane
+    // contract belongs to the NVFP4 decoder and must not accept MXFP4 bytes.
+    const planes = this.contract.codec === MXFP4_CSF_CODEC ? undefined : container.compressedPlanes(name);
     return {
       name,
       meta: located.meta,
