@@ -321,6 +321,8 @@ export class DeepseekV41Model extends ChatModel {
     const self = this;
     return yield* this.forwardWithLayerHolders(state, layerHolders, function* (layerHolders) {
       const { totalTokens: tokens } = state, ops = self.ops;
+      using rotaryStream = ops.withStream(() => state.positionIds.dsv41RotaryEmbedding());
+      using rotary = rotaryStream.result;
       using hidden = new UsingHolder(self.weight("embed.weight").embedding(state.input!, { streams: 4 }));
       const constants = self.hashConstants;
       using hashes = ops.dsv41Hash(state.input!, state.extras.get("dsv41.lookback") as Tensor,
@@ -331,6 +333,7 @@ export class DeepseekV41Model extends ChatModel {
       const draftContext = state.extras.get("dsv41.dsparkContext") as DsparkPlan | undefined;
       using mean = draftContext ? state.ws.alloc([tokens, 4], "F32") : undefined;
       mean?.fill(0.25, mean.numElements);
+      rotaryStream.streamWaitEvent();
       for (let layer = 0; layer < 40; layer++) {
         const p = `layers.${layer}`;
         if (layer === 1 || layer === 14) {
@@ -345,9 +348,9 @@ export class DeepseekV41Model extends ChatModel {
           const feature = hidden.value.dsv41Collapse(mean!);
           features.add(feature); taps.push(feature);
         }
-        yield* self.mlaLayerPhased(hidden, previous, layer, state, layerHolders);
+        yield* self.mlaLayerPhased(hidden, previous, layer, state, layerHolders, rotary);
       }
-      if (draftContext) self.prepareDsparkContext(state, taps, draftContext);
+      if (draftContext) self.prepareDsparkContext(state, taps, draftContext, rotary);
       using collapsed = hidden.value.dsv41Collapse(previous.value);
       return collapsed.rmsnorm(self.weight("norm.weight"), 1e-20);
     });
@@ -405,7 +408,7 @@ export class DeepseekV41Model extends ChatModel {
   }
 
   private *mlaLayerPhased(hidden: UsingHolder<Tensor>, previous: UsingHolder<Tensor>,
-    layer: number, state: ExecutionState, layerHolders: Required<LayerHolders>, draft?: DsparkPlan): Generator<void, void, void> {
+    layer: number, state: ExecutionState, layerHolders: Required<LayerHolders>, rotary: Tensor, draft?: DsparkPlan): Generator<void, void, void> {
     const pfx = this.layerPrefix(layer);
     using oProjBuf = new UsingHolder<Tensor>(undefined!);
     const attnMix = hidden.value.dsv41MhcPre(this.weight(pfx + ".hc_attn_fn"),
@@ -415,7 +418,7 @@ export class DeepseekV41Model extends ChatModel {
     using attnComb = attnMix.comb;
     previous.replace(attnMix.pre);
     using normed = attnInput.rmsnorm(this.weight(pfx + ".attn_norm.weight"), 1e-20);
-    oProjBuf.replace(draft ? this.dsparkAttention(normed, layer, state, draft) : this.attention(normed, layer, state, layerHolders));
+    oProjBuf.replace(draft ? this.dsparkAttention(normed, layer, state, draft, rotary) : this.attention(normed, layer, state, layerHolders, rotary));
 
     yield;
     hidden.replace(this.ops.mhcPost(hidden.value, oProjBuf.value, attnPost, attnComb));
@@ -436,7 +439,7 @@ export class DeepseekV41Model extends ChatModel {
     yield;
   }
 
-  private attention(normed: Tensor, layer: number, state: ExecutionState, layerHolders: Required<LayerHolders>): Tensor {
+  private attention(normed: Tensor, layer: number, state: ExecutionState, layerHolders: Required<LayerHolders>, rotary: Tensor): Tensor {
     const { localSlots, sharedSlots, candidates } = layerHolders;
     const cache = state.cache as DeepseekV41Cache, ws = state.ws, ops = this.ops;
     const tokens = state.totalTokens, position = state.positionIds;
@@ -450,7 +453,7 @@ export class DeepseekV41Model extends ChatModel {
     using kvcache = ops.withStream(() => {
       using projectedKv = this.linear(normed, p + ".wkv");
       using kv = projectedKv.rmsnorm(this.weight(p + ".kv_norm.weight"), 1e-20);
-      using rotated = kv.dsv41Rope(position, ratio > 0);
+      using rotated = kv.dsv41Rope(rotary, ratio > 0);
       ops.dsv4CacheAppend(cache.ckvData[layer], rotated, position, pages, 1, batchIndices);
     });
     using kvcacheIndex = source === layer ? ops.withStream(() => {
@@ -464,10 +467,10 @@ export class DeepseekV41Model extends ChatModel {
         previous?.pending, previous?.pendingPosition, 1e-20, carry.outputs.get(layer));
       using latent = result.latent;
       using valid = result.valid;
-      using compressed = latent.dsv41Rope(position, true, false, 512, ratio);
+      using compressed = latent.dsv41Rope(rotary, true, false, 512, ratio);
       using keyRaw = latent.linear(this.weight(p + ".indexer.wk.weight"));
       using keyNorm = keyRaw.rmsnorm(this.weight(p + ".indexer.k_norm.weight"), 1e-20);
-      using key = keyNorm.dsv41Rope(position, true, false, 128, ratio);
+      using key = keyNorm.dsv41Rope(rotary, true, false, 128, ratio);
       ops.dsv4CacheAppend(cache.compressed(layer), compressed, position, pages, ratio as 1 | 2, batchIndices);
       ops.dsv4IndexAppend(cache.indexKeys(layer), key, position, pages, ratio as 1 | 2, batchIndices);
     }) : undefined;
@@ -477,7 +480,7 @@ export class DeepseekV41Model extends ChatModel {
     using qNorm = qr.rmsnorm(this.weight(p + ".q_norm.weight"), 1e-20);
     const projectQuery = () => {
       using projectedQ = this.linear(qNorm, p + ".wq_b");
-      using qFlat = projectedQ.dsv41Rope(position, ratio > 0);
+      using qFlat = projectedQ.dsv41Rope(rotary, ratio > 0);
       return qFlat.reshape([tokens, 64, 512]);
     };
     // Full indexers overlap query expansion with selection. Shared indexers
@@ -488,7 +491,7 @@ export class DeepseekV41Model extends ChatModel {
     using idxWeights = idxWeightsStream?.result;
     if (indexSource === layer) {
       using indexQ = this.linear(qNorm, p + ".indexer.wq_b");
-      using rotatedQ = indexQ.dsv41Rope(position, true, false, 128);
+      using rotatedQ = indexQ.dsv41Rope(rotary, true, false, 128);
       using quantizedQ = ws.alloc(rotatedQ.shape, "F32", undefined, rotatedQ.parallelism);
       ops.dsv41IndexQuantize(quantizedQ, rotatedQ, position);
       const capacity = Math.min(cache.maxContext, state.isDecode || state.extras.get("dsv41.retainCompressorRows")
@@ -509,10 +512,10 @@ export class DeepseekV41Model extends ChatModel {
     qStream?.streamWaitEvent();
     const result = ops.dsv4SparseAttention((streamedQuery ?? directQuery)!, { cache: cache.ckvData[layer], indices: localSlots.value },
       global ? { cache: cache.compressed(source), indices: global } : undefined,
-      this.weight(p + ".attn_sink"), state.isDecode && tokens <= 64 ? "decode" : "prefill");
+      this.weight(p + ".attn_sink"));
     using output = result.output;
     using lse = result.lse;
-    using inverse = output.dsv41Rope(position, ratio > 0, true);
+    using inverse = output.dsv41Rope(rotary, ratio > 0, true);
     using grouped = inverse.linear(this.weight(p + ".wo_a.weight"), { groups: 8 });
     return this.linear(grouped, p + ".wo_b");
   }
@@ -575,7 +578,7 @@ export class DeepseekV41Model extends ChatModel {
         Int32Array.from({ length: batchSize }, (_, b) => b * 5 + d), [batchSize])) : undefined };
   }
 
-  private prepareDsparkContext(state: ExecutionState, features: readonly Tensor[], plan: DsparkPlan): void {
+  private prepareDsparkContext(state: ExecutionState, features: readonly Tensor[], plan: DsparkPlan, rotary: Tensor): void {
     using joined = features[0].cat(features.slice(1), 1);
     using projected = this.linear(joined, "mtp.0.main_proj");
     using context = projected.rmsnorm(this.weight("mtp.0.main_norm.weight"), 1e-20);
@@ -583,29 +586,29 @@ export class DeepseekV41Model extends ChatModel {
       const prefix = `mtp.${layer}.attn`;
       using projectedKv = this.linear(context, prefix + ".wkv");
       using kv = projectedKv.rmsnorm(this.weight(prefix + ".kv_norm.weight"), 1e-20);
-      using rotated = kv.dsv41Rope(state.positionIds, false);
+      using rotated = kv.dsv41Rope(rotary, false);
       this.ops.dsv4CacheAppend(plan.cache.ckvData[layer], rotated, plan.positions, plan.pages, 1, state.mlaBatchIndices);
     }
   }
 
-  private dsparkAttention(normed: Tensor, layer: number, state: ExecutionState, plan: DsparkPlan): Tensor {
+  private dsparkAttention(normed: Tensor, layer: number, state: ExecutionState, plan: DsparkPlan, rotary: Tensor): Tensor {
     const prefix = this.layerPrefix(layer) + ".attn";
     using kvStream = this.ops.withStream(() => {
       using projected = this.linear(normed, prefix + ".wkv");
       using kv = projected.rmsnorm(this.weight(prefix + ".kv_norm.weight"), 1e-20);
-      using rotated = kv.dsv41Rope(state.positionIds, false);
+      using rotated = kv.dsv41Rope(rotary, false);
       this.ops.dsv4CacheAppend(plan.cache.ckvData[layer - 40], rotated, plan.positions, plan.pages, 1, state.mlaBatchIndices);
     });
     using qr = this.linear(normed, prefix + ".wq_a");
     using qNorm = qr.rmsnorm(this.weight(prefix + ".q_norm.weight"), 1e-20);
     using projectedQ = this.linear(qNorm, prefix + ".wq_b");
-    using rotatedQ = projectedQ.dsv41Rope(state.positionIds, false);
+    using rotatedQ = projectedQ.dsv41Rope(rotary, false);
     using q = rotatedQ.reshape([state.totalTokens, 64, 512]);
     kvStream.streamWaitEvent();
     const attention = this.ops.dsv4SparseAttention(q, { cache: plan.cache.ckvData[layer - 40], indices: plan.slots! },
-      undefined, this.weight(prefix + ".attn_sink"), "prefill");
+      undefined, this.weight(prefix + ".attn_sink"));
     using output = attention.output; using lse = attention.lse;
-    using inverse = output.dsv41Rope(state.positionIds, false, true);
+    using inverse = output.dsv41Rope(rotary, false, true);
     using grouped = inverse.linear(this.weight(prefix + ".wo_a.weight"), { groups: 8 });
     return this.linear(grouped, prefix + ".wo_b");
   }
@@ -613,10 +616,13 @@ export class DeepseekV41Model extends ChatModel {
   /** Five parallel transformer positions, followed by five cheap conditional
    * Markov selections. Every vocabulary bias is applied before argmax. */
   private forwardDspark(state: ExecutionState, plan: DsparkPlan): Tensor {
+    using rotaryStream = this.ops.withStream(() => state.positionIds.dsv41RotaryEmbedding());
+    using rotary = rotaryStream.result;
     using hidden = new UsingHolder(this.weight("embed.weight").embedding(state.input!, { streams: 4 }));
     using previous = new UsingHolder<Tensor>(undefined!);
+    rotaryStream.streamWaitEvent();
     for (let layer = 40; layer < 43; layer++) {
-      this.runPhased(this.mlaLayerPhased(hidden, previous, layer, state, {} as Required<LayerHolders>, plan));
+      this.runPhased(this.mlaLayerPhased(hidden, previous, layer, state, {} as Required<LayerHolders>, rotary, plan));
     }
     using collapsed = hidden.value.dsv41Collapse(previous.value);
     using normed = collapsed.rmsnorm(this.weight("mtp.2.norm.weight"), 1e-20);

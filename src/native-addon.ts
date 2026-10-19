@@ -63,7 +63,8 @@ export interface NativeAddon {
   fusedAddRmsnorm(ctx: number, out: number, residual: number, inputA: number, inputB: number, weight: number, eps: number, dim: number, batch: number): void;
   fusedNormRope(ctx: number, out: number, input: number, weight: number, cos: number, sin: number, eps: number, ropeDim: number, headDim: number, nHeads: number, seqLen: number, batch: number, inStride: number, interleaved?: boolean): void;
   siluAndMul(ctx: number, out: number, gate: number, up: number, intermediate: number, batch: number): void;
-  dsv41Rope(ctx: number, out: number, input: number, positions: number, rows: number, dim: number, compressed: number, inverse: number, ratio: number, heads: number): void;
+  dsv41RotaryEmbedding(ctx: number, out: number, positions: number, tokens: number): void;
+  dsv41Rope(ctx: number, out: number, input: number, rotary: number, rows: number, dim: number, compressed: number, inverse: number, ratio: number, heads: number): void;
   dsv41SwiGlu(ctx: number, out: number, gate: number, up: number, count: number): void;
   dsv41Route(ctx: number, ids: number, weights: number, logits: number, bias: number, tokens: number, experts: number): void;
   dsv41Collapse(ctx: number, out: number, hidden: number, pre: number, dim: number, tokens: number): void;

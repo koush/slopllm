@@ -4,26 +4,37 @@
 #include <cuda_fp8.h>
 
 namespace {
-// The position remains a device input so one graph can replay at every token.
-__global__ void rope_device(__nv_bfloat16* out, const __nv_bfloat16* in,
-                            const int32_t* position, int heads, int dim,
-                            bool compressed, bool inverse, int ratio, int heads_per_token) {
-    const int pair_index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (pair_index >= heads * dim / 2) return;
-    const int head = pair_index / (dim / 2), pair = pair_index % (dim / 2);
-    const int i = head * dim + pair * 2;
-    if (pair < (dim - 64) / 2) { out[i] = in[i]; out[i + 1] = in[i + 1]; return; }
-    const int rotary_pair = pair - (dim - 64) / 2;
+// [uncompressed, compressed, compressed ratio-2] x tokens x 32 (cos, sin) pairs.
+// Positions remain device inputs, so captured forwards regenerate the tables.
+__global__ void rotary_embedding_device(float* out, const int32_t* position, int tokens) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= 3 * tokens * 32) return;
+    const int variant = index / (tokens * 32), token = (index / 32) % tokens;
+    const int rotary_pair = index % 32;
+    const bool compressed = variant != 0;
     const double theta = compressed ? 160000. : 10000.;
     const double pi = 3.14159265358979323846;
     const int low = max(0, int(floor(64. * log(65536. / (32. * 2. * pi)) / (2. * log(theta)))));
     const int high = min(63, int(ceil(64. * log(65536. / (2. * pi)) / (2. * log(theta)))));
     const double ramp = fmin(1., fmax(0., (rotary_pair - low) / (high == low ? .001 : double(high - low))));
     const float freq = float(pow(theta, -rotary_pair / 32.) * (compressed ? 1. - ramp + ramp / 16. : 1.));
-    const int token_position = position[head / heads_per_token];
-    const int p = ratio ? ((token_position + 1) / ratio - 1) * ratio : token_position;
+    const int token_position = position[token];
+    const int p = variant == 2 ? ((token_position + 1) / 2 - 1) * 2 : token_position;
     const float angle = p * freq;
-    const double c = float(cos(double(angle))), s = float(sin(double(angle))) * (inverse ? -1. : 1.);
+    out[index * 2] = float(cos(double(angle)));
+    out[index * 2 + 1] = float(sin(double(angle)));
+}
+
+__global__ void rope_device(__nv_bfloat16* out, const __nv_bfloat16* in,
+                            const float* rotary, int heads, int dim,
+                            bool inverse, int heads_per_token) {
+    const int pair_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair_index >= heads * dim / 2) return;
+    const int head = pair_index / (dim / 2), pair = pair_index % (dim / 2);
+    const int i = head * dim + pair * 2;
+    if (pair < (dim - 64) / 2) { out[i] = in[i]; out[i + 1] = in[i + 1]; return; }
+    const int offset = (head / heads_per_token) * 64 + (pair - (dim - 64) / 2) * 2;
+    const double c = rotary[offset], s = double(rotary[offset + 1]) * (inverse ? -1. : 1.);
     const double a = float(in[i]), b = float(in[i + 1]);
     out[i] = __float2bfloat16(float(a * c - b * s));
     out[i + 1] = __float2bfloat16(float(a * s + b * c));
@@ -367,11 +378,16 @@ __global__ void compress_latent(__nv_bfloat16* out, int32_t* valid, const float*
 }
 }
 
-void glm_dsv41_rope(GlmCtx* ctx, void* out, const void* input, const int32_t* positions,
+void glm_dsv41_rotary_embedding(GlmCtx* ctx, float* out, const int32_t* positions, int tokens) {
+    cudaSetDevice(ctx->device_id);
+    rotary_embedding_device<<<(3*tokens*32+255)/256,256,0,GLM_STREAM(ctx)>>>(out,positions,tokens);
+}
+void glm_dsv41_rope(GlmCtx* ctx, void* out, const void* input, const float* rotary,
     int rows, int dim, int compressed, int inverse, int ratio, int heads) {
     cudaSetDevice(ctx->device_id);
     rope_device<<<(rows*dim/2+255)/256,256,0,GLM_STREAM(ctx)>>>((__nv_bfloat16*)out,
-        (const __nv_bfloat16*)input,positions,rows,dim,compressed,inverse,ratio,heads);
+        (const __nv_bfloat16*)input,rotary + (compressed ? (ratio == 2 ? 2 : 1) : 0) * (rows / heads) * 64,
+        rows,dim,inverse,heads);
 }
 void glm_dsv41_swiglu(GlmCtx* ctx, void* out, const void* gate, const void* up, int count) {
     cudaSetDevice(ctx->device_id);

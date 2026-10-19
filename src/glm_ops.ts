@@ -1025,14 +1025,24 @@ export class GlmTensor extends Tensor {
     if (tensors.some(t => t && t.workspace.ops !== this.ops)) throw new Error("DSV4 tensors must belong to the same backend");
   }
 
-  dsv41Rope(positions: Tensor, compressed: boolean, inverse = false, dim = 512, ratio = 0): Tensor {
+  dsv41RotaryEmbedding(): Tensor {
+    if (this.type !== "I32" || !this.numElements) throw new Error("V4.1 rotary requires I32 positions");
+    const output = this.workspace.alloc([3, this.numElements, 64], "F32");
+    getNativeAddon().dsv41RotaryEmbedding(this.ops.ctx, output.data, this.data, this.numElements);
+    return output;
+  }
+
+  dsv41Rope(rotary: Tensor, compressed: boolean, inverse = false, dim = 512, ratio = 0): Tensor {
     const input = this;
-    this.checkDsv41Tensors(positions);
-    if (input.type !== "BF16" || positions.type !== "I32" || dim < 64 || dim % 2
-      || !positions.numElements || input.numElements % (dim * positions.numElements)) throw new Error("Invalid V4.1 rotary input");
+    this.checkDsv41Tensors(rotary);
+    const tokens = rotary.shape[1];
+    if (input.type !== "BF16" || rotary.type !== "F32" || rotary.shape.length !== 3
+      || rotary.shape[0] !== 3 || rotary.shape[2] !== 64 || dim < 64 || dim % 2
+      || !tokens || !input.numElements || input.numElements % (dim * tokens)
+      || ![0, 1, 2].includes(ratio) || (ratio === 2 && !compressed)) throw new Error("Invalid V4.1 rotary input");
     const output = input.workspace.alloc(input.shape, "BF16");
-    getNativeAddon().dsv41Rope(this.ops.ctx, output.data, input.data, positions.data, input.numElements / dim,
-      dim, +compressed, +inverse, ratio, input.numElements / dim / positions.numElements);
+    getNativeAddon().dsv41Rope(this.ops.ctx, output.data, input.data, rotary.data, input.numElements / dim,
+      dim, +compressed, +inverse, ratio, input.numElements / dim / tokens);
     return output;
   }
 
@@ -1213,7 +1223,9 @@ export class GlmOps implements DeviceOps {
         || (lengths && (lengths.type !== "I32" || lengths.shape.length !== 1 || lengths.shape[0] !== q.shape[0]))) throw new Error("Invalid DSV4 cache selection");
     }
     if (sinks && (sinks.type !== "F32" || sinks.shape.length !== 1 || sinks.numElements !== q.shape[1])) throw new Error("Invalid DSV4 sinks");
-    const decode = mode === "decode" || (mode === "auto" && q.shape[0] <= 64);
+    // Like sparseMlaPrefill, use split-K decode for small query blocks: causality
+    // is encoded in the per-query slots, independent of prefill/decode planning.
+    const decode = mode === "decode" || (mode === "auto" && q.shape[0] <= SPARSE_MLA_DECODE_DISPATCH_MAX);
     if (decode && q.shape[0] > 64) throw new Error("DSV4 decode supports at most 64 tokens");
     const heads = q.shape[1];
     if (heads < 1 || heads > 128) throw new Error("DSV4 attention supports 1..128 heads per GPU");

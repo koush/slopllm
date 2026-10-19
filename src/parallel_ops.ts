@@ -726,10 +726,16 @@ export class ParallelTensor extends Tensor {
     for (const t of tensors) if (t) this.assertParallel("DSV4", this.cast(t), TensorParallelism.Replicated);
   }
 
-  dsv41Rope(positions: Tensor, compressed: boolean, inverse = false, dim = 512, ratio = 0): Tensor {
-    this.requireDsv4Replicated(positions);
+  dsv41RotaryEmbedding(): Tensor {
+    this.requireDsv4Replicated(this);
+    const shards = this.shards.map(x => x.dsv41RotaryEmbedding());
+    return this.parallelOps.wrapShards(this.workspace, shards, [3, this.numElements, 64], "F32", TensorParallelism.Replicated);
+  }
+
+  dsv41Rope(rotary: Tensor, compressed: boolean, inverse = false, dim = 512, ratio = 0): Tensor {
+    this.requireDsv4Replicated(rotary);
     this.assertParallel("DSV4 rotary input", this, TensorParallelism.Row, TensorParallelism.Replicated);
-    const shards = this.shards.map((x, r) => x.dsv41Rope(this.cast(positions).shards[r], compressed, inverse, dim, ratio));
+    const shards = this.shards.map((x, r) => x.dsv41Rope(this.cast(rotary).shards[r], compressed, inverse, dim, ratio));
     return this.parallelOps.wrapShards(this.workspace, shards, this.shape, "BF16", this.parallelism);
   }
 

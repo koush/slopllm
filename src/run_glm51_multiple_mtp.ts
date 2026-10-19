@@ -4,7 +4,6 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { type ChatCache, type ChatModel, type Tokenizer } from "./chat_model";
 import { type DeviceOps } from "./device_ops";
 import { ExecutionWorkspace } from "./execution-workspace";
-import { Glm51Model } from "./glm51_model";
 import { type GlmOps } from "./glm_ops";
 import { createDeviceOps, loadModel, type ModelCliArgs, parseModelArgs, resolveModelSelection } from "./model_cli";
 import { MtpStats } from "./mtp_stats";
@@ -326,8 +325,8 @@ async function runBatch(model: ChatModel, ws: ExecutionWorkspace, cache: ChatCac
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   Error.stackTraceLimit = 20;
   const args = parseArgs(argv);
-  const { modelDir, modelType } = resolveModelSelection(args);
-  if (!args.noMtp && modelType !== "glm_moe_dsa") throw new Error("MTP requires a glm_moe_dsa checkpoint; use --no-mtp for other models");
+  const { modelDir, modelType, registration } = resolveModelSelection(args);
+  if (!args.noMtp && !registration.mtp) throw new Error(`${modelType} does not support MTP; use --no-mtp`);
   const { ops, gpuDevices } = createDeviceOps(args);
   let model: ChatModel | undefined;
   let cache: ChatCache | undefined;
@@ -335,7 +334,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
   try {
     const loadedModel = await loadModel(ops, args, modelDir);
-    if (!args.noMtp && !(loadedModel instanceof Glm51Model)) throw new Error("MTP requires a GLM-5.1 model");
     model = loadedModel;
     const workspaceSeqLen = args.file ? Math.min(args.maxSeqLen, PREFILL_CHUNK_SIZE + 1) : args.maxSeqLen;
     cache = model.createChatCache(args.maxPages, args.batchSize, workspaceSeqLen);

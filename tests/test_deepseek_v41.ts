@@ -44,7 +44,7 @@ for (const tp of [1, 2]) {
       };
       const local = makeSelection(1, 3);
       const global = makeSelection(2, 5);
-      for (const mode of ["decode", "prefill"] as const) {
+      for (const mode of ["auto", "decode", "prefill"] as const) {
         const result = ops.dsv4SparseAttention(q, local, global, sinks, mode);
         using output = result.output;
         using lse = result.lse;
@@ -138,7 +138,8 @@ for (const tp of [1, 2]) {
       indexInput.h2d(bf16Round(indexValues));
       using indexPosition = ws.alloc([1], "I32");
       indexPosition.h2d(Buffer.from(Int32Array.of(129).buffer));
-      using rotatedIndex = indexInput.dsv41Rope(indexPosition, true, false, 128);
+      using indexRotary = indexPosition.dsv41RotaryEmbedding();
+      using rotatedIndex = indexInput.dsv41Rope(indexRotary, true, false, 128);
       using quantizedIndex = ws.alloc([1, 4096], "F32", undefined, TensorParallelism.Row);
       ops.dsv41IndexQuantize(quantizedIndex, rotatedIndex, indexPosition);
       using fullIndex = quantizedIndex.replicate();

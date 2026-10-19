@@ -498,7 +498,9 @@ export abstract class Tensor implements Disposable {
     throw new Error(`Unsupported conversion ${this.type} to ${type}`);
   }
 
-  dsv41Rope(positions: Tensor, compressed: boolean, inverse = false, dim = 512, ratio = 0): Tensor { throw new Error("V4.1 rotary requires CUDA"); }
+  /** Generate F32 [3, tokens, 64] interleaved cos/sin tables from I32 positions. */
+  dsv41RotaryEmbedding(): Tensor { throw new Error("V4.1 rotary requires CUDA"); }
+  dsv41Rope(rotary: Tensor, compressed: boolean, inverse = false, dim = 512, ratio = 0): Tensor { throw new Error("V4.1 rotary requires CUDA"); }
   dsv41Collapse(pre: Tensor): Tensor { throw new Error("V4.1 collapse requires CUDA"); }
   dsv41MhcPre(fn: Tensor, base: Tensor, scale: Tensor, previousPre?: Tensor, normEps = 1e-20, hcEps = 1e-6, iters = 20): { input: Tensor; pre: Tensor; post: Tensor; comb: Tensor } { throw new Error("V4.1 mHC requires CUDA"); }
   /** Previous carry is read-only. A planned carry must be a fresh allocation, never an input alias. */

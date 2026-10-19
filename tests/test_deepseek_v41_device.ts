@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { it } from "node:test";
 import { GlmOps, bf16BytesToF32 } from "../src/glm_ops";
 import { WorkspaceBase } from "../src/workspace";
+import { CaptureManager } from "../src/capture-manager";
+import type { Tensor } from "../src/tensor";
 import { bf16Round, dsv41Rope, dsv41Route, dsv41SwiGlu, dsv41IndexQuantize, dsv41IndexScores, writeDsv4Cache } from "./deepseek_v41_oracles";
 
 it("V4.1 routing, clipped activation, rotary and paged cache packing match the host oracle", () => {
@@ -25,11 +27,15 @@ it("V4.1 routing, clipped activation, rotary and paged cache packing match the h
   const values = bf16BytesToF32(bf16Round(Float32Array.from({ length: 1024 }, (_, i) => Math.sin(i) * 15)));
   using input = ws.alloc([2, 512], "BF16"), position = ws.alloc([1], "I32");
   input.h2d(bf16Round(values));
-  for (const p of [0, 37, 128, 513, 16000]) for (const compressed of [false, true]) {
+  for (const p of [0, 37, 128, 513, 16000, 1048575]) {
     position.h2d(Buffer.from(Int32Array.of(p).buffer));
-    using rotated = input.dsv41Rope(position, compressed);
-    const bytes = Buffer.alloc(rotated.bytes); rotated.d2h(bytes);
-    assert.deepEqual(bytes, bf16Round(dsv41Rope(values, p, compressed)));
+    using rotary = position.dsv41RotaryEmbedding();
+    for (const compressed of [false, true]) for (const ratio of compressed ? [0, 1, 2] : [0]) for (const inverse of [false, true]) {
+      using rotated = input.dsv41Rope(rotary, compressed, inverse, 512, ratio);
+      const bytes = Buffer.alloc(rotated.bytes); rotated.d2h(bytes);
+      const effectivePosition = ratio === 2 ? (Math.floor((p + 1) / 2) - 1) * 2 : p;
+      assert.deepEqual(bytes, bf16Round(dsv41Rope(values, effectivePosition, compressed, inverse)));
+    }
   }
   using activated = input.siluAndMul(input, 10);
   const bytes = Buffer.alloc(activated.bytes); activated.d2h(bytes);
@@ -69,7 +75,8 @@ it("V4.1 batched primitives preserve token offsets and causal paged visibility",
     positions.h2d(Buffer.from(Int32Array.from({ length }, (_, i) => start + i).buffer));
     using input = ws.alloc([length, 512], "BF16");
     input.h2d(Buffer.concat(Array.from({ length }, (_, i) => bf16Round(row(start + i)))));
-    using rotated = input.dsv41Rope(positions, true);
+    using rotary = positions.dsv41RotaryEmbedding();
+    using rotated = input.dsv41Rope(rotary, true);
     const rotatedBytes = Buffer.alloc(rotated.bytes); rotated.d2h(rotatedBytes);
     assert.deepEqual(rotatedBytes, Buffer.concat(Array.from({ length }, (_, i) => bf16Round(dsv41Rope(row(start + i), start + i, true)))));
     const pageCount = Math.ceil((start + length) / 64);
@@ -87,6 +94,28 @@ it("V4.1 batched primitives preserve token offsets and causal paged visibility",
       assert.deepEqual(slots.slice(i * 128, (i + 1) * 128), Array.from({ length: 128 }, (_, j) => first + j > p ? -1 : first + j));
     }
   }
+});
+
+it("V4.1 captured rotary tables refresh positions and preserve inverse ratio-2 rotation", () => {
+  using ops = new GlmOps(0);
+  using ws = new WorkspaceBase(ops);
+  using manager = new CaptureManager(ops);
+  using input = ws.alloc([2, 128], "BF16"), positions = ws.alloc([2], "I32");
+  const values = bf16BytesToF32(bf16Round(Float32Array.from({ length: 256 }, (_, i) => Math.sin(i * 0.17))));
+  input.h2d(bf16Round(values));
+  for (const start of [0, 63, 128, 15999, 65535, 1048574]) {
+    positions.h2d(Buffer.from(Int32Array.of(start, start + 1).buffer));
+    using output = manager.run({ input, positions }, (_capturing, retained) => {
+      using stream = ops.withStream(() => retained.positions.dsv41RotaryEmbedding());
+      using rotary = stream.result;
+      stream.streamWaitEvent();
+      return retained.input.dsv41Rope(rotary, true, true, 128, 2);
+    }, ["dsv41.rotary"]) as Tensor;
+    const bytes = Buffer.alloc(output.bytes); output.d2h(bytes);
+    assert.deepEqual(bytes, Buffer.concat([0, 1].map(i => bf16Round(dsv41Rope(
+      values.slice(i * 128, (i + 1) * 128), (Math.floor((start + i + 1) / 2) - 1) * 2, true, true, 128)))));
+  }
+  assert([...manager.captured.values()].some(graph => graph.graphExec !== null));
 });
 
 it("V4.1 batched paged indexer masks future keys independently for each query", () => {

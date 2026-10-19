@@ -4477,6 +4477,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "dsv4SparseAttention"), Napi::Function::New(env, Dsv4SparseAttention));
     exports.Set(Napi::String::New(env, "dsv41MhcPre"), Napi::Function::New(env, Dsv41MhcPre));
     exports.Set("dsv41Rope", Napi::Function::New(env, CudaBinding<glm_dsv41_rope>::call));
+    exports.Set("dsv41RotaryEmbedding", Napi::Function::New(env, CudaBinding<glm_dsv41_rotary_embedding>::call));
     exports.Set("dsv41SwiGlu", Napi::Function::New(env, CudaBinding<glm_dsv41_swiglu>::call));
     exports.Set("dsv41Route", Napi::Function::New(env, CudaBinding<glm_dsv41_route>::call));
     exports.Set("dsv41Collapse", Napi::Function::New(env, CudaBinding<glm_dsv41_collapse>::call));
