@@ -1,7 +1,7 @@
 # DeepSeek V4.1 Flash implementation
 
-Target checkpoint: `local-inference-lab/DeepSeek-V4.1-Flash-lossless-CSF`, validated at
-revision `9c60bcbf1670e06f154b5d61080e50c9b3b7b4a3`.
+Target checkpoint: `local-inference-lab/DeepSeek-V4.1-Flash-1017-lossless-CSF`, at
+revision `90d665c19e1a9ff2097cc787515e370d86b616f0`.
 
 ## Supported operations
 
@@ -196,7 +196,7 @@ leave it disabled for throughput measurements.
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'content-type: application/json' \
-  -d '{"model":"local-inference-lab/DeepSeek-V4.1-Flash-lossless-CSF","messages":[{"role":"user","content":"What is the capital of France? Answer with only the city name."}],"temperature":0,"max_tokens":16,"chat_template_kwargs":{"enable_thinking":false}}'
+  -d '{"model":"local-inference-lab/DeepSeek-V4.1-Flash-1017-lossless-CSF","messages":[{"role":"user","content":"What is the capital of France? Answer with only the city name."}],"temperature":0,"max_tokens":16,"chat_template_kwargs":{"enable_thinking":false}}'
 ```
 
 Thinking defaults to enabled, with reasoning effort 75. Set `enable_thinking:false`
@@ -211,7 +211,7 @@ Start a resident loader:
 NCCL_P2P_LEVEL=SYS NCCL_TOPO_FILE=/root/chat/vllm/topo_fixed.xml \
   npx tsx src/run_model_loader.ts \
   --arena 85 --gpus 0,4,5,7,1,2,3,6 \
-  --model local-inference-lab/DeepSeek-V4.1-Flash-lossless-CSF
+  --model local-inference-lab/DeepSeek-V4.1-Flash-1017-lossless-CSF
 ```
 
 Executors use the existing `/fork`, `/spawn`, and `/restart` control endpoints.
