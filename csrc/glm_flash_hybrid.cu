@@ -384,14 +384,21 @@ __global__ void mhc_pre(bf16* collapsed, float* post, float* comb,
     const int row = blockIdx.x, tid = threadIdx.x, width = 4 * dim;
     const bf16* xr = x + static_cast<size_t>(row) * width;
     __shared__ float scratch[8], logits[24], pre[4], p[4], mix[16];
-    if (collapsed_norm && norm_weight) {
+    // The preceding projection already collapsed the input. Its RMSNorm is
+    // independent of the new coefficients, so reserve warp zero for Sinkhorn
+    // and let the remaining warps normalize without a block-wide join.
+    const bool overlap_norm = DELAYED && collapsed_norm && norm_weight;
+    if (collapsed_norm && norm_weight && (!overlap_norm || tid >= 32)) {
         float squared = 0.f;
         for (int p = 0; p < parts; ++p) squared += collapsed_norm[size_t(row) * parts + p];
         const float inv = rsqrtf(squared / dim + norm_eps);
-        for (int i = tid; i < dim; i += blockDim.x) {
+        const int first = overlap_norm ? tid - 32 : tid;
+        const int stride = overlap_norm ? blockDim.x - 32 : blockDim.x;
+        for (int i = first; i < dim; i += stride) {
             const size_t offset = size_t(row) * dim + i;
             collapsed[offset] = __float2bfloat16(float(collapsed[offset]) * inv * float(norm_weight[i]));
         }
+        if (overlap_norm) return;
     }
     if constexpr (DELAYED) {
         if (tid < 24) {
@@ -402,7 +409,10 @@ __global__ void mhc_pre(bf16* collapsed, float* post, float* comb,
             }
             logits[tid] = dot * rsqrtf(squared / width + norm_eps);
         }
-        __syncthreads();
+        // Only warp zero consumes logits in the overlapped path. Other warps
+        // return after RMSNorm, and this path returns before the later CTA sync.
+        if (overlap_norm) __syncwarp();
+        else __syncthreads();
     } else {
         float sum = 0.f;
         for (int i = tid; i < width; i += blockDim.x) {
