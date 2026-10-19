@@ -429,6 +429,7 @@ __global__ void mhc_pre(bf16* collapsed, float* post, float* comb,
         }
         if (overlap_norm) return;
     }
+    float delayed_logit = 0.f;
     if constexpr (DELAYED) {
         if (tid < 24) {
             float dot = 0.f, squared = 0.f;
@@ -436,12 +437,8 @@ __global__ void mhc_pre(bf16* collapsed, float* post, float* comb,
                 dot += partials[(size_t(row) * 25 + tid) * parts + p];
                 squared += partials[(size_t(row) * 25 + 24) * parts + p];
             }
-            logits[tid] = dot * rsqrtf(squared / width + norm_eps);
+            delayed_logit = dot * rsqrtf(squared / width + norm_eps);
         }
-        // Only warp zero consumes logits in the overlapped path. Other warps
-        // return after RMSNorm, and this path returns before the later CTA sync.
-        if (overlap_norm) __syncwarp();
-        else __syncthreads();
     } else {
         float sum = 0.f;
         for (int i = tid; i < width; i += blockDim.x) {
@@ -458,16 +455,23 @@ __global__ void mhc_pre(bf16* collapsed, float* post, float* comb,
         }
     }
     if constexpr (DELAYED) {
+        float post_logit = 0.f, mix_logit = 0.f;
+        if (tid < 32) {
+            // All source lanes participate before branching into consumers.
+            // Only lanes 0..3 use post and lanes 0..15 use mixing logits.
+            post_logit = __shfl_sync(0xffffffff, delayed_logit, (tid + 4) & 31);
+            mix_logit = __shfl_sync(0xffffffff, delayed_logit, (tid + 8) & 31);
+        }
         if (tid < 4) {
-            next_pre[row * 4 + tid] = sigmoid(logits[tid] * scale[0] + base[tid]) + hc_eps;
-            post[row * 4 + tid] = 2.f * sigmoid(logits[4 + tid] * scale[1] + base[4 + tid]);
+            next_pre[row * 4 + tid] = sigmoid(delayed_logit * scale[0] + base[tid]) + hc_eps;
+            post[row * 4 + tid] = 2.f * sigmoid(post_logit * scale[1] + base[4 + tid]);
         }
         // One lane per 4x4 mixing coefficient. Shuffle broadcasts retain the
         // original left-to-right denominator sums without serial matrix loops.
         if (tid < 16) {
             constexpr unsigned mask = 0xffff;
             const int first = (tid / 4) * 4, col = tid % 4;
-            float value = logits[8 + tid] * scale[2] + base[8 + tid];
+            float value = mix_logit * scale[2] + base[8 + tid];
             if (fast_sinkhorn) {
                 comb[row * 16 + tid] = mhc_sinkhorn_fast(value, hc_eps, iters);
             } else {
