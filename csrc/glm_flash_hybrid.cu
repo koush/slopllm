@@ -395,7 +395,24 @@ __global__ void mhc_pre(bf16* collapsed, float* post, float* comb,
         const int first = overlap_norm ? tid - 32 : tid;
         const int stride = overlap_norm ? blockDim.x - 32 : blockDim.x;
         bf16* output = collapsed + size_t(row) * dim;
-        if (dim % 2 == 0 && ((reinterpret_cast<uintptr_t>(output) |
+        if (dim % 8 == 0 && ((reinterpret_cast<uintptr_t>(output) |
+                             reinterpret_cast<uintptr_t>(norm_weight)) & 15) == 0) {
+            union Pack { uint4 words; __nv_bfloat162 pairs[4]; };
+            auto* packed_output = reinterpret_cast<uint4*>(output);
+            const auto* packed_weight = reinterpret_cast<const uint4*>(norm_weight);
+            for (int i = first; i < dim / 8; i += stride) {
+                Pack values = {packed_output[i]};
+                const Pack weights = {packed_weight[i]};
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 value = __bfloat1622float2(values.pairs[j]);
+                    const float2 weight = __bfloat1622float2(weights.pairs[j]);
+                    values.pairs[j] = __floats2bfloat162_rn(value.x * inv * weight.x,
+                                                         value.y * inv * weight.y);
+                }
+                packed_output[i] = values.words;
+            }
+        } else if (dim % 2 == 0 && ((reinterpret_cast<uintptr_t>(output) |
                              reinterpret_cast<uintptr_t>(norm_weight)) & 3) == 0) {
             auto* packed_output = reinterpret_cast<__nv_bfloat162*>(output);
             const auto* packed_weight = reinterpret_cast<const __nv_bfloat162*>(norm_weight);
