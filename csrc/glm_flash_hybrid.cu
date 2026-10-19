@@ -2,6 +2,9 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cmath>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
 
 namespace {
 using bf16 = __nv_bfloat16;
@@ -80,7 +83,8 @@ __global__ void kda_norm(bf16* out, const bf16* x, const bf16* gate,
                                   sigmoid(__bfloat162float(gate[offset])));
 }
 
-// mHC coefficient projection is FP32 (including normalization), not a BF16 GEMM.
+// mHC weights and accumulators are FP32; BF16 residuals must not cause the
+// projection weights or the normalization intermediates to be rounded to BF16.
 constexpr int MHC_PARTS = 8;
 
 // Parallelize both the 24 coefficients and K. Scratch is [rows,25,8]:
@@ -100,6 +104,112 @@ __global__ void mhc_projection_partials(float* partials, const bf16* x, const fl
     if (c == 0) {
         const float squared = block_sum(norm, scratch);
         if (tid == 0) partials[(size_t(row) * 25 + 24) * MHC_PARTS + part] = squared;
+    }
+}
+
+__device__ __forceinline__ unsigned mhc_tf32(float value) {
+    unsigned result;
+    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(result) : "f"(value));
+    return result;
+}
+
+__device__ __forceinline__ void mhc_mma(float (&d)[4], const unsigned (&a)[4], unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// Like b12x's corrected TF32 mHC projection, BF16 activations are represented
+// exactly and FP32 weights are split into TF32 high + residual. Flush separate
+// high/low accumulators every 32 K elements to bound Tensor Core accumulation
+// error. The scratch contract remains [rows,25,8], including FP32 squared norms.
+template<int TileM, int KWarps>
+__global__ void mhc_projection_tf32(float* partials, const bf16* x, const float* fn, int width, int rows) {
+    constexpr int TileK = 128;
+    const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+    const int first_row = blockIdx.x * TileM, part = blockIdx.y;
+    // Lane groups address different rows at the same K offsets. Padding makes
+    // those rows hit distinct shared-memory banks instead of serializing them.
+    __shared__ bf16 sx[TileM][TileK + 8];
+    __shared__ float sw[24][TileK + 4];
+    __shared__ float reductions[KWarps][TileM][24];
+    constexpr int NormWarps = KWarps == 1 ? 4 : 3 * KWarps;
+    float total[TileM / 16][4] = {};
+    float norm[(TileM + NormWarps - 1) / NormWarps] = {};
+    const int tiles = (width + TileK - 1) / TileK;
+    for (int tile = part; tile < tiles; tile += MHC_PARTS) {
+        const int kbase = tile * TileK;
+        for (int i = tid; i < TileM * TileK; i += blockDim.x) {
+            const int r = i / TileK, k = i % TileK;
+            sx[r][k] = first_row + r < rows && kbase + k < width
+                ? x[size_t(first_row + r) * width + kbase + k] : __float2bfloat16(0.f);
+        }
+        for (int i = tid; i < 24 * TileK; i += blockDim.x) {
+            const int c = i / TileK, k = i % TileK;
+            sw[c][k] = kbase + k < width ? fn[size_t(c) * width + kbase + k] : 0.f;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int r = 0; r < (TileM + NormWarps - 1) / NormWarps; r++) {
+            #pragma unroll
+            for (int k = lane; k < TileK; k += 32) {
+                if (r * NormWarps + warp < TileM) {
+                    const float value = float(sx[r * NormWarps + warp][k]);
+                    norm[r] += value * value;
+                }
+            }
+        }
+        if (warp < 3 * KWarps) {
+            #pragma unroll
+            for (int m = 0; m < TileM / 16; m++) {
+                for (int chunk = (warp / 3) * 32; chunk < TileK; chunk += 32 * KWarps) {
+                    float high[4] = {}, low[4] = {};
+                    #pragma unroll
+                    for (int kk = 0; kk < 32; kk += 8) {
+                        const int r = m * 16 + lane / 4, k = chunk + kk + lane % 4;
+                        const unsigned a[4] = {
+                            __float_as_uint(float(sx[r][k])), __float_as_uint(float(sx[r + 8][k])),
+                            __float_as_uint(float(sx[r][k + 4])), __float_as_uint(float(sx[r + 8][k + 4])) };
+                        const float b0 = sw[(warp % 3) * 8 + lane / 4][k], b1 = sw[(warp % 3) * 8 + lane / 4][k + 4];
+                        const unsigned h0 = mhc_tf32(b0), h1 = mhc_tf32(b1);
+                        mhc_mma(low, a, mhc_tf32(b0 - __uint_as_float(h0)), mhc_tf32(b1 - __uint_as_float(h1)));
+                        mhc_mma(high, a, h0, h1);
+                    }
+                    #pragma unroll
+                    for (int i = 0; i < 4; i++) total[m][i] += high[i] + low[i];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (warp < 3 * KWarps) {
+        #pragma unroll
+        for (int m = 0; m < TileM / 16; m++) {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const int row = first_row + m * 16 + lane / 4 + (i / 2) * 8;
+                const int c = (warp % 3) * 8 + (lane % 4) * 2 + i % 2;
+                if constexpr (KWarps > 1) reductions[warp / 3][row - first_row][c] = total[m][i];
+                else if (row < rows) partials[(size_t(row) * 25 + c) * MHC_PARTS + part] = total[m][i];
+            }
+        }
+    }
+    if constexpr (KWarps > 1) {
+        __syncthreads();
+        for (int i = tid; i < TileM * 24; i += blockDim.x) {
+            float sum = 0.f;
+            #pragma unroll
+            for (int group = 0; group < KWarps; group++) sum += reductions[group][i / 24][i % 24];
+            if (first_row + i / 24 < rows) partials[(size_t(first_row + i / 24) * 25 + i % 24) * MHC_PARTS + part] = sum;
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < (TileM + NormWarps - 1) / NormWarps; r++) {
+        float value = norm[r];
+        for (int delta = 16; delta > 0; delta /= 2) value += __shfl_down_sync(0xffffffff, value, delta);
+        const int row = first_row + r * NormWarps + warp;
+        if (lane == 0 && r * NormWarps + warp < TileM && row < rows) partials[(size_t(row) * 25 + 24) * MHC_PARTS + part] = value;
     }
 }
 
@@ -260,7 +370,17 @@ void glm_dsv41_mhc_pre(GlmCtx* ctx, void* out, float* pre, float* post, float* c
                        const float* previous_pre, int rows, int dim, float norm_eps, float hc_eps, int iters, float* partials) {
     cudaSetDevice(ctx->device_id);
     if (rows > 0) {
-        mhc_projection_partials<<<dim3(24, rows, MHC_PARTS), 256, 0, GLM_STREAM(ctx)>>>(partials, (const bf16*)x, fn, 4 * dim);
+        const char* mode = getenv("SLOPLLM_DSV41_MHC_PROJECTION");
+        if (mode && strcmp(mode, "fp32") && strcmp(mode, "tf32")) {
+            fprintf(stderr, "SLOPLLM_DSV41_MHC_PROJECTION must be fp32 or tf32\n");
+            abort();
+        }
+        const bool tensor_core = mode ? !strcmp(mode, "tf32") : rows >= 128;
+        // Decode favors the FP32 split-K reduction. Medium batches parallelize
+        // K within the CTA; large batches favor more rows and weight reuse.
+        if (!tensor_core) mhc_projection_partials<<<dim3(24, rows, MHC_PARTS), 256, 0, GLM_STREAM(ctx)>>>(partials, (const bf16*)x, fn, 4 * dim);
+        else if (rows < 2048) mhc_projection_tf32<16,4><<<dim3((rows+15)/16, MHC_PARTS), 384, 0, GLM_STREAM(ctx)>>>(partials, (const bf16*)x, fn, 4 * dim, rows);
+        else mhc_projection_tf32<32,1><<<dim3((rows+31)/32, MHC_PARTS), 128, 0, GLM_STREAM(ctx)>>>(partials, (const bf16*)x, fn, 4 * dim, rows);
         mhc_pre<float, true><<<rows, 256, 0, GLM_STREAM(ctx)>>>(
             (bf16*)out, post, comb, (const bf16*)x, fn, base, scale, dim, norm_eps, hc_eps, iters, previous_pre, pre, partials);
     }

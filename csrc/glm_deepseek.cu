@@ -122,7 +122,7 @@ __global__ void collapse_device(__nv_bfloat16* out, const __nv_bfloat16* hidden,
     hidden += blockIdx.y * 4 * dim;
     pre += blockIdx.y * 4;
     float sum = 0.f;
-    for (int s = 0; s < 4; s++) sum = float(double(sum) + double(float(hidden[s * dim + d])) * pre[s]);
+    for (int s = 0; s < 4; s++) sum += float(hidden[s * dim + d]) * pre[s];
     out[d] = __float2bfloat16(sum);
 }
 

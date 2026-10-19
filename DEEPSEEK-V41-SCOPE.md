@@ -145,9 +145,16 @@ Small workloads use one query per CTA; larger workloads reuse a 64-key tile
 across four queries, with independent compressed causal bounds for each query.
 Mixed-sequence query tiles reload keys per query. Dispatch uses
 query count and compressed key capacity; `SLOPLLM_DSV41_INDEXER_QUERY_TILE=1|4`
-overrides it for kernel comparisons. mHC's projection and squared norm use FP32 split-K
-partials; inverse RMS is applied to the merged projection before coefficient
-activation. No BF16 intermediate is introduced in that coefficient computation.
+overrides it for kernel comparisons. mHC's projection and squared norm use FP32
+split-K partials; inverse RMS is applied to the merged projection before coefficient
+activation. Below 128 tokens the projection uses FP32 multiply/accumulate.
+Larger batches use Tensor Cores with TF32-exact BF16 activations and FP32 weights
+split into TF32 high and residual terms. Separate FP32 high/low accumulators are
+merged every 32 K elements. Tiles cover 16 tokens below 2,048 tokens and 32 tokens
+at larger sizes. `SLOPLLM_DSV41_MHC_PROJECTION=fp32|tf32` overrides the arithmetic
+path for comparisons. Mixing coefficients, Sinkhorn, and four-stream collapse
+use FP32 arithmetic; collapsed hidden states are rounded to BF16 only at output.
+No BF16 intermediate is introduced in the coefficient computation.
 Indexer queries and keys use 132-byte records: 128 E4M3 bytes followed by one
 power-of-two FP32 scale. With 2,048 pages, persistent replicated cache storage
 is approximately 3.20 GiB/GPU. Index-score tests compare FP32-reference scores
