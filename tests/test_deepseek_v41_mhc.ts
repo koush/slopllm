@@ -86,3 +86,38 @@ it("DeepSeek mHC collapse uses FP32 coefficients and rounds only the final outpu
   });
   assert.deepEqual(bytes, bf16Round(expected));
 });
+
+it("DeepSeek mHC asynchronous tile loads preserve synchronous results exactly", () => {
+  const savedMode = process.env.SLOPLLM_DSV41_MHC_PROJECTION;
+  const savedPipeline = process.env.SLOPLLM_DSV41_MHC_PIPELINE;
+  using ops = new GlmOps(0);
+  try {
+    process.env.SLOPLLM_DSV41_MHC_PROJECTION = "tf32";
+    for (const [rows, dim, offset] of [[33, 72, 0], [129, 73, 0], [129, 72, 1], [129, 5120, 0], [2049, 5120, 0]]) {
+      using ws = new WorkspaceBase(ops);
+      using storage = ws.alloc([rows * 4 * dim + offset], "BF16");
+      using view = storage.narrow(offset, rows * 4 * dim);
+      using x = view.reshape([rows, 4, dim]), fn = ws.alloc([24, 4 * dim], "F32");
+      using base = ws.alloc([24], "F32"), scale = ws.alloc([3], "F32"), previous = ws.alloc([rows, 4], "F32");
+      fn.h2d(Buffer.from(Float32Array.from({ length: fn.numElements }, (_, i) => Math.sin(i * .17) * .01).buffer));
+      base.fill(.01, 24); scale.fill(.1, 3); previous.fill(.25, previous.numElements);
+      const run = (pipeline: string) => {
+        process.env.SLOPLLM_DSV41_MHC_PIPELINE = pipeline;
+        const result = x.dsv41MhcPre(fn, base, scale, previous);
+        using input = result.input; using pre = result.pre; using post = result.post; using comb = result.comb;
+        return [input, pre, post, comb].map(tensor => {
+          const bytes = Buffer.alloc(tensor.bytes); tensor.d2h(bytes); return bytes;
+        });
+      };
+      for (const value of [.5, -.25]) {
+        x.fill(value, x.numElements);
+        assert.deepEqual(run("1"), run("0"), `rows=${rows}, dim=${dim}, value=${value}`);
+      }
+    }
+  } finally {
+    if (savedMode === undefined) delete process.env.SLOPLLM_DSV41_MHC_PROJECTION;
+    else process.env.SLOPLLM_DSV41_MHC_PROJECTION = savedMode;
+    if (savedPipeline === undefined) delete process.env.SLOPLLM_DSV41_MHC_PIPELINE;
+    else process.env.SLOPLLM_DSV41_MHC_PIPELINE = savedPipeline;
+  }
+});

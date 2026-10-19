@@ -154,6 +154,10 @@ merged every 32 K elements. Tiles cover 16 tokens below 2,048 tokens and 32 toke
 at larger sizes. `SLOPLLM_DSV41_MHC_PROJECTION=fp32|tf32` overrides the arithmetic
 path for comparisons. Mixing coefficients, Sinkhorn, and four-stream collapse
 use FP32 arithmetic; collapsed hidden states are rounded to BF16 only at output.
+Tensor Core tiles use double-buffered 16-byte `cp.async` global-to-shared copies,
+overlapping the next tile's transfer with current-tile computation. Unaligned
+inputs or row widths use synchronous loads. `SLOPLLM_DSV41_MHC_PIPELINE=0|1`
+controls asynchronous loading for comparisons without changing the arithmetic.
 No BF16 intermediate is introduced in the coefficient computation.
 Indexer queries and keys use 132-byte records: 128 E4M3 bytes followed by one
 power-of-two FP32 scale. With 2,048 pages, persistent replicated cache storage

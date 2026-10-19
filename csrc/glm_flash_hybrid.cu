@@ -120,34 +120,71 @@ __device__ __forceinline__ void mhc_mma(float (&d)[4], const unsigned (&a)[4], u
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
+__device__ __forceinline__ void mhc_copy_async(void* shared, const void* global, bool valid) {
+    const unsigned address = __cvta_generic_to_shared(shared);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+        :: "r"(address), "l"(global), "r"(valid ? 16 : 0) : "memory");
+}
+
+template<int TileM>
+__device__ __forceinline__ void mhc_load_async(bf16* sx, float* sw, const bf16* x,
+                                               const float* fn, int first_row, int kbase, int width, int rows) {
+    // The async path requires width divisible by eight: all source rows and
+    // 16-byte vectors are aligned, including the final partially filled tile.
+    for (int i = threadIdx.x; i < TileM * 16; i += blockDim.x) {
+        const int r = i / 16, k = (i % 16) * 8;
+        const bool valid = first_row + r < rows && kbase + k < width;
+        mhc_copy_async(sx + r * 136 + k, valid ? x + size_t(first_row + r) * width + kbase + k : x, valid);
+    }
+    for (int i = threadIdx.x; i < 24 * 32; i += blockDim.x) {
+        const int c = i / 32, k = (i % 32) * 4;
+        const bool valid = kbase + k < width;
+        mhc_copy_async(sw + c * 132 + k, valid ? fn + size_t(c) * width + kbase + k : fn, valid);
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+}
+
 // Like b12x's corrected TF32 mHC projection, BF16 activations are represented
 // exactly and FP32 weights are split into TF32 high + residual. Flush separate
 // high/low accumulators every 32 K elements to bound Tensor Core accumulation
 // error. The scratch contract remains [rows,25,8], including FP32 squared norms.
-template<int TileM, int KWarps>
+template<int TileM, int KWarps, bool Pipeline = false>
 __global__ void mhc_projection_tf32(float* partials, const bf16* x, const float* fn, int width, int rows) {
     constexpr int TileK = 128;
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
     const int first_row = blockIdx.x * TileM, part = blockIdx.y;
     // Lane groups address different rows at the same K offsets. Padding makes
     // those rows hit distinct shared-memory banks instead of serializing them.
-    __shared__ bf16 sx[TileM][TileK + 8];
-    __shared__ float sw[24][TileK + 4];
+    __shared__ __align__(16) bf16 sx[Pipeline ? 2 : 1][TileM][TileK + 8];
+    __shared__ __align__(16) float sw[Pipeline ? 2 : 1][24][TileK + 4];
     __shared__ float reductions[KWarps][TileM][24];
     constexpr int NormWarps = KWarps == 1 ? 4 : 3 * KWarps;
     float total[TileM / 16][4] = {};
     float norm[(TileM + NormWarps - 1) / NormWarps] = {};
     const int tiles = (width + TileK - 1) / TileK;
+    if constexpr (Pipeline) {
+        if (part < tiles) mhc_load_async<TileM>(&sx[0][0][0], &sw[0][0][0], x, fn, first_row, part * TileK, width, rows);
+    }
     for (int tile = part; tile < tiles; tile += MHC_PARTS) {
+        const int stage = Pipeline ? ((tile - part) / MHC_PARTS) % 2 : 0;
         const int kbase = tile * TileK;
-        for (int i = tid; i < TileM * TileK; i += blockDim.x) {
-            const int r = i / TileK, k = i % TileK;
-            sx[r][k] = first_row + r < rows && kbase + k < width
-                ? x[size_t(first_row + r) * width + kbase + k] : __float2bfloat16(0.f);
-        }
-        for (int i = tid; i < 24 * TileK; i += blockDim.x) {
-            const int c = i / TileK, k = i % TileK;
-            sw[c][k] = kbase + k < width ? fn[size_t(c) * width + kbase + k] : 0.f;
+        if constexpr (Pipeline) {
+            if (tile + MHC_PARTS < tiles) {
+                mhc_load_async<TileM>(&sx[stage ^ 1][0][0], &sw[stage ^ 1][0][0], x, fn,
+                    first_row, (tile + MHC_PARTS) * TileK, width, rows);
+                // Current tile is ready; the next tile can transfer during MMA.
+                asm volatile("cp.async.wait_group 1;" ::: "memory");
+            } else asm volatile("cp.async.wait_group 0;" ::: "memory");
+        } else {
+            for (int i = tid; i < TileM * TileK; i += blockDim.x) {
+                const int r = i / TileK, k = i % TileK;
+                sx[stage][r][k] = first_row + r < rows && kbase + k < width
+                    ? x[size_t(first_row + r) * width + kbase + k] : __float2bfloat16(0.f);
+            }
+            for (int i = tid; i < 24 * TileK; i += blockDim.x) {
+                const int c = i / TileK, k = i % TileK;
+                sw[stage][c][k] = kbase + k < width ? fn[size_t(c) * width + kbase + k] : 0.f;
+            }
         }
         __syncthreads();
         #pragma unroll
@@ -155,7 +192,7 @@ __global__ void mhc_projection_tf32(float* partials, const bf16* x, const float*
             #pragma unroll
             for (int k = lane; k < TileK; k += 32) {
                 if (r * NormWarps + warp < TileM) {
-                    const float value = float(sx[r * NormWarps + warp][k]);
+                    const float value = float(sx[stage][r * NormWarps + warp][k]);
                     norm[r] += value * value;
                 }
             }
@@ -169,9 +206,9 @@ __global__ void mhc_projection_tf32(float* partials, const bf16* x, const float*
                     for (int kk = 0; kk < 32; kk += 8) {
                         const int r = m * 16 + lane / 4, k = chunk + kk + lane % 4;
                         const unsigned a[4] = {
-                            __float_as_uint(float(sx[r][k])), __float_as_uint(float(sx[r + 8][k])),
-                            __float_as_uint(float(sx[r][k + 4])), __float_as_uint(float(sx[r + 8][k + 4])) };
-                        const float b0 = sw[(warp % 3) * 8 + lane / 4][k], b1 = sw[(warp % 3) * 8 + lane / 4][k + 4];
+                            __float_as_uint(float(sx[stage][r][k])), __float_as_uint(float(sx[stage][r + 8][k])),
+                            __float_as_uint(float(sx[stage][r][k + 4])), __float_as_uint(float(sx[stage][r + 8][k + 4])) };
+                        const float b0 = sw[stage][(warp % 3) * 8 + lane / 4][k], b1 = sw[stage][(warp % 3) * 8 + lane / 4][k + 4];
                         const unsigned h0 = mhc_tf32(b0), h1 = mhc_tf32(b1);
                         mhc_mma(low, a, mhc_tf32(b0 - __uint_as_float(h0)), mhc_tf32(b1 - __uint_as_float(h1)));
                         mhc_mma(high, a, h0, h1);
@@ -181,6 +218,7 @@ __global__ void mhc_projection_tf32(float* partials, const bf16* x, const float*
                 }
             }
         }
+        // All readers must finish before this buffer becomes a future load target.
         __syncthreads();
     }
     if (warp < 3 * KWarps) {
@@ -376,11 +414,23 @@ void glm_dsv41_mhc_pre(GlmCtx* ctx, void* out, float* pre, float* post, float* c
             abort();
         }
         const bool tensor_core = mode ? !strcmp(mode, "tf32") : rows >= 128;
+        const char* pipeline_mode = getenv("SLOPLLM_DSV41_MHC_PIPELINE");
+        if (pipeline_mode && strcmp(pipeline_mode, "0") && strcmp(pipeline_mode, "1")) {
+            fprintf(stderr, "SLOPLLM_DSV41_MHC_PIPELINE must be 0 or 1\n"); abort();
+        }
+        const bool pipeline = (4 * dim) % 8 == 0
+            && ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(fn)) & 15) == 0
+            && (!pipeline_mode || !strcmp(pipeline_mode, "1"));
         // Decode favors the FP32 split-K reduction. Medium batches parallelize
         // K within the CTA; large batches favor more rows and weight reuse.
         if (!tensor_core) mhc_projection_partials<<<dim3(24, rows, MHC_PARTS), 256, 0, GLM_STREAM(ctx)>>>(partials, (const bf16*)x, fn, 4 * dim);
-        else if (rows < 2048) mhc_projection_tf32<16,4><<<dim3((rows+15)/16, MHC_PARTS), 384, 0, GLM_STREAM(ctx)>>>(partials, (const bf16*)x, fn, 4 * dim, rows);
-        else mhc_projection_tf32<32,1><<<dim3((rows+31)/32, MHC_PARTS), 128, 0, GLM_STREAM(ctx)>>>(partials, (const bf16*)x, fn, 4 * dim, rows);
+        else if (rows < 2048) {
+            if (pipeline) mhc_projection_tf32<16,4,true><<<dim3((rows+15)/16, MHC_PARTS), 384, 0, GLM_STREAM(ctx)>>>(partials, (const bf16*)x, fn, 4 * dim, rows);
+            else mhc_projection_tf32<16,4><<<dim3((rows+15)/16, MHC_PARTS), 384, 0, GLM_STREAM(ctx)>>>(partials, (const bf16*)x, fn, 4 * dim, rows);
+        } else {
+            if (pipeline) mhc_projection_tf32<32,1,true><<<dim3((rows+31)/32, MHC_PARTS), 128, 0, GLM_STREAM(ctx)>>>(partials, (const bf16*)x, fn, 4 * dim, rows);
+            else mhc_projection_tf32<32,1><<<dim3((rows+31)/32, MHC_PARTS), 128, 0, GLM_STREAM(ctx)>>>(partials, (const bf16*)x, fn, 4 * dim, rows);
+        }
         mhc_pre<float, true><<<rows, 256, 0, GLM_STREAM(ctx)>>>(
             (bf16*)out, post, comb, (const bf16*)x, fn, base, scale, dim, norm_eps, hc_eps, iters, previous_pre, pre, partials);
     }
