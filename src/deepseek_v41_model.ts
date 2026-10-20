@@ -32,6 +32,8 @@ export class CompressorCarry implements Disposable {
 export class LayerHolders extends DisposableSet {
   readonly localSlots = new UsingHolder<Tensor>(undefined!);
   readonly sharedSlots = new UsingHolder<Tensor>(undefined!);
+  readonly localLengths = new UsingHolder<Tensor>(undefined!);
+  readonly sharedLengths = new UsingHolder<Tensor>(undefined!);
   readonly candidates = new UsingHolder<Tensor>(undefined!);
   readonly compressorInputs = new Map<number, CompressorCarry>();
   readonly compressorOutputs = new Map<number, CompressorCarry>();
@@ -43,6 +45,8 @@ export class LayerHolders extends DisposableSet {
     super();
     this.add(this.localSlots);
     this.add(this.sharedSlots);
+    this.add(this.localLengths);
+    this.add(this.sharedLengths);
     this.add(this.candidates);
     this.compressorCarry = parent?.compressorCarry ?? new Map();
     if (!parent) {
@@ -160,6 +164,7 @@ interface DsparkPlan {
   positions: Tensor;
   pages: Tensor;
   slots?: Tensor;
+  lengths?: Tensor;
   rows?: Tensor[];
 }
 
@@ -514,6 +519,8 @@ export class DeepseekV41Model extends ChatModel {
     // remain owned by the caller until replay/verification has completed.
     using localSlots = layerHolders.localSlots;
     using sharedSlots = layerHolders.sharedSlots;
+    using localLengths = layerHolders.localLengths;
+    using sharedLengths = layerHolders.sharedLengths;
     using candidates = layerHolders.candidates;
     return yield* cb(layerHolders);
   }
@@ -701,7 +708,7 @@ export class DeepseekV41Model extends ChatModel {
   }
 
   private attention(normed: Tensor, layer: number, state: ExecutionState, layerHolders: Required<LayerHolders>, rotary: Tensor): Tensor {
-    const { localSlots, sharedSlots, candidates } = layerHolders;
+    const { localSlots, sharedSlots, localLengths, sharedLengths, candidates } = layerHolders;
     const cache = state.cache as DeepseekV41Cache, ws = state.ws, ops = this.ops;
     const tokens = state.totalTokens, position = state.positionIds;
     const p = `layers.${layer}.attn`, ratio = this.cfg.text.compress_ratios[layer] as 0 | 1 | 2;
@@ -767,7 +774,10 @@ export class DeepseekV41Model extends ChatModel {
     using idxWeights = idxWeightsStream?.result;
     using localSlotsStream = localSlots.value
       ? undefined
-      : ops.withStream(() => ops.dsv4LocalSlots(position, pages, batchIndices));
+      : ops.withStream(() => {
+        localLengths.replace(position.workspace.alloc([position.numElements], "I32"));
+        return ops.dsv4LocalSlots(position, pages, batchIndices, localLengths.value);
+      });
     if (indexSource === layer) {
       using indexQ = this.linear(qNorm, p + ".indexer.wq_b");
       using rotatedQ = indexQ.dsv41Rope(rotary, true, false, 128);
@@ -783,7 +793,8 @@ export class DeepseekV41Model extends ChatModel {
       }
       using selected = ops.dsv41Select(scores, position, ratio, layer > 20 ? candidates.value : undefined);
       sharedSlots.release();
-      sharedSlots.replace(ops.dsv4TopkToSlots(selected, position, pages, ratio as 1 | 2, batchIndices));
+      sharedLengths.replace(position.workspace.alloc([position.numElements], "I32"));
+      sharedSlots.replace(ops.dsv4TopkToSlots(selected, position, pages, ratio as 1 | 2, batchIndices, sharedLengths.value));
     }
     const global = !ratio
       ? undefined
@@ -800,8 +811,8 @@ export class DeepseekV41Model extends ChatModel {
       localSlotsStream.streamWaitEvent();
       localSlots.replace(localSlotsStream.result);
     }
-    const result = ops.dsv4SparseAttention((streamedQuery ?? directQuery)!, { cache: cache.ckvData[layer], indices: localSlots.value },
-      global ? { cache: cache.compressed(source), indices: global } : undefined,
+    const result = ops.dsv4SparseAttention((streamedQuery ?? directQuery)!, { cache: cache.ckvData[layer], indices: localSlots.value, lengths: localLengths.value },
+      global ? { cache: cache.compressed(source), indices: global, lengths: sharedLengths.value } : undefined,
       this.weight(p + ".attn_sink"));
     using output = result.output;
     using lse = result.lse;
@@ -852,6 +863,9 @@ export class DeepseekV41Model extends ChatModel {
     const slots = !block
       ? undefined
       : new Int32Array(totalTokens * 192).fill(-1);
+    const lengths = !slots
+      ? undefined
+      : new Int32Array(totalTokens);
     let row = 0;
     for (let b = 0; b < batchSize; b++) {
       const sequence = cache.sequences[b], start = starts[b];
@@ -866,6 +880,7 @@ export class DeepseekV41Model extends ChatModel {
           for (let p = Math.max(0, start - 128); p < start + 5; p++) {
             slots[row * 192 + column++] = slot(p);
           }
+          lengths![row] = column;
         }
       }
     }
@@ -875,6 +890,9 @@ export class DeepseekV41Model extends ChatModel {
       slots: !slots
         ? undefined
         : upload("slots", slots, [totalTokens, 192]),
+      lengths: !lengths
+        ? undefined
+        : upload("lengths", lengths, [totalTokens]),
       rows: !block
         ? undefined
         : Array.from({ length: 5 }, (_, d) => upload(`rows.${d}`,
@@ -909,7 +927,7 @@ export class DeepseekV41Model extends ChatModel {
     using rotatedQ = projectedQ.dsv41Rope(rotary, false);
     using q = rotatedQ.reshape([state.totalTokens, 64, 512]);
     kvStream.streamWaitEvent();
-    const attention = this.ops.dsv4SparseAttention(q, { cache: plan.cache.ckvData[layer - 40], indices: plan.slots! },
+    const attention = this.ops.dsv4SparseAttention(q, { cache: plan.cache.ckvData[layer - 40], indices: plan.slots!, lengths: plan.lengths },
       undefined, this.weight(prefix + ".attn_sink"));
     using output = attention.output;
     using lse = attention.lse;

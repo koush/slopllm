@@ -1,4 +1,5 @@
 #include "glm_ops.h"
+#include "glm_indexer_cache.cuh"
 #include "glm_nvfp4.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -34,18 +35,10 @@ __global__ void rope_device(__nv_bfloat16* out, const __nv_bfloat16* in,
     const int i = head * dim + pair * 2;
     if (pair < (dim - 64) / 2) { out[i] = in[i]; out[i + 1] = in[i + 1]; return; }
     const int offset = (head / heads_per_token) * 64 + (pair - (dim - 64) / 2) * 2;
-    const double c = rotary[offset], s = double(rotary[offset + 1]) * (inverse ? -1. : 1.);
-    const double a = float(in[i]), b = float(in[i + 1]);
-    out[i] = __float2bfloat16(float(a * c - b * s));
-    out[i + 1] = __float2bfloat16(float(a * s + b * c));
-}
-
-__global__ void swiglu_device(__nv_bfloat16* out, const __nv_bfloat16* gate,
-                               const __nv_bfloat16* up, int count) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    const double g = fmin(double(float(gate[i])), 10.);
-    out[i] = __float2bfloat16(float(g / (1. + __expf(float(-g))) * fmin(10., fmax(-10., double(float(up[i]))))));
+    const float c = rotary[offset], s = rotary[offset + 1] * (inverse ? -1.f : 1.f);
+    const float a = float(in[i]), b = float(in[i + 1]);
+    out[i] = __float2bfloat16(a * c - b * s);
+    out[i + 1] = __float2bfloat16(a * s + b * c);
 }
 
 // GLM-style register-resident scores and warp-local top-k. Each warp owns
@@ -158,14 +151,16 @@ __global__ void cache_device(uint8_t* cache, const __nv_bfloat16* input, const i
     for (int s = 8; s; s >>= 1) {
         maximum = fmaxf(maximum, __shfl_xor_sync(mask, maximum, s, 16));
     }
-    const int exponent = int(ceil(log2(double(maximum) / 448.)));
+    const float scale = indexer_ue8m0_scale(maximum);
+    const uint32_t exponent = (__float_as_uint(scale) >> 23) & 0xffu;
+    const float inverse_scale = __uint_as_float((254u - exponent) << 23);
     if (!lane) {
-        scales[block] = exponent + 127;
+        scales[block] = exponent;
     }
     uint32_t packed = 0;
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        packed |= uint32_t(__nv_fp8_e4m3(ldexpf(float(values[i]), -exponent)).__x) << (8 * i);
+        packed |= uint32_t(__nv_fp8_e4m3(float(values[i]) * inverse_scale).__x) << (8 * i);
     }
     *reinterpret_cast<uint32_t*>(data + block * 64 + d) = packed;
 }
@@ -211,40 +206,85 @@ __global__ void hash_device(int32_t* out, const int32_t* lookback, const int32_t
     }
 }
 
-__global__ void index_quant_device(uint8_t* out, const __nv_bfloat16* input, const int32_t* position,
+__global__ void index_pack_device(uint8_t* out, const __nv_bfloat16* input, const int32_t* position,
                                     int heads, int ratio, const int32_t* slots = nullptr) {
     input += blockIdx.y * heads * 128;
     position += blockIdx.y;
     if (!ratio) out += size_t(blockIdx.y) * heads * 132;
     if (ratio && (*position + 1) % ratio) return;
-    const int h = blockIdx.x, d = threadIdx.x;
-    __shared__ float maxima[128];
-    const float value = float(input[h * 128 + d]);
-    maxima[d] = fmaxf(1e-4f, fabsf(value));
-    __syncthreads();
-    for (int s = 64; s; s >>= 1) { if (d < s) maxima[d] = fmaxf(maxima[d], maxima[d+s]); __syncthreads(); }
-    const int exponent = int(ceil(log2(double(maxima[0]) / 448.)));
-    const uint8_t quantized = __nv_fp8_e4m3(ldexpf(value, -exponent)).__x;
+    const int h = blockIdx.x;
     const int slot = slots ? slots[blockIdx.y] : 0;
     if (slot < 0) return;
     uint8_t* record = out + (size_t(slot) + h) * 132;
-    record[d] = quantized;
-    if (d == 0) *reinterpret_cast<float*>(record + 128) = ldexpf(1.f, exponent);
+    __shared__ float scratch[2];
+    pack_indexer_k_row<128>(record, reinterpret_cast<float*>(record + 128),
+                           input + h * 128, scratch);
 }
 
 // Logical pages always span 64 original tokens. Ratio-2 uses the first 32
 // records of each physical page, preserving ordinary page sharing and COW.
 __global__ void paged_slots_device(int32_t* out, const int32_t* position, const int32_t* pages,
-                                    const int32_t* selected, int width, int ratio, int mode, const int32_t* batch_indices, int page_stride) {
+                                    const int32_t* selected, int width, int ratio, int mode, const int32_t* batch_indices, int page_stride, int32_t* lengths) {
     const int col = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
     if (col >= width) return;
     if (batch_indices) pages += size_t(batch_indices[row]) * page_stride;
     const int p = position[row];
+    if (col == 0 && lengths) {
+        lengths[row] = min(128, max(0, p + 1));
+    }
     int ordinal;
     if (mode == 0) ordinal = (p + 1) % ratio ? -1 : (p + 1) / ratio - 1;
     else if (mode == 1) { const int key = max(0, p - 127) + col; ordinal = key <= p ? key : -1; }
     else { ordinal = selected[row * width + col]; if (ordinal >= (p + 1) / ratio) ordinal = -1; }
     out[row * width + col] = ordinal < 0 ? -1 : pages[ordinal * ratio / 64] * 64 + ordinal % (64 / ratio);
+}
+
+// Adapted from GLM topk_to_slots: stable ballot compaction, with DeepSeek's
+// compressed logical positions and per-sequence page-table rows.
+__global__ void dsv41_topk_slots_device(int32_t* out, int32_t* lengths,
+    const int32_t* selected, const int32_t* positions, const int32_t* pages,
+    int width, int ratio, const int32_t* batch_indices, int page_stride) {
+    const int row = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (batch_indices) {
+        pages += size_t(batch_indices[row]) * page_stride;
+    }
+    out += size_t(row) * width;
+    selected += size_t(row) * width;
+    const int causal_count = (positions[row] + 1) / ratio;
+    __shared__ int warp_counts[8];
+    int count = 0;
+    for (int base = 0; base < width; base += blockDim.x) {
+        const int col = base + threadIdx.x;
+        const int ordinal = col < width ? selected[col] : -1;
+        int slot = -1;
+        if (ordinal >= 0 && ordinal < causal_count) {
+            slot = pages[ordinal * ratio / 64] * 64 + ordinal % (64 / ratio);
+        }
+        const unsigned vote = __ballot_sync(0xffffffffu, slot >= 0);
+        if (lane == 0) {
+            warp_counts[warp] = __popc(vote);
+        }
+        __syncthreads();
+        int offset = 0, total = 0;
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            if (w < warp) {
+                offset += warp_counts[w];
+            }
+            total += warp_counts[w];
+        }
+        if (slot >= 0) {
+            out[count + offset + __popc(vote & ((1u << lane) - 1))] = slot;
+        }
+        __syncthreads();
+        count += total;
+    }
+    for (int col = count + threadIdx.x; col < width; col += blockDim.x) {
+        out[col] = -1;
+    }
+    if (threadIdx.x == 0 && lengths) {
+        lengths[row] = count;
+    }
 }
 
 // Masks address logical compressed positions, independently of future CP storage.
@@ -428,10 +468,6 @@ void glm_dsv41_rope(GlmCtx* ctx, void* out, const void* input, const float* rota
         (const __nv_bfloat16*)input,rotary + (compressed ? (ratio == 2 ? 2 : 1) : 0) * (rows / heads) * 64,
         rows,dim,inverse,heads);
 }
-void glm_dsv41_swiglu(GlmCtx* ctx, void* out, const void* gate, const void* up, int count) {
-    cudaSetDevice(ctx->device_id);
-    swiglu_device<<<(count+255)/256,256,0,GLM_STREAM(ctx)>>>((__nv_bfloat16*)out,(const __nv_bfloat16*)gate,(const __nv_bfloat16*)up,count);
-}
 void glm_dsv41_route(GlmCtx* ctx, int32_t* ids, float* weights, const float* logits, const float* bias, int tokens, int experts) {
     cudaSetDevice(ctx->device_id);
     // Small batches favor parallel score evaluation; large batches favor four
@@ -466,8 +502,12 @@ void glm_dsv41_hash(GlmCtx* ctx, int32_t* out, const int32_t* lookback, const in
 }
 void glm_dsv41_index_quantize(GlmCtx* ctx, uint8_t* out, const void* input, const int32_t* positions,
     int heads, int ratio, int tokens, const int32_t* slots) {
+    if (!ratio && heads == 32 && !slots) {
+        glm_dsv41_index_quantize_q(ctx, out, input, tokens);
+        return;
+    }
     cudaSetDevice(ctx->device_id);
-    index_quant_device<<<dim3(heads,tokens),128,0,GLM_STREAM(ctx)>>>(out,(const __nv_bfloat16*)input,positions,heads,ratio,slots);
+    index_pack_device<<<dim3(heads,tokens),64,0,GLM_STREAM(ctx)>>>(out,(const __nv_bfloat16*)input,positions,heads,ratio,slots);
 }
 void glm_dsv41_candidates(GlmCtx* ctx, int32_t* out, const void* scores, const int32_t* positions, int capacity, int tokens, void* scratch) {
     cudaSetDevice(ctx->device_id);
@@ -492,9 +532,13 @@ void glm_dsv41_to_bf16(GlmCtx* ctx, void* out, const float* input, int count) {
     to_bf16_device<<<(count+255)/256,256,0,GLM_STREAM(ctx)>>>((__nv_bfloat16*)out,input,count);
 }
 void glm_dsv4_paged_slots(GlmCtx* ctx, int32_t* out, const int32_t* positions, const int32_t* pages,
-    const int32_t* selected, int width, int ratio, int tokens, int mode, const int32_t* batch_indices, int page_stride) {
+    const int32_t* selected, int width, int ratio, int tokens, int mode, const int32_t* batch_indices, int page_stride, int32_t* lengths) {
     cudaSetDevice(ctx->device_id);
-    paged_slots_device<<<dim3((width+127)/128,tokens),128,0,GLM_STREAM(ctx)>>>(out,positions,pages,selected,width,ratio,mode,batch_indices,page_stride);
+    if (mode == 2) {
+        dsv41_topk_slots_device<<<tokens,256,0,GLM_STREAM(ctx)>>>(out,lengths,selected,positions,pages,width,ratio,batch_indices,page_stride);
+    } else {
+        paged_slots_device<<<dim3((width+127)/128,tokens),128,0,GLM_STREAM(ctx)>>>(out,positions,pages,selected,width,ratio,mode,batch_indices,page_stride,lengths);
+    }
 }
 
 extern "C" void glm_dsv41_engram_lookup(GlmCtx* ctx, void* out, const int32_t* ids,

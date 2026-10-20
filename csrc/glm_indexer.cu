@@ -1334,7 +1334,7 @@ __device__ __forceinline__ Acc mma(uint32_t a0, uint32_t a1, uint32_t a2,
 // Row-sharded quantization. 8 lanes per head, 4 heads per warp. weightsOffset
 // shifts into a Replicated [rows, globalNHeads] weight row so a Row-sharded
 // caller reads its contiguous head slice in place (no gather).
-template <int NH>
+template <int NH, bool INTERLEAVED_SCALES = false>
 __global__ void quantize_q_kernel(const __nv_bfloat16* __restrict__ q,
                                   const __nv_bfloat16* __restrict__ weights,
                                   int weightsStride, int weightsOffset,
@@ -1347,7 +1347,6 @@ __global__ void quantize_q_kernel(const __nv_bfloat16* __restrict__ q,
     const int head = tid >> 3;
     const int lane = tid & 7;
     uint8_t* q8 = q8Data + (size_t)qi * q8Stride;
-    float* ew = effectiveWeights + (size_t)qi * ewStride;
     const __nv_bfloat16* src = q + (size_t)qi * (NH * HD) + head * HD;
 
     float vmax = 0.f;
@@ -1359,14 +1358,20 @@ __global__ void quantize_q_kernel(const __nv_bfloat16* __restrict__ q,
         vmax = fmaxf(vmax, __shfl_down_sync(0xffffffffu, vmax, off, 8));
     if (lane == 0) {
         const float qs = indexer_ue8m0_scale(vmax);
-        ew[head] = __bfloat162float(weights[(size_t)qi * weightsStride + weightsOffset + head]) * qs * scale;
+        if constexpr (INTERLEAVED_SCALES) {
+            *reinterpret_cast<float*>(q8 + head * (HD + sizeof(float)) + HD) = qs;
+        } else {
+            float* ew = effectiveWeights + (size_t)qi * ewStride;
+            ew[head] = __bfloat162float(weights[(size_t)qi * weightsStride + weightsOffset + head]) * qs * scale;
+        }
     }
     __syncwarp();
     const float inv = 1.f / __shfl_sync(0xffffffffu, lane == 0 ? indexer_ue8m0_scale(vmax) : 0.f,
                                         (head & 3) * 8, 32);
 #pragma unroll
     for (int d = lane; d < HD; d += 8) {
-        q8[head * HD + d] = __nv_cvt_float_to_fp8(
+        constexpr int HEAD_STRIDE = INTERLEAVED_SCALES ? HD + sizeof(float) : HD;
+        q8[head * HEAD_STRIDE + d] = __nv_cvt_float_to_fp8(
             __bfloat162float(src[d]) * inv, __NV_SATFINITE, __NV_E4M3);
     }
 }
@@ -1508,14 +1513,15 @@ __global__ void score_kernel(
 // Small-query CTAs score 64 keys. Prefill CTAs reuse those keys across four
 // adjacent queries; a mixed-sequence group reloads keys for each query instead.
 // Each query retains its own compressed causal bound, including verification.
-template <int QUERIES>
+template <int QUERIES, bool GRID_STRIDE = false>
 __global__ void dsv41_index_score_mma_kernel(
     __nv_bfloat16* scores, const uint8_t* q, const uint8_t* keys,
     const __nv_bfloat16* weights, const int32_t* positions, const int32_t* pages,
     const int32_t* batch_indices, int page_stride, int ratio, int capacity, int tokens) {
     constexpr int NK = idxfp8::WARPS * idxfp8::K_ROWS;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const int first = blockIdx.y * QUERIES, base = blockIdx.x * NK;
+    static_assert(!GRID_STRIDE || QUERIES == 1);
+    const int first = blockIdx.y * QUERIES;
     const int rows = min(QUERIES, tokens - first);
     const int batch = batch_indices ? batch_indices[first] : 0;
     bool same_batch = true;
@@ -1524,66 +1530,95 @@ __global__ void dsv41_index_score_mma_kernel(
         same_batch &= !batch_indices || batch_indices[first + r] == batch;
         max_count = max(max_count, (positions[first + r] + 1) / ratio);
     }
-    if (base >= max_count) {
-        if (tid < NK && base + tid < capacity)
-            for (int r = 0; r < rows; ++r)
-                scores[size_t(first + r) * capacity + base + tid] = __float2bfloat16(-INFINITY);
-        return;
-    }
     __shared__ __align__(16) uint8_t sq[32 * 128];
     __shared__ __align__(16) uint8_t sk[NK * 128];
     __shared__ float ks[NK], ew[32];
-    for (int r = 0; r < rows; ++r) {
-        const int qi = first + r, count = (positions[qi] + 1) / ratio;
-        if (r == 0 || !same_batch) {
-            const int b = batch_indices ? batch_indices[qi] : 0;
-            const int limit = same_batch ? max_count : count;
-            const int32_t* table = pages + size_t(b) * page_stride;
-            for (int i = tid; i < NK * 32; i += blockDim.x) {
-                const int key = i / 32, d = (i % 32) * 4, ordinal = base + key;
-                uint32_t value = 0;
-                if (ordinal < limit && ordinal < capacity) {
-                    const size_t slot = size_t(table[ordinal * ratio / 64]) * 64 + ordinal % (64 / ratio);
-                    const uint8_t* record = keys + slot * 132;
-                    value = *reinterpret_cast<const uint32_t*>(record + d);
-                    if (d == 0) ks[key] = *reinterpret_cast<const float*>(record + 128);
-                } else if (d == 0) ks[key] = 0.f;
-                reinterpret_cast<uint32_t*>(sk)[i] = value;
+    if constexpr (GRID_STRIDE) {
+        // Load Q once per split, then reuse it across the split's key tiles.
+        if (blockIdx.x * NK < max_count) {
+            const uint8_t* query = q + size_t(first) * 32 * 132;
+            for (int i = tid; i < 32 * 32; i += blockDim.x) {
+                reinterpret_cast<uint32_t*>(sq)[i] = *reinterpret_cast<const uint32_t*>(query + (i / 32) * 132 + (i % 32) * 4);
+            }
+            if (tid < 32) {
+                ew[tid] = float(weights[size_t(first) * 32 + tid]) * (*reinterpret_cast<const float*>(query + tid * 132 + 128) / 64.f);
             }
         }
-        const uint8_t* query = q + size_t(qi) * 32 * 132;
-        for (int i = tid; i < 32 * 32; i += blockDim.x)
-            reinterpret_cast<uint32_t*>(sq)[i] = *reinterpret_cast<const uint32_t*>(query + (i / 32) * 132 + (i % 32) * 4);
-        if (tid < 32)
-            ew[tid] = float(weights[size_t(qi) * 32 + tid]) * (*reinterpret_cast<const float*>(query + tid * 132 + 128) / 64.f);
-        __syncthreads();
-        idxfp8::Acc lo{0.f, 0.f, 0.f, 0.f}, hi{0.f, 0.f, 0.f, 0.f};
-        const uint8_t* wk = sk + warp * 8 * 128;
-        #pragma unroll
-        for (int kk = 0; kk < 128; kk += 32) {
-            uint32_t a0, a1, a2, a3, b0, b1;
-            idxfp8::load_b(b0, b1, wk + kk, lane);
-            idxfp8::load_a(a0, a1, a2, a3, sq + kk, lane);
-            lo = idxfp8::mma(a0, a1, a2, a3, b0, b1, lo);
-            idxfp8::load_a(a0, a1, a2, a3, sq + 16 * 128 + kk, lane);
-            hi = idxfp8::mma(a0, a1, a2, a3, b0, b1, hi);
+    }
+    // Also cover padded capacity on replay: every out-of-range score is -inf.
+    for (int base = blockIdx.x * NK; base < capacity; base += gridDim.x * NK) {
+        if (base >= max_count) {
+            if (tid < NK && base + tid < capacity) {
+                for (int r = 0; r < rows; ++r) {
+                    scores[size_t(first + r) * capacity + base + tid] = __float2bfloat16(-INFINITY);
+                }
+            }
+            continue;
         }
-        const int group = lane >> 2, pair = lane & 3;
-        float s0 = ew[group] * fmaxf(lo.x0, 0.f) + ew[group + 8] * fmaxf(lo.x2, 0.f)
-                 + ew[group + 16] * fmaxf(hi.x0, 0.f) + ew[group + 24] * fmaxf(hi.x2, 0.f);
-        float s1 = ew[group] * fmaxf(lo.x1, 0.f) + ew[group + 8] * fmaxf(lo.x3, 0.f)
-                 + ew[group + 16] * fmaxf(hi.x1, 0.f) + ew[group + 24] * fmaxf(hi.x3, 0.f);
-        #pragma unroll
-        for (int off = 4; off <= 16; off <<= 1) {
-            s0 += __shfl_xor_sync(0xffffffffu, s0, off);
-            s1 += __shfl_xor_sync(0xffffffffu, s1, off);
+        for (int r = 0; r < rows; ++r) {
+            const int qi = first + r, count = (positions[qi] + 1) / ratio;
+            if (r == 0 || !same_batch) {
+                const int b = batch_indices ? batch_indices[qi] : 0;
+                const int limit = same_batch ? max_count : count;
+                const int32_t* table = pages + size_t(b) * page_stride;
+                for (int i = tid; i < NK * 32; i += blockDim.x) {
+                    const int key = i / 32, d = (i % 32) * 4, ordinal = base + key;
+                    uint32_t value = 0;
+                    if (ordinal < limit && ordinal < capacity) {
+                        const size_t slot = size_t(table[ordinal * ratio / 64]) * 64 + ordinal % (64 / ratio);
+                        const uint8_t* record = keys + slot * 132;
+                        value = *reinterpret_cast<const uint32_t*>(record + d);
+                        if (d == 0) {
+                            ks[key] = *reinterpret_cast<const float*>(record + 128);
+                        }
+                    } else if (d == 0) {
+                        ks[key] = 0.f;
+                    }
+                    reinterpret_cast<uint32_t*>(sk)[i] = value;
+                }
+            }
+            if constexpr (!GRID_STRIDE) {
+                const uint8_t* query = q + size_t(qi) * 32 * 132;
+                for (int i = tid; i < 32 * 32; i += blockDim.x) {
+                    reinterpret_cast<uint32_t*>(sq)[i] = *reinterpret_cast<const uint32_t*>(query + (i / 32) * 132 + (i % 32) * 4);
+                }
+                if (tid < 32) {
+                    ew[tid] = float(weights[size_t(qi) * 32 + tid]) * (*reinterpret_cast<const float*>(query + tid * 132 + 128) / 64.f);
+                }
+            }
+            __syncthreads();
+            idxfp8::Acc lo{0.f, 0.f, 0.f, 0.f}, hi{0.f, 0.f, 0.f, 0.f};
+            const uint8_t* wk = sk + warp * 8 * 128;
+            #pragma unroll
+            for (int kk = 0; kk < 128; kk += 32) {
+                uint32_t a0, a1, a2, a3, b0, b1;
+                idxfp8::load_b(b0, b1, wk + kk, lane);
+                idxfp8::load_a(a0, a1, a2, a3, sq + kk, lane);
+                lo = idxfp8::mma(a0, a1, a2, a3, b0, b1, lo);
+                idxfp8::load_a(a0, a1, a2, a3, sq + 16 * 128 + kk, lane);
+                hi = idxfp8::mma(a0, a1, a2, a3, b0, b1, hi);
+            }
+            const int group = lane >> 2, pair = lane & 3;
+            float s0 = ew[group] * fmaxf(lo.x0, 0.f) + ew[group + 8] * fmaxf(lo.x2, 0.f)
+                     + ew[group + 16] * fmaxf(hi.x0, 0.f) + ew[group + 24] * fmaxf(hi.x2, 0.f);
+            float s1 = ew[group] * fmaxf(lo.x1, 0.f) + ew[group + 8] * fmaxf(lo.x3, 0.f)
+                     + ew[group + 16] * fmaxf(hi.x1, 0.f) + ew[group + 24] * fmaxf(hi.x3, 0.f);
+            #pragma unroll
+            for (int off = 4; off <= 16; off <<= 1) {
+                s0 += __shfl_xor_sync(0xffffffffu, s0, off);
+                s1 += __shfl_xor_sync(0xffffffffu, s1, off);
+            }
+            if (group == 0) {
+                const int k0 = warp * 8 + pair * 2, p0 = base + k0, p1 = p0 + 1;
+                if (p0 < capacity) {
+                    scores[size_t(qi) * capacity + p0] = __float2bfloat16(p0 < count ? s0 * ks[k0] : -INFINITY);
+                }
+                if (p1 < capacity) {
+                    scores[size_t(qi) * capacity + p1] = __float2bfloat16(p1 < count ? s1 * ks[k0 + 1] : -INFINITY);
+                }
+            }
+            __syncthreads();
         }
-        if (group == 0) {
-            const int k0 = warp * 8 + pair * 2, p0 = base + k0, p1 = p0 + 1;
-            if (p0 < capacity) scores[size_t(qi) * capacity + p0] = __float2bfloat16(p0 < count ? s0 * ks[k0] : -INFINITY);
-            if (p1 < capacity) scores[size_t(qi) * capacity + p1] = __float2bfloat16(p1 < count ? s1 * ks[k0 + 1] : -INFINITY);
-        }
-        __syncthreads();
     }
 }
 
@@ -1597,6 +1632,19 @@ void glm_dsv41_index_scores(GlmCtx* ctx, void* out, const uint8_t* query, const 
     if (tile && std::strcmp(tile, "1") && std::strcmp(tile, "4")) {
         fprintf(stderr, "SLOPLLM_DSV41_INDEXER_QUERY_TILE must be 1 or 4\n");
         std::abort();
+    }
+    if (tokens <= 8 && capacity >= 32768 && !tile) {
+        const int resident = idx_query_occupancy(dsv41_index_score_mma_kernel<1, true>, 256, 0);
+        // A single-wave budget benchmarks slower than tiled scoring on SM120.
+        // Keep multiple waves, and only use reuse when there are enough tiles
+        // to amortize the loop. Short contexts retain the tiled launch.
+        const int splits = (tokens > 4 ? 4 : 2) * idx_auto_num_splits(resident, tokens);
+        if (splits < (capacity + 63) / 64) {
+            dsv41_index_score_mma_kernel<1, true><<<dim3(splits, tokens), 256, 0, GLM_STREAM(ctx)>>>(
+                (__nv_bfloat16*)out, query, keys, (const __nv_bfloat16*)weights, positions, pages,
+                batch_indices, page_stride, ratio, capacity, tokens);
+            return;
+        }
     }
     // Reusing K wins once the single-query grid spans enough waves; small
     // compressed contexts prefer independent queries even during prefill.
@@ -1748,6 +1796,14 @@ void glm_indexer_score_topk_v2(GlmCtx* ctx, int32_t* out_idx,
 #undef LAUNCH_IDX_SCORE
     glm_topk_from_scores(ctx, out_idx, out_scores, scores, rowLen, hist, meta,
                          totalQ, maxKv, topk, num_splits, effectiveCpWorldSize, effectiveCpRank);
+}
+
+// DeepSeek retains explicit per-head scales so its scoring arithmetic is unchanged.
+void glm_dsv41_index_quantize_q(GlmCtx* ctx, uint8_t* out, const void* input, int tokens) {
+    cudaSetDevice(ctx->device_id);
+    idxfp8::quantize_q_kernel<32, true><<<tokens, 256, 0, GLM_STREAM(ctx)>>>(
+        static_cast<const __nv_bfloat16*>(input), nullptr, 0, 0,
+        out, 32 * (idxfp8::HD + sizeof(float)), nullptr, 0, 1.f);
 }
 
 // Standalone indexer Q quantization for Row-sharded callers. Outputs are

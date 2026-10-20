@@ -885,6 +885,7 @@ void glm_dsv41_collapse(GlmCtx*, void*, const void*, const float*, int, int);
 void glm_dsv41_cache_insert(GlmCtx*, uint8_t*, const void*, const int32_t*, int, int, const int32_t*);
 void glm_dsv41_embedding(GlmCtx*, void*, const void*, const int32_t*, int, int, int, int, int);
 void glm_dsv41_hash(GlmCtx*, int32_t*, const int32_t*, const int32_t*, const int32_t*, const int32_t*, const int32_t*, int, const int32_t*, int);
+void glm_dsv41_index_quantize_q(GlmCtx*, uint8_t*, const void*, int);
 void glm_dsv41_index_quantize(GlmCtx*, uint8_t*, const void*, const int32_t*, int, int, int, const int32_t*);
 void glm_dsv41_index_scores(GlmCtx*, void*, const uint8_t*, const uint8_t*, const void*, const int32_t*, int, int, int, const int32_t*, const int32_t*, int);
 void glm_topk_from_scores_prefill(GlmCtx*, int32_t*, void*, const void*, const int32_t*,
@@ -892,7 +893,7 @@ void glm_topk_from_scores_prefill(GlmCtx*, int32_t*, void*, const void*, const i
 void glm_dsv41_candidates(GlmCtx*, int32_t*, const void*, const int32_t*, int, int, void*);
 void glm_dsv41_select(GlmCtx*, int32_t*, const void*, const int32_t*, const int32_t*, int, int, int, void*);
 void glm_dsv41_to_bf16(GlmCtx*, void*, const float*, int);
-void glm_dsv4_paged_slots(GlmCtx*, int32_t*, const int32_t*, const int32_t*, const int32_t*, int, int, int, int, const int32_t*, int);
+void glm_dsv4_paged_slots(GlmCtx*, int32_t*, const int32_t*, const int32_t*, const int32_t*, int, int, int, int, const int32_t*, int, int32_t*);
 int glm_mxfp4_mul_mat_id(GlmCtx* ctx, void* output, const void* input,
     const void* pointer_table, const int* expert_ids, int top_k, int count, int N, int K);
 int glm_fp8_linear_lt(GlmCtx* ctx, void* output, const void* input,

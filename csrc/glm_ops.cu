@@ -997,6 +997,17 @@ void glm_mla_v_expand(GlmCtx* ctx, void* result, const void* attn_out,
 // SiLU + Mul kernel
 // ---------------------------------------------------------------------------
 
+template <bool CLIPPED>
+__device__ __forceinline__ float swiglu_activation(float gate) {
+    if constexpr (CLIPPED) {
+        // Preserve the negative tail: tanh-based SiLU loses precision near -1.
+        return gate / (1.f + __expf(-gate));
+    } else {
+        return silu_f(gate);
+    }
+}
+
+template <bool CLIPPED = false>
 __global__ void __launch_bounds__(256, 4) silu_and_mul_kernel(
     __nv_bfloat16* out,
     const __nv_bfloat16* gate,
@@ -1007,12 +1018,32 @@ __global__ void __launch_bounds__(256, 4) silu_and_mul_kernel(
     if (idx + 1 < total) {
         float2 gv = load_bf16x2(gate + idx);
         float2 uv = load_bf16x2(up + idx);
-        store_bf16x2(out + idx, silu_f(gv.x) * uv.x, silu_f(gv.y) * uv.y);
+        if constexpr (CLIPPED) {
+            gv.x = fminf(gv.x, 10.f);
+            gv.y = fminf(gv.y, 10.f);
+            uv.x = fminf(10.f, fmaxf(-10.f, uv.x));
+            uv.y = fminf(10.f, fmaxf(-10.f, uv.y));
+        }
+        store_bf16x2(out + idx, swiglu_activation<CLIPPED>(gv.x) * uv.x,
+                    swiglu_activation<CLIPPED>(gv.y) * uv.y);
     } else if (idx < total) {
         float g = __bfloat162float(gate[idx]);
         float u = __bfloat162float(up[idx]);
-        out[idx] = __float2bfloat16(silu_f(g) * u);
+        if constexpr (CLIPPED) {
+            g = fminf(g, 10.f);
+            u = fminf(10.f, fmaxf(-10.f, u));
+        }
+        out[idx] = __float2bfloat16(swiglu_activation<CLIPPED>(g) * u);
     }
+}
+
+void glm_dsv41_swiglu(GlmCtx* ctx, void* out, const void* gate, const void* up, int count) {
+    cudaSetDevice(ctx->device_id);
+    constexpr int block_size = 256;
+    const int grid = (count + 2 * block_size - 1) / (2 * block_size);
+    silu_and_mul_kernel<true><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)gate,
+        (const __nv_bfloat16*)up, count);
 }
 
 void glm_silu_and_mul(GlmCtx* ctx, void* out, const void* gate,
@@ -1021,7 +1052,7 @@ void glm_silu_and_mul(GlmCtx* ctx, void* out, const void* gate,
     int total = batch * intermediate;
     int block_size = 256;
     int grid = (total + 2 * block_size - 1) / (2 * block_size);
-    silu_and_mul_kernel<<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
+    silu_and_mul_kernel<><<<grid, block_size, 0, GLM_STREAM(ctx)>>>(
         (__nv_bfloat16*)out, (const __nv_bfloat16*)gate,
         (const __nv_bfloat16*)up, total);
 }

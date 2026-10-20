@@ -1203,17 +1203,18 @@ export class GlmOps implements DeviceOps {
       || pages.shape.length !== (batchIndices ? 2 : 1) || !pages.numElements || ![1, 2].includes(ratio)
       || (batchIndices && (batchIndices.type !== "I32" || batchIndices.shape.length !== 1 || batchIndices.numElements !== positions.numElements))) throw new Error("Invalid DSV4 paged addressing");
   }
-  private dsv4PagedSlots(positions: Tensor, pages: Tensor, ratio: number, mode: number, selected?: Tensor, batchIndices?: Tensor): Tensor {
+  private dsv4PagedSlots(positions: Tensor, pages: Tensor, ratio: number, mode: number, selected?: Tensor, batchIndices?: Tensor, lengths?: Tensor): Tensor {
     this.validateDsv4Pages(positions, pages, ratio, batchIndices);
-    this.checkDsv41Tensors(selected);
+    this.checkDsv41Tensors(selected, lengths);
+    if (lengths && (lengths.type !== "I32" || lengths.shape.length !== 1 || lengths.numElements !== positions.numElements)) throw new Error("Invalid DSV4 slot lengths");
     if (selected && (selected.type !== "I32" || selected.shape.length !== 2 || selected.shape[0] !== positions.numElements)) throw new Error("Invalid DSV4 top-k indices");
     const width = mode === 0 ? 1 : mode === 1 ? 128 : selected!.shape[1];
     const output = positions.workspace.alloc([positions.numElements, width], "I32");
-    getNativeAddon().dsv4PagedSlots(this.ctx, output.data, positions.data, pages.data, selected?.data ?? 0, output.shape[1], ratio, positions.numElements, mode, batchIndices?.data ?? 0, pages.shape[1] ?? 0);
+    getNativeAddon().dsv4PagedSlots(this.ctx, output.data, positions.data, pages.data, selected?.data ?? 0, output.shape[1], ratio, positions.numElements, mode, batchIndices?.data ?? 0, pages.shape[1] ?? 0, lengths?.data ?? 0);
     return output;
   }
-  dsv4LocalSlots(positions: Tensor, pages: Tensor, batchIndices?: Tensor): Tensor { return this.dsv4PagedSlots(positions, pages, 1, 1, undefined, batchIndices); }
-  dsv4TopkToSlots(selected: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, batchIndices?: Tensor): Tensor { return this.dsv4PagedSlots(positions, pages, ratio, 2, selected, batchIndices); }
+  dsv4LocalSlots(positions: Tensor, pages: Tensor, batchIndices?: Tensor, lengths?: Tensor): Tensor { return this.dsv4PagedSlots(positions, pages, 1, 1, undefined, batchIndices, lengths); }
+  dsv4TopkToSlots(selected: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, batchIndices?: Tensor, lengths?: Tensor): Tensor { return this.dsv4PagedSlots(positions, pages, ratio, 2, selected, batchIndices, lengths); }
   private validateDsv4Append(cache: Tensor, input: Tensor, positions: Tensor, pages: Tensor, ratio: number, keys: boolean, batchIndices?: Tensor): void {
     this.validateDsv4Pages(positions, pages, ratio, batchIndices);
     this.checkDsv41Tensors(cache, input);

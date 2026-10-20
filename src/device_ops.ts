@@ -115,8 +115,8 @@ export interface DeviceOps extends Disposable {
   dsv4IndexScores(query: Tensor, keys: Tensor, weights: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, capacity: number, batchIndices?: Tensor): Tensor;
   dsv41Candidates(scores: Tensor, positions: Tensor): Tensor;
   dsv41Select(scores: Tensor, positions: Tensor, ratio: number, candidates?: Tensor): Tensor;
-  dsv4LocalSlots(positions: Tensor, pages: Tensor, batchIndices?: Tensor): Tensor;
-  dsv4TopkToSlots(selected: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, batchIndices?: Tensor): Tensor;
+  dsv4LocalSlots(positions: Tensor, pages: Tensor, batchIndices?: Tensor, lengths?: Tensor): Tensor;
+  dsv4TopkToSlots(selected: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, batchIndices?: Tensor, lengths?: Tensor): Tensor;
   dsv4CacheAppend(cache: Tensor, input: Tensor, positions: Tensor, pages: Tensor, ratio?: 1 | 2, batchIndices?: Tensor): void;
   dsv4IndexAppend(cache: Tensor, input: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, batchIndices?: Tensor): void;
   dsv4SparseAttention(q: Tensor, local: Dsv4CacheSelection, global?: Dsv4CacheSelection, sinks?: Tensor, mode?: "auto" | "prefill" | "decode"): { output: Tensor; lse: Tensor };

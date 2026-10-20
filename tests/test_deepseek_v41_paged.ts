@@ -7,6 +7,7 @@ import { writeDsv4Cache } from "./deepseek_v41_oracles";
 import type { Tensor } from "../src/tensor";
 import { DeepseekV41Cache } from "../src/deepseek_v41_cache";
 import type { DeepseekV41Model } from "../src/deepseek_v41_model";
+import { CaptureManager } from "../src/capture-manager";
 
 function bytes(t: Tensor): Buffer { const b = Buffer.alloc(t.bytes); t.d2h(b); return b; }
 
@@ -51,8 +52,22 @@ for (const world of [1, 2]) it(`DSV4 batches unequal sequences without cross-seq
       const b = t < lengths[0] ? 0 : 1, p = b ? t - lengths[0] : t;
       assert.equal(scored[t * 130 + k], k < Math.floor((p + 1) / ratio) ? 64 * (b + 1) : -Infinity);
     }
+    using selected = ws.alloc([tokens, 4], "I32");
+    selected.h2d(Buffer.from(Int32Array.from({ length: tokens * 4 }, (_, i) => [32, -1, 0, 64][i % 4]).buffer));
+    using selectedLengths = ws.alloc([tokens], "I32");
+    using mapped = ops.dsv4TopkToSlots(selected, positions, pages, ratio, batches, selectedLengths);
+    const mappedIds = mapped.readInt32LEArray(), counts = selectedLengths.readInt32LEArray();
+    for (let t = 0; t < tokens; ++t) {
+      const b = t < lengths[0] ? 0 : 1, p = b ? t - lengths[0] : t;
+      const valid = [32, 0, 64].filter(id => id < Math.floor((p + 1) / ratio));
+      assert.equal(counts[t], valid.length);
+      const expected = valid.map(id => pageIds[b][Math.floor(id * ratio / 64)] * 64 + id % (64 / ratio));
+      assert.deepEqual(mappedIds.slice(t * 4, (t + 1) * 4), [...expected, ...Array(4 - valid.length).fill(-1)]);
+    }
   }
-  using local = ops.dsv4LocalSlots(positions, pages, batches);
+  using localLengths = ws.alloc([tokens], "I32");
+  using local = ops.dsv4LocalSlots(positions, pages, batches, localLengths);
+  assert.deepEqual(localLengths.readInt32LEArray(), lengths.flatMap(n => Array.from({ length: n }, (_, i) => Math.min(i + 1, 128))));
   const slots = local.readInt32LEArray();
   for (let t = 0; t < tokens; t++) for (let col = 0; col < 128; col++) {
     const b = t < lengths[0] ? 0 : 1, p = b ? t - lengths[0] : t, k = Math.max(0, p - 127) + col;
@@ -143,11 +158,15 @@ for (const world of [1, 2]) it(`DSV4 paged writes, slots and scores agree across
     assert.ok(actual.subarray(0, 64 * 584).every(x => x === 0), "unreferenced page untouched");
     using selected = ws.alloc([tokens, 4], "I32");
     selected.h2d(Buffer.from(Int32Array.from({ length: tokens * 4 }, (_, i) => [-1, 0, 32, 64][i % 4]).buffer));
-    using mapped = ops.dsv4TopkToSlots(selected, positions, pages, ratio);
+    using mappedLengths = ws.alloc([tokens], "I32");
+    using mapped = ops.dsv4TopkToSlots(selected, positions, pages, ratio, undefined, mappedLengths);
     const indices = mapped.readInt32LEArray();
-    for (let p = 0; p < tokens; p++) for (let j = 0; j < 4; j++) {
-      const ordinal = [-1, 0, 32, 64][j];
-      assert.equal(indices[p * 4 + j], ordinal < 0 || ordinal >= Math.floor((p + 1) / ratio) ? -1 : slot(ordinal, ratio));
+    const counts = mappedLengths.readInt32LEArray();
+    for (let p = 0; p < tokens; p++) {
+      const valid = [0, 32, 64].filter(ordinal => ordinal < Math.floor((p + 1) / ratio));
+      assert.equal(counts[p], valid.length);
+      assert.deepEqual(indices.slice(p * 4, (p + 1) * 4),
+        [...valid.map(ordinal => slot(ordinal, ratio)), ...Array(4 - valid.length).fill(-1)]);
     }
     using keyCache = ws.alloc([5, 64, 132], "U8"); keyCache.fill(0, keyCache.numElements);
     ops.dsv4IndexAppend(keyCache, keys, positions, pages, ratio);
@@ -163,4 +182,39 @@ for (const world of [1, 2]) it(`DSV4 paged writes, slots and scores agree across
     const key = Math.max(0, p - 127) + j;
     assert.equal(indices[p * 128 + j], key <= p ? slot(key, 1) : -1);
   }
+});
+
+for (const ratio of [1, 2] as const) it(`DSV4 compact slots and lengths refresh under capture, ratio${ratio}`, () => {
+  using ops = new GlmOps(0);
+  using ws = new WorkspaceBase(ops);
+  using manager = new CaptureManager(ops);
+  const rows = 4, width = 513, pageIds = [[3, 1, 0], [5, 4, 2]];
+  using positions = ws.alloc([rows], "I32");
+  using pages = ws.alloc([2, 3], "I32");
+  pages.h2d(Buffer.from(Int32Array.from(pageIds.flat()).buffer));
+  using batches = ws.alloc([rows], "I32");
+  batches.h2d(Buffer.from(Int32Array.from([0, 1, 0, 1]).buffer));
+  using selected = ws.alloc([rows, width], "I32");
+  using lengths = ws.alloc([rows], "I32");
+  using localLengths = ws.alloc([rows], "I32");
+  for (let pass = 0; pass < 4; ++pass) {
+    const pos = Array.from({ length: rows }, (_, r) => [0, 31, 64, 129][(r + pass) % rows]);
+    const ids = Int32Array.from({ length: rows * width }, (_, i) => (i + pass) % 3 === 0 ? -1 : (i * 17 + pass) % 150);
+    positions.h2d(Buffer.from(Int32Array.from(pos).buffer));
+    selected.h2d(Buffer.from(ids.buffer));
+    using output = manager.run({ positions, pages, batches, selected, lengths, localLengths }, (_capture, input) => {
+      using local = ops.dsv4LocalSlots(input.positions, input.pages, input.batches, input.localLengths);
+      return ops.dsv4TopkToSlots(input.selected, input.positions, input.pages, ratio, input.batches, input.lengths);
+    }, ["compact-slots", ratio]) as Tensor;
+    const actual = output.readInt32LEArray(), counts = lengths.readInt32LEArray();
+    assert.deepEqual(localLengths.readInt32LEArray(), pos.map(p => Math.min(p + 1, 128)));
+    for (let r = 0; r < rows; ++r) {
+      const valid = Array.from(ids.subarray(r * width, (r + 1) * width))
+        .filter(id => id >= 0 && id < Math.floor((pos[r] + 1) / ratio));
+      assert.equal(counts[r], valid.length);
+      const expected = valid.map(id => pageIds[r % 2][Math.floor(id * ratio / 64)] * 64 + id % (64 / ratio));
+      assert.deepEqual(actual.slice(r * width, (r + 1) * width), [...expected, ...Array(width - valid.length).fill(-1)]);
+    }
+  }
+  assert([...manager.captured.values()].some(graph => graph.graphExec !== null));
 });

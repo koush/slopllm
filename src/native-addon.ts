@@ -76,7 +76,7 @@ export interface NativeAddon {
   dsv41Candidates(ctx: number, out: number, scores: number, positions: number, capacity: number, tokens: number, scratch: number): void;
   dsv41Select(ctx: number, out: number, scores: number, candidates: number, positions: number, capacity: number, ratio: number, tokens: number, scratch: number): void;
   dsv41ToBf16(ctx: number, out: number, input: number, count: number): void;
-  dsv4PagedSlots(ctx: number, out: number, positions: number, pages: number, selected: number, width: number, ratio: number, tokens: number, mode: number, batchIndices: number, pageStride: number): void;
+  dsv4PagedSlots(ctx: number, out: number, positions: number, pages: number, selected: number, width: number, ratio: number, tokens: number, mode: number, batchIndices: number, pageStride: number, lengths: number): void;
   mxfp4MulMatId(ctx: number, out: number, input: number, pointers: number, ids: number, topK: number, count: number, n: number, k: number): void;
   fp8BlockLinear(ctx: number, out: number, input: number, weight: number, scales: number, m: number, n: number, k: number, block: number, scaleKind: number, groups: number): void;
   linear(ctx: number, out: number, input: number, weight: number, batch: number, n: number, k: number, workspace: number, workspaceSize: number, outputF32: boolean): void;

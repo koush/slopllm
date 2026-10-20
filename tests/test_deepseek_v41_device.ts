@@ -157,6 +157,94 @@ it("V4.1 captured rotary tables refresh positions and preserve inverse ratio-2 r
   assert([...manager.captured.values()].some(graph => graph.graphExec !== null));
 });
 
+it("shared SwiGLU handles clipping boundaries, independent inputs and odd tails", () => {
+  using ops = new GlmOps(0);
+  using ws = new WorkspaceBase(ops);
+  const cases = [-100, -12, -10.0625, -10, -9.9375, -1, 0, 1, 9.9375, 10, 10.0625, 12, 100];
+  for (const count of [1, 511, 512, 513]) {
+    using gate = ws.alloc([1, count], "BF16");
+    using up = ws.alloc([1, count], "BF16");
+    const gates = Float32Array.from({ length: count }, (_, i) => cases[i % cases.length]);
+    const ups = Float32Array.from({ length: count }, (_, i) => cases[Math.floor(i / cases.length) % cases.length]);
+    gate.h2d(bf16Round(gates));
+    up.h2d(bf16Round(ups));
+    for (const limit of [undefined, 10]) {
+      using result = gate.siluAndMul(up, limit);
+      const expected = limit === 10 ? dsv41SwiGlu(gates, ups)
+        : Float32Array.from(gates, (g, i) => g / (1 + Math.exp(-g)) * ups[i]);
+      const actual = Buffer.alloc(result.bytes);
+      result.d2h(actual);
+      // Ordinary GLM SiLU uses approximate tanh; clipped SiLU preserves the
+      // negative tail with expf. Allow BF16 rounding and tanh's absolute error.
+      const got = bf16BytesToF32(actual), reference = bf16BytesToF32(bf16Round(expected));
+      for (let i = 0; i < count; ++i) {
+        const approximationError = limit === undefined ? 1e-6 * Math.abs(gates[i] * ups[i]) : 1e-35;
+        assert(Math.abs(got[i] - reference[i]) <= Math.max(approximationError, Math.abs(reference[i]) / 128),
+          `count=${count}, limit=${limit}, i=${i}: ${got[i]} != ${reference[i]}`);
+      }
+    }
+  }
+});
+
+it("V4.1 shared K packing preserves ratio filtering and noncontiguous page boundaries", () => {
+  using ops = new GlmOps(0);
+  using ws = new WorkspaceBase(ops);
+  const rows = 130, pageIds = [2, 0, 1];
+  using positions = ws.alloc([rows], "I32");
+  positions.h2d(Buffer.from(Int32Array.from({ length: rows }, (_, i) => i).buffer));
+  using pages = ws.alloc([3], "I32");
+  pages.h2d(Buffer.from(Int32Array.from(pageIds).buffer));
+  using input = ws.alloc([rows, 128], "BF16");
+  const values = bf16BytesToF32(bf16Round(Float32Array.from({ length: rows * 128 }, (_, i) => {
+    const row = Math.floor(i / 128), lane = i % 128;
+    if (row < 2) {
+      return row * 1e-6;
+    }
+    return [446, 448, 450][row % 3] * 2 ** (Math.floor(row / 3) - 24)
+      * (lane % 2 ? -1 : 1) * (128 - lane) / 128;
+  })));
+  input.h2d(bf16Round(values));
+  const packed = packDsv41Index(values);
+  for (const ratio of [1, 2] as const) {
+    using cache = ws.alloc([3, 64, 132], "U8");
+    cache.fill(0, cache.numElements);
+    ops.dsv4IndexAppend(cache, input, positions, pages, ratio);
+    const expected = Buffer.alloc(cache.bytes), actual = Buffer.alloc(cache.bytes);
+    for (let row = ratio - 1; row < rows; row += ratio) {
+      const ordinal = (row + 1) / ratio - 1;
+      const slot = pageIds[Math.floor(ordinal * ratio / 64)] * 64 + ordinal % (64 / ratio);
+      packed.copy(expected, slot * 132, row * 132, (row + 1) * 132);
+    }
+    cache.d2h(actual);
+    assert.deepEqual(actual, expected);
+  }
+});
+
+it("V4.1 shared Q quantizer preserves packed bytes at power-of-two scale boundaries", () => {
+  using ops = new GlmOps(0);
+  using ws = new WorkspaceBase(ops);
+  const rows = 4;
+  using positions = ws.alloc([rows], "I32");
+  positions.fill(0, rows);
+  using query = ws.alloc([rows, 4096], "BF16");
+  const maxima = [0, 1e-6];
+  for (let exponent = -24; exponent <= 16; ++exponent) {
+    for (const significand of [446, 448, 450]) {
+      maxima.push(significand * 2 ** exponent);
+    }
+  }
+  const values = bf16BytesToF32(bf16Round(Float32Array.from({ length: rows * 4096 }, (_, i) => {
+    const maximum = maxima[Math.floor(i / 128) % maxima.length];
+    const lane = i % 128;
+    return maximum === 0 ? 0 : maximum * (lane % 2 ? -1 : 1) * (128 - lane) / 128;
+  })));
+  query.h2d(bf16Round(values));
+  using quantized = ops.dsv41IndexQuantize(query, positions);
+  const actual = Buffer.alloc(quantized.bytes);
+  quantized.d2h(actual);
+  assert.deepEqual(actual, packDsv41Index(values));
+});
+
 it("V4.1 batched paged indexer masks future keys independently for each query", () => {
   using ops = new GlmOps(0);
   using ws = new WorkspaceBase(ops);
@@ -252,6 +340,128 @@ for (const rows of [1, 4, 64, 65, 128]) for (const ratio of [1, 2] as const) {
     assert([...manager.captured.values()].some(graph => graph.graphExec !== null));
   });
 }
+
+for (const rows of [1, 8]) it(`V4.1 bounded decode scoring matches tiled scoring under replay, rows=${rows}`, () => {
+  using ops = new GlmOps(0);
+  using ws = new WorkspaceBase(ops);
+  using manager = new CaptureManager(ops);
+  const capacity = 32771, ratio = 2, stride = Math.ceil(capacity * ratio / 64);
+  using input = ws.alloc([rows, 4096], "BF16"), weights = ws.alloc([rows, 32], "BF16");
+  using positions = ws.alloc([rows], "I32"), batches = ws.alloc([rows], "I32");
+  using pages = ws.alloc([2, stride], "I32"), keys = ws.alloc([2 * stride, 64, 132], "U8");
+  const pageIds = Int32Array.from({ length: 2 * stride }, (_, i) => 2 * stride - 1 - i);
+  pages.h2d(Buffer.from(pageIds.buffer));
+  batches.h2d(Buffer.from(Int32Array.from({ length: rows }, (_, i) => i % 2).buffer));
+  weights.h2d(bf16Round(Float32Array.from({ length: rows * 32 }, (_, i) => Math.cos(i * 0.23))));
+  const patterns = packDsv41Index(bf16BytesToF32(bf16Round(Float32Array.from({ length: 16 * 128 }, (_, i) => Math.sin(i * 0.17)))));
+  const packed = Buffer.alloc(keys.bytes);
+  for (let b = 0; b < 2; ++b) {
+    for (let k = 0; k < capacity; ++k) {
+      const slot = pageIds[b * stride + Math.floor(k / 32)] * 64 + k % 32;
+      const pattern = (k + b * 3) % 16;
+      patterns.copy(packed, slot * 132, pattern * 132, (pattern + 1) * 132);
+    }
+  }
+  keys.h2d(packed);
+  const oldTile = process.env.SLOPLLM_DSV41_INDEXER_QUERY_TILE;
+  try {
+    for (let pass = 0; pass < 4; ++pass) {
+      const counts = Array.from({ length: rows }, (_, r) => [0, 63, 16401, capacity][(r + pass) % 4]);
+      positions.h2d(Buffer.from(Int32Array.from(counts, n => Math.max(0, n * ratio - 1)).buffer));
+      input.h2d(bf16Round(Float32Array.from({ length: rows * 4096 }, (_, i) => Math.sin(i * 0.29 + pass))));
+      process.env.SLOPLLM_DSV41_INDEXER_QUERY_TILE = "1";
+      const expected = Buffer.alloc(rows * capacity * 2);
+      {
+        using query = ops.dsv41IndexQuantize(input, positions);
+        using reference = ops.dsv4IndexScores(query, keys, weights, positions, pages, ratio, capacity, batches);
+        reference.d2h(expected);
+      }
+      delete process.env.SLOPLLM_DSV41_INDEXER_QUERY_TILE;
+      using result = manager.run({ input, keys, weights, positions, pages, batches }, (_capture, retained) => {
+        using query = ops.dsv41IndexQuantize(retained.input, retained.positions);
+        return ops.dsv4IndexScores(query, retained.keys, retained.weights, retained.positions,
+          retained.pages, ratio, capacity, retained.batches);
+      }, ["bounded-scoring", rows]) as Tensor;
+      const actual = Buffer.alloc(result.bytes);
+      result.d2h(actual);
+      assert.deepEqual(actual, expected);
+    }
+    assert([...manager.captured.values()].some(graph => graph.graphExec !== null));
+  } finally {
+    if (oldTile === undefined) {
+      delete process.env.SLOPLLM_DSV41_INDEXER_QUERY_TILE;
+    } else {
+      process.env.SLOPLLM_DSV41_INDEXER_QUERY_TILE = oldTile;
+    }
+  }
+});
+
+it("V4.1 FP32 RoPE preserves unrotated features and BF16 accuracy at long positions", () => {
+  using ops = new GlmOps(0);
+  using ws = new WorkspaceBase(ops);
+  const pos = [0, 1, 37, 65535, 1048575];
+  using positions = ws.alloc([pos.length], "I32");
+  positions.h2d(Buffer.from(Int32Array.from(pos).buffer));
+  using rotary = positions.dsv41RotaryEmbedding();
+  for (const dim of [128, 512]) {
+    for (const heads of [1, 32]) {
+      const width = dim * heads;
+      using input = ws.alloc([pos.length, width], "BF16");
+      const values = bf16BytesToF32(bf16Round(Float32Array.from({ length: input.numElements }, (_, i) => Math.sin(i * 0.31) * 2 ** (i % 9 - 4))));
+      input.h2d(bf16Round(values));
+      for (const compressed of [false, true]) for (const inverse of [false, true]) for (const ratio of [1, 2]) {
+        if (!compressed && ratio === 2) {
+          continue;
+        }
+        using output = input.dsv41Rope(rotary, compressed, inverse, dim, ratio);
+        const data = Buffer.alloc(output.bytes);
+        output.d2h(data);
+        const actual = bf16BytesToF32(data);
+        for (let r = 0; r < pos.length; ++r) {
+          const p = compressed && ratio === 2 ? (Math.floor((pos[r] + 1) / 2) - 1) * 2 : pos[r];
+          const expected = bf16BytesToF32(bf16Round(dsv41Rope(values.subarray(r * width, (r + 1) * width), p, compressed, inverse, dim)));
+          for (let d = 0; d < width; ++d) {
+            const i = r * width + d;
+            if (d % dim < dim - 64) {
+              assert.equal(actual[i], values[i]);
+            } else {
+              const ulp = 2 ** (Math.floor(Math.log2(Math.max(Math.abs(expected[d]), 2 ** -126))) - 7);
+              const rounding = (Math.abs(values[i]) + Math.abs(values[i ^ 1])) * 2 ** -22;
+              assert(Math.abs(actual[i] - expected[d]) <= ulp + rounding,
+                `dim=${dim}, heads=${heads}, pos=${p}, inverse=${inverse}, d=${d}`);
+            }
+          }
+        }
+      }
+    }
+  }
+});
+
+it("V4.1 KV packing matches the FP64 oracle for every finite BF16 maximum", () => {
+  using ops = new GlmOps(0);
+  using ws = new WorkspaceBase(ops);
+  const maxima = 0x7f80, rows = Math.ceil(maxima / 7), pageCount = Math.ceil(rows / 64);
+  using input = ws.alloc([rows, 512], "BF16");
+  using positions = ws.alloc([rows], "I32"), pages = ws.alloc([pageCount], "I32");
+  using cache = ws.alloc([pageCount, 64, 584], "U8");
+  positions.h2d(Buffer.from(Int32Array.from({ length: rows }, (_, i) => i).buffer));
+  pages.h2d(Buffer.from(Int32Array.from({ length: pageCount }, (_, i) => i).buffer));
+  const raw = Buffer.alloc(input.bytes);
+  for (let r = 0; r < rows; ++r) {
+    for (let d = 0; d < 512; ++d) {
+      raw.writeUInt16LE(d < 448 ? Math.min(maxima - 1, r * 7 + Math.floor(d / 64)) : 0x3f80, (r * 512 + d) * 2);
+    }
+  }
+  input.h2d(raw);
+  cache.fill(0, cache.numElements);
+  ops.dsv4CacheAppend(cache, input, positions, pages);
+  const values = bf16BytesToF32(raw), expected = Buffer.alloc(cache.bytes), actual = Buffer.alloc(cache.bytes);
+  for (let r = 0; r < rows; ++r) {
+    writeDsv4Cache(expected, r, values.subarray(r * 512, (r + 1) * 512));
+  }
+  cache.d2h(actual);
+  assert.deepEqual(actual, expected);
+});
 
 it("V4.1 scoring handles an 8192-query prefill and refreshed causal bounds under capture", () => {
   using ops = new GlmOps(0);

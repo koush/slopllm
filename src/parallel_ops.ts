@@ -2535,14 +2535,14 @@ export class ParallelOps implements DeviceOps {
     const shards = this.devices.map((ops, r) => ops.dsv41Select(this.local(scores, r), this.local(positions, r), ratio, this.optionalLocal(candidates, r)));
     return this.wrapShards(scores.workspace, shards, [scores.shape[0], 512], "I32", TensorParallelism.Replicated);
   }
-  dsv4LocalSlots(positions: Tensor, pages: Tensor, batchIndices?: Tensor): Tensor {
-    this.requireDsv4Replicated(positions, pages, batchIndices);
-    const shards = this.devices.map((ops, r) => ops.dsv4LocalSlots(this.local(positions, r), this.local(pages, r), this.optionalLocal(batchIndices, r)));
+  dsv4LocalSlots(positions: Tensor, pages: Tensor, batchIndices?: Tensor, lengths?: Tensor): Tensor {
+    this.requireDsv4Replicated(positions, pages, batchIndices, lengths);
+    const shards = this.devices.map((ops, r) => ops.dsv4LocalSlots(this.local(positions, r), this.local(pages, r), this.optionalLocal(batchIndices, r), this.optionalLocal(lengths, r)));
     return this.wrapShards(positions.workspace, shards, [positions.numElements, 128], "I32", TensorParallelism.Replicated);
   }
-  dsv4TopkToSlots(selected: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, batchIndices?: Tensor): Tensor {
-    this.requireDsv4Replicated(selected, positions, pages, batchIndices);
-    const shards = this.devices.map((ops, r) => ops.dsv4TopkToSlots(this.local(selected, r), this.local(positions, r), this.local(pages, r), ratio, this.optionalLocal(batchIndices, r)));
+  dsv4TopkToSlots(selected: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, batchIndices?: Tensor, lengths?: Tensor): Tensor {
+    this.requireDsv4Replicated(selected, positions, pages, batchIndices, lengths);
+    const shards = this.devices.map((ops, r) => ops.dsv4TopkToSlots(this.local(selected, r), this.local(positions, r), this.local(pages, r), ratio, this.optionalLocal(batchIndices, r), this.optionalLocal(lengths, r)));
     return this.wrapShards(selected.workspace, shards, selected.shape, "I32", TensorParallelism.Replicated);
   }
   dsv4CacheAppend(cache: Tensor, input: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2 = 1, batchIndices?: Tensor): void {

@@ -147,6 +147,20 @@ Mixed-sequence query tiles reload keys per query. Dispatch uses
 query count and compressed key capacity; `SLOPLLM_DSV41_INDEXER_QUERY_TILE=1|4`
 overrides it for kernel comparisons.
 
+For at most eight query rows and compressed key capacities of at least 32,768,
+decode scoring can use an occupancy-bounded grid-stride launch. Each CTA retains
+Q while iterating key tiles; the FP32 score reduction order is unchanged. The
+budget permits multiple resident waves because a single-wave budget benchmarked
+slower on SM120. Small workloads and grids that would not reuse Q retain the
+tiled launch; an explicit query-tile override also selects the tiled path.
+
+RoPE application uses FP32 multiply/add followed by BF16 output rounding, while
+rotary table generation retains its existing frequency/angle and trig contract.
+KV packing uses the shared FP32 bit-based power-of-two scale helper and preserves
+the exponent-byte cache format. Its packed output is checked against the FP64
+host oracle for every finite BF16 maximum. FP32 RoPE is checked at BF16 output
+precision, including long positions, inverse rotation, and ratio-2 positions.
+
 Index selection shares GLM's BF16 radix top-k kernels. At most 64 query rows use
 the general split-radix dispatcher; larger batches use the prefill histogram
 pipeline with deterministic gathering. Selection keeps the lowest logical
@@ -158,6 +172,12 @@ computes each block maximum once, selects 2047 non-latest blocks, and includes
 the latest block unconditionally. Scratch is workspace-owned and graph-reusable;
 the preparation pass refreshes padding and masks on every replay. FP8 scoring
 still evaluates all causal keys before this selection-time masking.
+
+Global attention slot mapping stably compacts causally valid selections into a
+prefix and emits per-query lengths. Local sliding-window slots and DSpark draft
+slots also supply their valid lengths to sparse attention, so short contexts
+do not traverse the full padded candidate width. Slot buffers retain `-1` tails;
+the device-generated target lengths are refreshed during CUDA graph replay.
 
 mHC's projection and squared norm use FP32
 split-K partials; inverse RMS is applied to the merged projection before coefficient
