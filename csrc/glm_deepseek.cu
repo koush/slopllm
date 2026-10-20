@@ -127,7 +127,7 @@ __global__ void collapse_device(__nv_bfloat16* out, const __nv_bfloat16* hidden,
 }
 
 __global__ void cache_device(uint8_t* cache, const __nv_bfloat16* input, const int32_t* position, int ratio, const int32_t* slots) {
-    const int row = blockIdx.y;
+    const int row = blockIdx.x;
     input += row * 512;
     position += row;
     if (ratio && (*position + 1) % ratio) return;
@@ -136,19 +136,38 @@ __global__ void cache_device(uint8_t* cache, const __nv_bfloat16* input, const i
     uint8_t* page = cache + size_t(slot / 64) * 64 * 584;
     uint8_t* data = page + (slot % 64) * 576;
     uint8_t* scales = page + 64 * 576 + (slot % 64) * 8;
-    const int block = blockIdx.x, d = threadIdx.x;
+    // Eight half-warps pack one token: seven FP8 groups and one BF16 group.
+    const int block = threadIdx.x / 16, lane = threadIdx.x % 16;
+    const int d = lane * 4;
+    const int2 packed_input = *reinterpret_cast<const int2*>(input + block * 64 + d);
     if (block == 7) {
-        reinterpret_cast<__nv_bfloat16*>(data + 448)[d] = input[448 + d];
-        if (!d) scales[7] = 0;
+        *reinterpret_cast<int2*>(data + 448 + d * 2) = packed_input;
+        if (!lane) {
+            scales[7] = 0;
+        }
         return;
     }
-    __shared__ float maxima[64];
-    maxima[d] = fmaxf(1e-4f, fabsf(float(input[block * 64 + d])));
-    __syncthreads();
-    for (int s = 32; s; s >>= 1) { if (d < s) maxima[d] = fmaxf(maxima[d], maxima[d + s]); __syncthreads(); }
-    const int exponent = int(ceil(log2(double(maxima[0]) / 448.)));
-    if (!d) scales[block] = exponent + 127;
-    data[block * 64 + d] = __nv_fp8_e4m3(ldexpf(float(input[block * 64 + d]), -exponent)).__x;
+    const auto* values = reinterpret_cast<const __nv_bfloat16*>(&packed_input);
+    float maximum = 1e-4f;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        maximum = fmaxf(maximum, fabsf(float(values[i])));
+    }
+    const unsigned mask = (block & 1) ? 0xffff0000u : 0x0000ffffu;
+    #pragma unroll
+    for (int s = 8; s; s >>= 1) {
+        maximum = fmaxf(maximum, __shfl_xor_sync(mask, maximum, s, 16));
+    }
+    const int exponent = int(ceil(log2(double(maximum) / 448.)));
+    if (!lane) {
+        scales[block] = exponent + 127;
+    }
+    uint32_t packed = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        packed |= uint32_t(__nv_fp8_e4m3(ldexpf(float(values[i]), -exponent)).__x) << (8 * i);
+    }
+    *reinterpret_cast<uint32_t*>(data + block * 64 + d) = packed;
 }
 
 __global__ void embedding_device(__nv_bfloat16* out, const __nv_bfloat16* table,
@@ -433,7 +452,7 @@ void glm_dsv41_collapse(GlmCtx* ctx, void* out, const void* hidden, const float*
 void glm_dsv41_cache_insert(GlmCtx* ctx, uint8_t* cache, const void* input, const int32_t* positions,
     int ratio, int tokens, const int32_t* slots) {
     cudaSetDevice(ctx->device_id);
-    cache_device<<<dim3(8,tokens),64,0,GLM_STREAM(ctx)>>>(cache,(const __nv_bfloat16*)input,positions,ratio,slots);
+    cache_device<<<tokens,128,0,GLM_STREAM(ctx)>>>(cache,(const __nv_bfloat16*)input,positions,ratio,slots);
 }
 void glm_dsv41_embedding(GlmCtx* ctx, void* out, const void* weight, const int32_t* tokens, int start, int rows, int count, int dim, int streams) {
     cudaSetDevice(ctx->device_id);
