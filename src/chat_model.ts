@@ -395,7 +395,7 @@ export abstract class ChatModel extends WorkspaceBase {
 
   /** Read the caller-published pending token without modifying committed model state. */
   protected async prepareDecodeInput(_ws: ExecutionWorkspace, cache: ChatCache,
-    _samplingPolicy: TokenSelector): Promise<number[]> {
+    _samplingPolicy: TokenSelector, _resources?: Disposable): Promise<number[]> {
     const sequences = cache.getPagedKV().sequences;
     if (!sequences.length || sequences.some(sequence => sequence.targetToken === undefined
       || sequence.reportedTokenCount() !== sequence.allocLen)) {
@@ -404,21 +404,38 @@ export abstract class ChatModel extends WorkspaceBase {
     return sequences.map(sequence => sequence.targetToken!);
   }
 
+  /** Optional recurrent execution state owned by one decode generator. */
+  protected createDecodeResources(_ws: ExecutionWorkspace, _cache: ChatCache): Disposable | undefined { return undefined; }
+
   /** Consume the caller-published pending target and yield newly selected tokens. */
   async *generateDecode(
     ws: ExecutionWorkspace, cache: ChatCache,
     executionManager: ExecutionManager = new EagerExecution(),
     samplingPolicy: TokenSelector = { selectTarget: logits => logits.argmax() },
   ): AsyncGenerator<MtpStepResult & { warmup: boolean }, void, void> {
+    ws.assertClear();
+    try {
+      yield* this.generateDecodeInternal(ws, cache, executionManager, samplingPolicy);
+    } finally {
+      await this.ops.synchronizeAsync();
+      ws.assertClear();
+      ws.resetPlanSlots();
+    }
+  }
+
+  protected async *generateDecodeInternal(
+    ws: ExecutionWorkspace, cache: ChatCache,
+    executionManager: ExecutionManager,
+    samplingPolicy: TokenSelector,
+  ): AsyncGenerator<MtpStepResult & { warmup: boolean }, void, void> {
     const pagedKV = cache.getPagedKV();
     const sequences = pagedKV.sequences.slice();
     const batchSize = sequences.length;
-    ws.assertClear();
-    let nextTokens = await this.prepareDecodeInput(ws, cache, samplingPolicy);
-    try {
+    using resources = this.createDecodeResources(ws, cache);
+    let nextTokens = await this.prepareDecodeInput(ws, cache, samplingPolicy, resources);
+    {
       while (true) {
-        ws.assertClear();
-        ws.clearTracking();
+        ws.resetPlanSlots();
         if (pagedKV.sequences.length !== batchSize || sequences.some((sequence, batch) =>
           pagedKV.sequences[batch] !== sequence)) {
           throw new Error("Decode batch changed; close and restart the generator");
@@ -428,9 +445,9 @@ export abstract class ChatModel extends WorkspaceBase {
         state.setInput([nextTokens]);
         let warmup: boolean;
         {
-          using forwardResources = this.prepareForward(state);
+          using forwardResources = this.prepareForward(state, resources);
           const captureKey = ["decode", samplingPolicy.captureKey ?? "greedy", ...this.forwardCaptureKey(state)];
-          const execution = executionManager.execute({ states: [state], inputs: {}, key: captureKey }, () => {
+          const execution = executionManager.execute({ states: [state], inputs: this.forwardCaptureInputs(state), key: captureKey }, () => {
             using hidden = this.forwardModel(state);
             using logits = state.computeLogits(hidden, this);
             return samplingPolicy.selectTarget(logits);
@@ -441,8 +458,7 @@ export abstract class ChatModel extends WorkspaceBase {
           nextTokens = selected.readInt32LEArray();
         }
         inputTokens.forEach((token, batch) => cache.reportTokens(batch, [token], nextTokens[batch]));
-        ws.assertClear();
-        ws.clearTracking();
+        ws.resetPlanSlots();
         // Keep the next input independent of the caller's yielded array.
         yield {
           draft: { targetTokens: [...nextTokens], treeTokens: nextTokens.map(() => []), topks: [] },
@@ -452,8 +468,6 @@ export abstract class ChatModel extends WorkspaceBase {
           warmup,
         };
       }
-    } finally {
-      await this.ops.synchronizeAsync();
     }
   }
 
@@ -464,10 +478,13 @@ export abstract class ChatModel extends WorkspaceBase {
   }
 
   /** Prepare metadata outside capture; callers retain returned resources through execution/replay. */
-  prepareForward(_state: ExecutionState): Disposable | undefined { return undefined; }
+  prepareForward(_state: ExecutionState, _resources?: Disposable): Disposable | undefined { return undefined; }
 
   /** Model-owned persistent resources that distinguish otherwise identical graphs. */
   forwardCaptureKey(_state: ExecutionState): (string | number)[] { return []; }
+
+  /** Preallocated execution tensors staged at capture entry and on replay. */
+  forwardCaptureInputs(_state: ExecutionState): Record<string, Tensor> { return {}; }
 
   forward(state: ExecutionState): Tensor {
     using _tracker = state.ws.startTracking();

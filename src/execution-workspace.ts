@@ -418,10 +418,8 @@ export class ExecutionWorkspace extends WorkspaceBase {
     this.planSlot = 0;
   }
 
+  /** Reuse planning buffers after prior states finish, without disposing live execution tensors. */
   resetPlanSlots(): void {
-    if (this.tracking !== null || this.tracked.size !== 0 || this.staged.size !== 0) {
-      throw new Error("resetPlanSlots requires a clear workspace");
-    }
     this.planSlot = 0;
   }
 

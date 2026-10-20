@@ -4,7 +4,7 @@ import { ChatModel, type ChatCache, type CommonModelConfig, type TokenSelector, 
 import { resolveCheckpointConfigDir, type CheckpointTensor } from "./checkpoint_source";
 import { type DeviceOps, TensorParallelism } from "./device_ops";
 import type { ExecutionState, ExecutionWorkspace } from "./execution-workspace";
-import { CompressorCarry, DeepseekV41Cache, DSV41_KV_SOURCES as KV_SOURCES, DSV41_INDEX_SOURCES as INDEX_SOURCES } from "./deepseek_v41_cache";
+import { DeepseekV41Cache, DSV41_KV_SOURCES as KV_SOURCES, DSV41_INDEX_SOURCES as INDEX_SOURCES } from "./deepseek_v41_cache";
 import { DeepseekV41EngramHasher } from "./deepseek_v41_engram";
 import { UsingHolder, UsingHolderBase, DisposableSet } from "./using-holder";
 import { EagerExecution, type ExecutionManager } from "./execution-manager";
@@ -22,6 +22,13 @@ export interface DeepseekV41Config extends CommonModelConfig {
   eosTokenId: number;
 }
 
+/** Immutable after its producing forward. Views retain both allocations. */
+export class CompressorCarry implements Disposable {
+  constructor(readonly pending: Tensor, readonly pendingPosition: Tensor) {}
+  viewClone(): CompressorCarry { return new CompressorCarry(this.pending.viewClone(), this.pendingPosition.viewClone()); }
+  [Symbol.dispose](): void { this.pending[Symbol.dispose](); this.pendingPosition[Symbol.dispose](); }
+}
+
 export class LayerHolders extends DisposableSet {
   readonly localSlots = new UsingHolder<Tensor>(undefined!);
   readonly sharedSlots = new UsingHolder<Tensor>(undefined!);
@@ -29,42 +36,86 @@ export class LayerHolders extends DisposableSet {
   readonly compressorInputs = new Map<number, CompressorCarry>();
   readonly compressorOutputs = new Map<number, CompressorCarry>();
   readonly compressorRows = new Map<number, UsingHolder<Tensor>>();
+  readonly compressorCarry: Map<number, UsingHolder<CompressorCarry>>;
+  private state?: ExecutionState;
 
-  constructor(private readonly state: ExecutionState) {
+  constructor(readonly ws: ExecutionWorkspace, private readonly parent?: LayerHolders) {
     super();
     this.add(this.localSlots);
     this.add(this.sharedSlots);
     this.add(this.candidates);
+    this.compressorCarry = parent?.compressorCarry ?? new Map();
+    if (!parent) {
+      for (const source of KV_SOURCES.filter(source => source !== 20)) {
+        const holder = new UsingHolder<CompressorCarry>(undefined!);
+        this.add(holder);
+        this.compressorCarry.set(source, holder);
+      }
+    }
+  }
+
+  planCompressor(state: ExecutionState): LayerHolders {
+    const planned = new LayerHolders(this.ws, this);
+    planned.state = state;
     const cache = state.cache as DeepseekV41Cache;
     try {
       // Retain each plan's inputs before publishing fresh carry, including
       // plan+plan+run+run. The caller owns these references through execution.
-      for (const [source, holder] of cache.compressorCarry) {
+      for (const [source, holder] of this.compressorCarry) {
         if (holder.value) {
           const input = holder.value.viewClone();
-          this.add(input);
-          this.compressorInputs.set(source, input);
+          planned.add(input);
+          planned.compressorInputs.set(source, input);
         }
-        const pending = cache.compressorWorkspace.alloc([cache.maxBatch, 1024], "F32");
-        this.add(pending);
-        const position = cache.compressorWorkspace.alloc([cache.maxBatch], "I32");
-        this.add(position);
+        const pending = this.ws.alloc([cache.maxBatch, 1024], "F32");
+        planned.add(pending);
+        const position = this.ws.alloc([cache.maxBatch], "I32");
+        planned.add(position);
         if (state.batchSize < cache.maxBatch) {
           using unused = position.narrow(state.batchSize, cache.maxBatch - state.batchSize);
           unused.fill(-1, unused.numElements);
         }
         const output = new CompressorCarry(pending, position);
-        this.compressorOutputs.set(source, output);
+        planned.compressorOutputs.set(source, output);
         holder.replace(output.viewClone());
         if (state.extras.get("dsv41.retainCompressorRows")) {
           const rows = new UsingHolder<Tensor>(undefined!);
-          this.add(rows);
-          this.compressorRows.set(source, rows);
+          planned.add(rows);
+          planned.compressorRows.set(source, rows);
         }
       }
     } catch (error) {
-      this[Symbol.dispose]();
+      planned[Symbol.dispose]();
       throw error;
+    }
+    return planned;
+  }
+
+  /** Select the unfinished pair at each accepted verification boundary. */
+  commitCompressor(state: ExecutionState, accepted: readonly number[]): void {
+    if (accepted.length !== state.batchSize || accepted.some((count, b) => !Number.isInteger(count)
+      || count < 0 || count >= state.seqLens[b])) throw new Error("Invalid compressor acceptance boundary");
+    const ws = this.ws, maxBatch = (state.cache as DeepseekV41Cache).maxBatch;
+    const indices = new Int32Array(maxBatch), positions = new Int32Array(maxBatch).fill(-1);
+    let offset = 0;
+    for (let b = 0; b < maxBatch; b++) {
+      indices[b] = b;
+      if (b >= state.batchSize) continue;
+      const start = state.seqKvLens[b] - state.seqLens[b];
+      const even = (start + accepted[b]) & ~1;
+      positions[b] = even;
+      if (even >= start) indices[b] = maxBatch + offset + even - start;
+      offset += state.seqLens[b];
+    }
+    using selection = ws.alloc([maxBatch], "I32"); selection.h2d(Buffer.from(indices.buffer));
+    for (const [layer, holder] of this.compressorCarry) {
+      const previous = this.compressorInputs.get(layer);
+      const rows = this.compressorRows.get(layer)?.value;
+      if (!previous || !rows) throw new Error("Compressor verification requires retained inputs and projection rows");
+      using joined = previous.pending.cat([rows], 0);
+      const pending = joined.indexSelect(selection);
+      const position = ws.alloc([maxBatch], "I32"); position.h2d(Buffer.from(positions.buffer));
+      holder.replace(new CompressorCarry(pending, position));
     }
   }
 
@@ -72,16 +123,35 @@ export class LayerHolders extends DisposableSet {
     return Object.fromEntries([...this.compressorRows].map(([layer, holder]) => [layer, holder.detach()]));
   }
 
+  captureInputs(): Record<string, Tensor> {
+    const inputs: Record<string, Tensor> = {};
+    // Include holder views as well as planned inputs/outputs: siblings sharing
+    // an allocation are separate tracked tensors and must all be staged.
+    for (const [kind, carries] of [
+      ["input", this.compressorInputs], ["output", this.compressorOutputs],
+      ["carry", new Map([...this.compressorCarry].filter(([, holder]) => holder.value).map(([layer, holder]) => [layer, holder.value]))],
+    ] as const) {
+      for (const [layer, carry] of carries) {
+        inputs[`${kind}.${layer}.pending`] = carry.pending;
+        inputs[`${kind}.${layer}.position`] = carry.pendingPosition;
+      }
+    }
+    return inputs;
+  }
+
   replaceCompressorRows(rows: Record<string, Tensor>): void {
     for (const [layer, tensor] of Object.entries(rows)) this.compressorRows.get(Number(layer))!.replace(tensor);
   }
 
-  override [Symbol.dispose](): void {
+  override[Symbol.dispose](): void {
     super[Symbol.dispose]();
     this.compressorInputs.clear();
     this.compressorOutputs.clear();
     this.compressorRows.clear();
-    if (this.state.extras.get("dsv41.layerHolders") === this) this.state.extras.delete("dsv41.layerHolders");
+    if (this.state?.extras.get("dsv41.layerHolders") === this) this.state.extras.delete("dsv41.layerHolders");
+    if (!this.parent) {
+      this.compressorCarry.clear();
+    }
   }
 }
 
@@ -291,6 +361,19 @@ export class DeepseekV41Model extends ChatModel {
       throw new Error(`Unsupported DeepSeek V4.1 dtype ${meta.dtype}: ${name}`);
     }
     this.sourceMetadata.set(name, meta);
+    const compressor = /^layers\.(\d+)\.attn\.compressor\.(wkv|wgate)\.weight$/.exec(name);
+    if (compressor && this.cfg.text.compress_ratios[Number(compressor[1])] === 2) {
+      if (meta.dtype !== "BF16" || meta.shape.length !== 2 || meta.shape[0] !== 512 || meta.shape[1] !== 5120) {
+        throw new Error(`Invalid DeepSeek V4.1 compressor weight: ${name}`);
+      }
+      // Both checkpoint tensors load directly into one named allocation. The
+      // executor replays the same layout without reading or uploading bytes.
+      const fusedName = name.replace(/\.(wkv|wgate)\.weight$/, ".wkv_gate.weight");
+      const fused = this.ensureAlloc([1024, 5120], "BF16", fusedName, TensorParallelism.Replicated);
+      using half = fused.narrow(compressor[2] === "wkv" ? 0 : 512, 512);
+      await this.loadTensorBytes(half, source);
+      return;
+    }
     const dtype = this.resolveWeightType(name, meta);
     const shape = [...meta.shape];
     const engram = /\.engram\.embed\.(weight|scale)$/.test(name);
@@ -355,7 +438,11 @@ export class DeepseekV41Model extends ChatModel {
     return this.runPhased(this.forwardPhased(state, layerHolders));
   }
 
-  override prepareForward(state: ExecutionState): LayerHolders {
+  protected override createDecodeResources(ws: ExecutionWorkspace): LayerHolders {
+    return new LayerHolders(ws);
+  }
+
+  override prepareForward(state: ExecutionState, resources?: Disposable): LayerHolders {
     const cache = state.cache;
     if (!(cache instanceof DeepseekV41Cache)) {
       throw new Error("V4.1 requires its own cache");
@@ -387,7 +474,17 @@ export class DeepseekV41Model extends ChatModel {
     pageHost.withPinnedBuffer(buffer => Buffer.from(pageIds.buffer).copy(buffer));
     pageTable.memcpy(pageHost, pageHost.bytes, MemcpyKind.HostToDevice);
     state.extras.set("dsv41.pages", pageTable);
-    const holders = state.extras.get("dsv41.layerHolders") as LayerHolders | undefined ?? new LayerHolders(state);
+    let holders = state.extras.get("dsv41.layerHolders") as LayerHolders | undefined;
+    if (!holders) {
+      const parent = resources as LayerHolders | undefined ?? new LayerHolders(state.ws);
+      try {
+        holders = parent.planCompressor(state);
+        if (!resources) holders.add(parent);
+      } catch (error) {
+        if (!resources) parent[Symbol.dispose]();
+        throw error;
+      }
+    }
     state.extras.set("dsv41.layerHolders", holders);
     return holders;
   }
@@ -400,6 +497,10 @@ export class DeepseekV41Model extends ChatModel {
       state.positionIds, state.qoIndptrD, state.mlaBatchIndices,
       state.extras.get("dsv41.lookback") as Tensor, state.extras.get("dsv41.pages") as Tensor,
     ].map(tensor => tensor.memoryRanges()))];
+  }
+
+  override forwardCaptureInputs(state: ExecutionState): Record<string, Tensor> {
+    return (state.extras.get("dsv41.layerHolders") as LayerHolders).captureInputs();
   }
 
   private *forwardWithLayerHolders<T>(state: ExecutionState, layerHolders: LayerHolders | undefined,
@@ -610,16 +711,18 @@ export class DeepseekV41Model extends ChatModel {
     // share one launch while preserving independent positions and causal masks.
     const pages = state.extras.get("dsv41.pages") as Tensor, batchIndices = state.mlaBatchIndices;
 
+    using idxWeightsStream = indexSource !== layer
+      ? undefined
+      : ops.withStream(() => {
+        return normed.linear(this.weight(p + ".indexer.weights_proj.weight"));
+      });
+
     using kvcacheIndex = source !== layer
       ? undefined
       : ops.withStream(() => {
-        using gateStream = ratio !== 2
-          ? undefined
-          : ops.withStream(() => normed.linear(this.weight(p + ".compressor.wgate.weight"), { outputType: "F32" }));
-        using projected = normed.linear(this.weight(p + ".compressor.wkv.weight"), { outputType: "F32" });
-        gateStream?.streamWaitEvent();
-        using gate = gateStream?.result;
-        using raw = gate ? projected.cat([gate], 1) : projected.viewClone();
+        using raw = normed.linear(this.weight(p + (ratio === 2
+          ? ".compressor.wkv_gate.weight"
+          : ".compressor.wkv.weight")), { outputType: "F32" });
         layerHolders.compressorRows.get(layer)?.replace(raw.viewClone());
         const previous = layerHolders.compressorInputs.get(layer);
         const result = raw.dsv41Compress(position, state.qoIndptrD, this.weight(p + ".compressor.norm.weight"), ratio as 1 | 2,
@@ -645,11 +748,6 @@ export class DeepseekV41Model extends ChatModel {
       ops.dsv4CacheAppend(cache.ckvData[layer], rotated, position, pages, 1, batchIndices);
     });
 
-    using idxWeightsStream = indexSource !== layer
-      ? undefined
-      : ops.withStream(() => {
-        return normed.linear(this.weight(p + ".indexer.weights_proj.weight"));
-      });
     using qr = this.linear(normed, p + ".wq_a");
     using qNorm = qr.rmsnorm(this.weight(p + ".q_norm.weight"), 1e-20);
     const projectQuery = () => {
@@ -852,6 +950,18 @@ export class DeepseekV41Model extends ChatModel {
   override async *generateMtpDecode(ws: ExecutionWorkspace, chatCache: ChatCache, depth: number,
     executionManager: ExecutionManager = new EagerExecution(),
     sampling: TokenSelector = { selectTarget: logits => logits.argmax() }): AsyncGenerator<MtpDecodeStepResult, void, void> {
+    ws.assertClear();
+    try {
+      yield* this.generateMtpDecodeInternal(ws, chatCache, depth, executionManager, sampling);
+    } finally {
+      await this.ops.synchronizeAsync();
+      ws.assertClear();
+      ws.resetPlanSlots();
+    }
+  }
+
+  private async *generateMtpDecodeInternal(ws: ExecutionWorkspace, chatCache: ChatCache, depth: number,
+    executionManager: ExecutionManager, sampling: TokenSelector): AsyncGenerator<MtpDecodeStepResult, void, void> {
     const cache = chatCache as DeepseekV41Cache, draft = cache.draft;
     if (!this.mtp || !draft || !Number.isInteger(depth) || depth < 1 || depth > 5) {
       throw new Error("DSpark requires --mtp depth 1..5");
@@ -864,6 +974,7 @@ export class DeepseekV41Model extends ChatModel {
     if (sampled && (!sampling.prepareDraft || !sampling.prepareDeterministicVerification || !sampling.verify)) {
       throw new Error("DSpark requires deterministic proposal verification");
     }
+    using layerHolders = new LayerHolders(ws);
     // The aligned context replay below restores compressor state as well.
     const nextTokens = await super.prepareDecodeInput(ws, cache, sampling);
     const histories = sequences.map(sequence => sequence.getTokenIds());
@@ -883,14 +994,13 @@ export class DeepseekV41Model extends ChatModel {
       committed = starts.slice();
       const offsets = starts.slice();
       while (offsets.some((offset, b) => offset < histories[b].length)) {
-        ws.assertClear();
-        ws.clearTracking();
+        ws.resetPlanSlots();
         const budget = Math.max(1, Math.floor(ws.maxSeqLen / batch));
         const chunks = histories.map((history, b) => history.slice(offsets[b], offsets[b] + budget));
         speculative = true;
         const target = ws.planPrefill(this, batch, chunks.map(chunk => chunk.length), cache);
         target.setInput(chunks);
-        using targetHolders = this.prepareForward(target);
+        using targetHolders = this.prepareForward(target, layerHolders);
         target.extras.set("dsv41.dsparkContext", this.planDspark(target, draft, "recondition"));
         {
           using hidden = this.forwardModel(target);
@@ -904,8 +1014,7 @@ export class DeepseekV41Model extends ChatModel {
         speculative = false;
       }
       for (; ;) {
-        ws.assertClear();
-        ws.clearTracking();
+        ws.resetPlanSlots();
         if (cache.sequences.length !== batch || sequences.some((sequence, b) => cache.sequences[b] !== sequence || sequence.allocLen !== committed[b])) {
           throw new Error("DSpark batch changed; close and restart the generator");
         }
@@ -926,14 +1035,14 @@ export class DeepseekV41Model extends ChatModel {
         const verification = ws.planPrefill(this, batch, Array(batch).fill(width), cache);
         verification.setInput(nextTokens.map(token => [token, ...Array(depth).fill(0)]));
         verification.extras.set("dsv41.retainCompressorRows", true);
-        using verificationHolders = this.prepareForward(verification);
+        using verificationHolders = this.prepareForward(verification, layerHolders);
         const context = this.planDspark(verification, draft, "context");
         verification.extras.set("dsv41.dsparkContext", context);
         if (sampled) {
           sampling.prepareDraft!(batch, depth);
         }
         const execution = executionManager.execute({
-          states: [block, verification], inputs: {},
+          states: [block, verification], inputs: this.forwardCaptureInputs(verification),
           key: ["dspark", depth, sampling.captureKey ?? "greedy", sampling.mtpCaptureKey ?? "greedy",
             ...this.forwardCaptureKey(verification), JSON.stringify(draft.ckvData.map(t => t.memoryRanges()))]
         }, () => {
@@ -989,12 +1098,11 @@ export class DeepseekV41Model extends ChatModel {
           accepted.push(count);
           tokens.push([...prefix.slice(1), replacement]);
         }
-        cache.commitCompressor(verification, verificationHolders, accepted);
+        verificationHolders.commitCompressor(verification, accepted);
         verificationHolders[Symbol.dispose]();
         committed = sequences.map(sequence => sequence.allocLen);
         speculative = false;
-        ws.assertClear();
-        ws.clearTracking();
+        ws.resetPlanSlots();
         yield { tokens, numAccepted: accepted, numDraftTokens: depth, warmup: execution.warmup };
       }
     } finally {
@@ -1031,8 +1139,9 @@ export class DeepseekV41Model extends ChatModel {
         const self = this;
         const committed = chunk.prefillInputIdsList.map((row, i) => [...overlap[i], ...row]);
         const plan = this.createChunkedPrefillPlan([first, second], cache, committed, (function* () {
-          using firstHolders = self.prepareForward(first);
-          using secondHolders = self.prepareForward(second);
+          using layerHolders = new LayerHolders(ws);
+          using firstHolders = self.prepareForward(first, layerHolders);
+          using secondHolders = self.prepareForward(second, layerHolders);
           {
             using hidden = yield* self.forwardPhased(first);
           }
@@ -1059,7 +1168,7 @@ export class DeepseekV41Model extends ChatModel {
     return plan;
   }
 
-  protected override async prepareDecodeInput(ws: ExecutionWorkspace, cache: ChatCache, sampling: TokenSelector): Promise<number[]> {
+  protected override async prepareDecodeInput(ws: ExecutionWorkspace, cache: ChatCache, sampling: TokenSelector, resources?: Disposable): Promise<number[]> {
     const targets = await super.prepareDecodeInput(ws, cache, sampling);
     const sequences = cache.getPagedKV().sequences;
     const overlap = sequences.map(sequence => sequence.allocLen % 2 ? [sequence.getTokenIds().at(-1)!] : []);
@@ -1071,13 +1180,11 @@ export class DeepseekV41Model extends ChatModel {
         sequences[i].truncate(sequences[i].allocLen - 1);
       }
     }
-    ws.assertClear();
-    ws.clearTracking();
+    ws.resetPlanSlots();
     {
-      using tracking = ws.startTracking();
       const state = ws.planPrefill(this, sequences.length, overlap.map(row => row.length), cache);
       state.setInput(overlap);
-      using holders = this.prepareForward(state);
+      using holders = this.prepareForward(state, resources);
       using hidden = this.forwardModel(state);
       await this.ops.synchronizeAsync();
       for (let i = 0; i < sequences.length; i++) {
@@ -1086,8 +1193,7 @@ export class DeepseekV41Model extends ChatModel {
         }
       }
     }
-    ws.assertClear();
-    ws.clearTracking();
+    ws.resetPlanSlots();
     return targets;
   }
 

@@ -9,10 +9,78 @@ import { TensorParallelism } from "../src/device_ops";
 import { GlmOps, bf16BytesToF32 } from "../src/glm_ops";
 import { ParallelOps } from "../src/parallel_ops";
 import { WorkspaceBase } from "../src/workspace";
-import { loadDeepseekV41Config } from "../src/deepseek_v41_model";
-import { CompressorCarry } from "../src/deepseek_v41_cache";
+import { CompressorCarry, DeepseekV41Model, loadDeepseekV41Config, type DeepseekV41Config } from "../src/deepseek_v41_model";
+import type { CheckpointTensor } from "../src/checkpoint_source";
 import { UsingHolder } from "../src/using-holder";
 import { bf16Round, dsv41IndexQuantize, dsv41IndexScores, dsv41Rope, engramHashes, packDsv41Index } from "./deepseek_v41_oracles";
+
+class CompressorLoadModel extends DeepseekV41Model {
+  replay = false;
+  protected override get loadReplay(): boolean { return this.replay; }
+  load(source: CheckpointTensor) { return this.loadTensor(source.name, source.meta, source); }
+  finishLoading() { return this.drainLoadTransfers(); }
+}
+
+for (const tp of [1, 2]) it(`DSV4 fused compressor weights load in either order and replay without transfers, TP${tp}`, async () => {
+  using gpu0 = new GlmOps(0);
+  using gpu1 = tp === 2 ? new GlmOps(1) : undefined;
+  using parallel = gpu1 ? new ParallelOps([gpu0, gpu1]) : undefined;
+  const ops = parallel ?? gpu0;
+  const config = { eosTokenId: 1, text: { compress_ratios: Array.from({ length: 40 }, (_, i) => i < 2 ? 0 : i < 20 ? 2 : 1) } } as unknown as DeepseekV41Config;
+  using model = new CompressorLoadModel(ops, config);
+  const kv = Buffer.alloc(512 * 5120 * 2), gate = Buffer.alloc(kv.length);
+  for (let row = 0; row < 512; ++row) {
+    kv.fill(bf16Round(Float32Array.of(row % 7 - 3)), row * 5120 * 2, (row + 1) * 5120 * 2);
+    gate.fill(bf16Round(Float32Array.of(row % 5 + 1)), row * 5120 * 2, (row + 1) * 5120 * 2);
+  }
+  const source = (layer: number, projection: string, bytes: Buffer, replay = false): CheckpointTensor => ({
+    name: `layers.${layer}.attn.compressor.${projection}.weight`,
+    meta: { dtype: "BF16", shape: [512, 5120], dataOffsets: [0, bytes.length] },
+    mapping() { assert(!replay, "replay must not request a mapping"); return undefined; },
+    read() { assert(!replay, "replay must not read weight bytes"); return bytes; },
+    readSlice() { throw new Error("unexpected slice read"); },
+  });
+  // Include reversed and concurrent loads: each half shares one allocation.
+  await model.load(source(2, "wkv", kv));
+  await model.load(source(2, "wgate", gate));
+  await model.load(source(8, "wgate", gate));
+  await model.load(source(8, "wkv", kv));
+  await Promise.all([model.load(source(14, "wkv", kv)), model.load(source(14, "wgate", gate))]);
+  await model.load(source(20, "wkv", kv));
+  await model.finishLoading();
+  const expected = Buffer.concat([kv, gate]);
+  for (const layer of [2, 8, 14]) {
+    const p = `layers.${layer}.attn.compressor`;
+    const fused = model.tensors.get(p + ".wkv_gate.weight")!;
+    assert.deepEqual(fused.shape, [1024, 5120]);
+    assert.equal(fused.parallelism, TensorParallelism.Replicated);
+    assert(!model.tensors.has(p + ".wkv.weight"));
+    assert(!model.tensors.has(p + ".wgate.weight"));
+    assert(model.sourceMetadata.has(p + ".wkv.weight"));
+    assert(model.sourceMetadata.has(p + ".wgate.weight"));
+    const bytes = Buffer.alloc(fused.bytes); fused.d2h(bytes);
+    assert.deepEqual(bytes, expected);
+  }
+  assert.deepEqual(model.tensors.get("layers.20.attn.compressor.wkv.weight")!.shape, [512, 5120]);
+  using ws = new WorkspaceBase(ops);
+  using input = ws.alloc([1, 5120], "BF16"); input.fill(1, input.numElements);
+  using output = input.linear(model.tensors.get("layers.2.attn.compressor.wkv_gate.weight")!, { outputType: "F32" });
+  const bytes = Buffer.alloc(output.bytes); output.d2h(bytes);
+  for (let row = 0; row < 1024; ++row)
+    assert.equal(bytes.readFloatLE(row * 4), 5120 * (row < 512 ? row % 7 - 3 : (row - 512) % 5 + 1));
+  model.assertClear();
+
+  using replay = new CompressorLoadModel(ops, config);
+  replay.replay = true;
+  for (const layer of [2, 8, 14]) {
+    await replay.load(source(layer, "wgate", gate, true));
+    await replay.load(source(layer, "wkv", kv, true));
+  }
+  await replay.load(source(20, "wkv", kv, true));
+  assert.deepEqual([...replay.tensors].map(([name, tensor]) => [name, tensor.shape, tensor.type, tensor.parallelism]),
+    [...model.tensors].map(([name, tensor]) => [name, tensor.shape, tensor.type, tensor.parallelism]));
+  replay.assertClear();
+});
 
 for (const tp of [1, 2]) {
   it(`DSV4 native wrapper combines local/global caches and sinks on TP${tp}`, () => {

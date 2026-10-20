@@ -586,7 +586,7 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     assert.deepEqual(await run(true), await run(false));
   });
 
-  it("stateful decode generator preserves caller tensors on entry, resume, and break", async () => {
+  it("stateful decode generator checks entry and exit without disposing caller tensors", async () => {
     using cache = model.createChatCache(32, 1);
     cache.reset(1);
     let targets = chunkedPrefill(model, ws, cache, [1, 2, 3], [3]);
@@ -605,15 +605,18 @@ describe("GLM-5.1 small model phased MTP prefill", () => {
     targets = first.value!.tokens.map(tokens => tokens[0]);
     {
       using callerTensor = ws.alloc([1], "I32");
-      await assert.rejects(generator.next(), /assertClear/);
+      assert.equal((await generator.next()).done, false);
+      await assert.rejects(generator.return(), /assertClear/);
       assert.equal(callerTensor.disposed, false);
     }
     let callerTensor: Tensor | undefined;
     try {
-      for await (const step of model.generateDecode(ws, cache)) {
-        callerTensor = ws.alloc([1], "I32");
-        break;
-      }
+      await assert.rejects(async () => {
+        for await (const step of model.generateDecode(ws, cache)) {
+          callerTensor = ws.alloc([1], "I32");
+          break;
+        }
+      }, /assertClear/);
       assert.ok(callerTensor);
       assert.equal(callerTensor.disposed, false);
     } finally {
