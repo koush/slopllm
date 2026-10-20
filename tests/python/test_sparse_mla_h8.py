@@ -1,4 +1,4 @@
-"""Native H8 versus generic decode and FP32 attention on quantized inputs."""
+"""Native H8 versus FP32 attention on quantized inputs and graph replay."""
 import math
 
 import pytest
@@ -7,12 +7,11 @@ import torch
 
 @pytest.mark.parametrize("mode", ["packed", "split", "fp8"])
 @pytest.mark.parametrize("cpb", [1, 2, 3, 32, "prefill"])
-def test_native_h8(glm, device, monkeypatch, mode, cpb):
-    switch = "FLASHINFER_GLM_H8_PREFILL_SWAP_QK" if cpb == "prefill" else "FLASHINFER_GLM_H8_NATIVE"
-    _check_native_h8(glm, device, monkeypatch, mode, cpb, switch)
+def test_native_h8(glm, device, mode, cpb):
+    _check_native_h8(glm, device, mode, cpb)
 
 
-def _check_native_h8(glm, device, monkeypatch, mode, cpb, switch):
+def _check_native_h8(glm, device, mode, cpb):
     torch.manual_seed(782)
     rows, heads, topk, splits = (32 if cpb == "prefill" else 8), 8, 2048, 32
     q = (torch.randn(rows, heads, 512, device=device) * .3).to(torch.float8_e4m3fn)
@@ -67,15 +66,8 @@ def _check_native_h8(glm, device, monkeypatch, mode, cpb, switch):
                 q_scales=qs.data_ptr() if mode == "fp8" else 0)
 
     torch.cuda.synchronize(device)
-    monkeypatch.setenv(switch, "0")
     run()
     glm.synchronize()
-    generic, generic_lse = out.clone(), lse.clone()
-    monkeypatch.setenv(switch, "1")
-    run()
-    glm.synchronize()
-    torch.testing.assert_close(out, generic, atol=.002, rtol=.025)
-    torch.testing.assert_close(lse, generic_lse, atol=.002, rtol=.001)
     for i, n in enumerate(lengths):
         slots = indices[i, :n].long()
         slots = slots[slots >= 0]
@@ -102,7 +94,6 @@ def _check_native_h8(glm, device, monkeypatch, mode, cpb, switch):
         glm.graph_launch(executable)
         glm.synchronize()
         replay, replay_lse = out.clone(), lse.clone()
-        monkeypatch.setenv(switch, "0")
         torch.cuda.synchronize(device)
         run()
         glm.synchronize()

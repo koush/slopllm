@@ -361,6 +361,10 @@ NCCL erroneously (the 8 GPUs are connected via 2 switches) sees device interconn
 
 # Workflow
 
+Use environment-variable switches for A/B kernel experiments, but remove those
+switches before committing an accepted optimization. Integrate accepted dispatch
+and resource settings into the normal planner/kernel selection.
+
 You must NEVER "git commit" unless the user explicitly asks you to commit. If you think the user intends to commit, you must ask for permission per commit. There may be multiple changes that may need to be in multiple commits. You must not proactively commit a change just because you made a prior commit. You must wait for explicit permission to commit every change to ensure the user has fully reviewed it. Instructions to make a change is not implicit permission to commit. Permission to commit is only for a single commit.
 
 You must NEVER use "git stash pop" to reapply stashed changes. You MUST use "git stash apply" instead. "git stash pop" is potentially destructive and may cause data loss when used in conjunction with an coding agent harness rollback. The user will clean up any entries left behind from usage of "git stash apply".
