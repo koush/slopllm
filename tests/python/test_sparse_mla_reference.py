@@ -1,27 +1,10 @@
-"""Dense-vs-sparse MLA equivalence test.
+"""Sparse MLA versus independent FP32 attention on unquantized KV.
 
-This is the test that reproduces the model-level bug ("dense attention works,
-sparse attention over topk KV produces garbage") in isolation — no model, one
-GPU, deterministic.
-
-Key idea: when kvLen < topk, the sparse kernel selects EVERY KV position, so
-sparse MLA must be numerically equivalent to dense MLA over the same KV (within
-FP8 quantization tolerance). We build identical ckv/kpe/q, compute an fp32
-ground-truth reference, and check BOTH kernels against it:
-
-  * dense  (glm.mla_decode_run over a BF16 paged cache)   -> tight (bf16)
-  * sparse (glm.sparse_mla_decode over FP8-packed cache)  -> close (FP8)
-
-Existing sparse tests only compare the SM120 kernel against a PyTorch reference
-that shares the same packed-FP8 assumptions (and use a very loose max_diff<3.0),
-so a systematic sparse-path error is invisible there. This test does not have
-that blind spot: the reference is plain fp32 attention on the un-quantized KV.
-
-rope is irrelevant to this bug, so kpe is treated as already position-encoded
-and fed identically to reference and both kernels.
+When kvLen < topk, sparse attention selects every KV position and must agree
+with full attention within FP8 quantization tolerance. Both prefill and decode
+are checked against PyTorch, with kpe treated as already position-encoded.
 """
 import math
-import ctypes
 import pytest
 import torch
 
@@ -60,57 +43,6 @@ def _cos(a, b):
     a = a.flatten().float()
     b = b.flatten().float()
     return (a @ b / (a.norm() * b.norm() + 1e-12)).item()
-
-
-def _run_dense(glm, device, q, ckv, kpe, num_heads, seq_len):
-    """Dense MLA decode over a BF16 paged cache. Returns [H,512] bf16."""
-    B = 1
-    num_pages = (seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-
-    ckv_cache = torch.zeros(num_pages, PAGE_SIZE, KV_LORA_RANK, dtype=torch.bfloat16, device=device)
-    kpe_cache = torch.zeros(num_pages, PAGE_SIZE, PE_DIM, dtype=torch.bfloat16, device=device)
-    flat_ckv = ckv_cache.view(-1, KV_LORA_RANK)
-    flat_kpe = kpe_cache.view(-1, PE_DIM)
-    flat_ckv[:seq_len] = ckv
-    flat_kpe[:seq_len] = kpe
-
-    q_nope = q[:, :KV_LORA_RANK].reshape(B, num_heads, KV_LORA_RANK).contiguous()
-    q_pe = q[:, KV_LORA_RANK:].reshape(B, num_heads, PE_DIM).contiguous()
-
-    indices = torch.arange(num_pages, dtype=torch.int32, device=device)
-    rem = seq_len % PAGE_SIZE
-    last_page_len = torch.tensor([rem if rem else PAGE_SIZE], dtype=torch.int32, device=device)
-    indptr_h = (ctypes.c_int32 * 2)(0, num_pages)
-    indptr_d = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
-
-    float_ws = glm.alloc(32 * 1024 * 1024)
-    int_ws = glm.alloc(8 * 1024 * 1024)
-    pinned_int_ws = glm.alloc_pinned(8 * 1024 * 1024)
-    plan_info = (ctypes.c_int64 * 10)()
-
-    glm.mla_decode_plan(
-        float_ws, 32 * 1024 * 1024,
-        int_ws, pinned_int_ws, 8 * 1024 * 1024,
-        ctypes.addressof(plan_info),
-        ctypes.addressof(indptr_h),
-        B, num_heads, PAGE_SIZE, False,
-        head_dim_ckv=KV_LORA_RANK, head_dim_kpe=PE_DIM)
-
-    o = torch.empty(B, num_heads, KV_LORA_RANK, dtype=torch.bfloat16, device=device)
-    glm.mla_decode_run(
-        q_nope.data_ptr(), q_pe.data_ptr(),
-        ckv_cache.data_ptr(), kpe_cache.data_ptr(),
-        indices.data_ptr(), indptr_d.data_ptr(), last_page_len.data_ptr(),
-        o.data_ptr(),
-        float_ws, int_ws, ctypes.addressof(plan_info),
-        B, num_heads, PAGE_SIZE, SM_SCALE,
-        head_dim_ckv=KV_LORA_RANK, head_dim_kpe=PE_DIM)
-    glm.synchronize()
-
-    glm.free_buf(float_ws)
-    glm.free_buf(int_ws)
-    glm.free_pinned(pinned_int_ws)
-    return o.reshape(num_heads, KV_LORA_RANK)
 
 
 def _run_sparse(glm, device, q, ckv, kpe, num_heads, seq_len):
@@ -265,8 +197,8 @@ def test_sparse_prefill_matches_reference(glm, device, num_heads, seq_len):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("num_heads", [8, 64])
 @pytest.mark.parametrize("seq_len", [13, 37, 200])
-def test_sparse_matches_dense_and_reference(glm, device, num_heads, seq_len):
-    """Sparse MLA over topk KV must equal dense MLA when kvLen < topk."""
+def test_sparse_decode_matches_reference(glm, device, num_heads, seq_len):
+    """Sparse MLA over all KV positions agrees with the FP32 reference."""
     torch.manual_seed(1234 + seq_len + num_heads)
 
     ckv = torch.randn(seq_len, KV_LORA_RANK, dtype=torch.bfloat16, device=device)
@@ -274,30 +206,20 @@ def test_sparse_matches_dense_and_reference(glm, device, num_heads, seq_len):
     q = torch.randn(num_heads, D_QK, dtype=torch.bfloat16, device=device)
 
     ref = _reference_mla(q, ckv, kpe, SM_SCALE)                       # [H,512] fp32
-    dense = _run_dense(glm, device, q, ckv, kpe, num_heads, seq_len).float()
     sparse = _run_sparse(glm, device, q, ckv, kpe, num_heads, seq_len).float()
 
     ref_scale = ref.abs().max().item() + 1e-6
-    dense_rel = (dense - ref).abs().max().item() / ref_scale
     sparse_rel = (sparse - ref).abs().max().item() / ref_scale
-    dense_cos = _cos(dense, ref)
     sparse_cos = _cos(sparse, ref)
 
     print(f"\n[H={num_heads} S={seq_len}] "
-          f"dense: rel={dense_rel:.4f} cos={dense_cos:.5f} | "
           f"sparse: rel={sparse_rel:.4f} cos={sparse_cos:.5f}")
     print(f"  ref[0,:6]:    {ref[0,:6].tolist()}")
-    print(f"  dense[0,:6]:  {dense[0,:6].tolist()}")
     print(f"  sparse[0,:6]: {sparse[0,:6].tolist()}")
-
-    # Anchor: dense kernel must match the fp32 reference (this is the path that
-    # "works" in the model). If this fails the test harness itself is wrong.
-    assert dense_cos > 0.999, f"dense kernel disagrees with reference (cos={dense_cos})"
-    assert dense_rel < 0.03, f"dense rel error too high: {dense_rel}"
 
     # The actual bug check: sparse must match within FP8 tolerance.
     assert sparse_cos > 0.99, (
-        f"SPARSE disagrees with dense/reference (cos={sparse_cos}, rel={sparse_rel}) "
+        f"SPARSE disagrees with reference (cos={sparse_cos}, rel={sparse_rel}) "
         f"— reproduces the model garbage-output bug")
     assert sparse_rel < 0.10, f"sparse rel error too high: {sparse_rel}"
 

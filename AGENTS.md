@@ -60,7 +60,7 @@ Key rules:
 - Single-GPU device backend. Wraps the native addon (`glm.node`).
 - Owns CUDA context, device heap, and alternate streams. `withStream(fn)` uses normal priority; `withStream(true, fn)` uses high priority.
 - CUDA graph API: `graphBeginCapture/EndCapture/Instantiate/Launch/Destroy`.
-- FlashInfer integration: plan/run split for batch prefill/decode and MLA attention.
+- FlashInfer integration: plan/run split for standard batch prefill/decode; sparse MLA uses direct kernel dispatch.
 - NCCL and P2P primitives exposed for `ParallelOps`.
 
 ### ParallelOps (`src/parallel_ops.ts`)
@@ -176,9 +176,9 @@ Linear op parallelism rules (weight × input → output):
 
 When `--cp` is set on the GLM backend, GPUs operate as context-parallel shards for attention while retaining tensor-parallel sharding for linear layers:
 
-- **KV cache is Row-sharded**: each GPU stores every Nth token's KV (tokens interleaved across GPUs). `PagedKVCache` uses `TensorParallelism.Row` for ckv/kpe tensors.
+- **KV cache is Row-sharded**: each GPU stores every Nth token's KV (tokens interleaved across GPUs). `PagedKVCache` uses `TensorParallelism.Row` for packed CKV and indexer cache tensors.
 - **Position IDs**: planning supplies global token positions. CP-aware cache/attention kernels use rank and world size to map tokens `i, i+N, i+2N, ...` to GPU `i`.
-- **Attention**: shard-local attention produces partial output plus log-sum-exp for CP merging. GLM also gathers CKV/indexer caches for selected workloads to run against flat gathered buffers. Production GLM uses sparse MLA; dense MLA uses the FlashInfer plan/run path.
+- **Attention**: shard-local attention produces partial output plus log-sum-exp for CP merging. GLM also gathers CKV/indexer caches for selected workloads to run against flat gathered buffers. GLM uses sparse MLA exclusively.
 - **CP Merge**: Partial attention outputs are combined with an online-softmax merge using a custom P2P push or tree-reduce path, or AllGather plus ReduceScatter, depending on output size and P2P availability.
 - **Page allocation**: every logical page spans all CP GPUs. `pageSize = physicalPageSize * worldSize`, so the default physical page holds 64 tokens per GPU and a logical page holds `64 * worldSize` interleaved tokens.
 - **KV and Indexer K Prefetch**: `prefetchLayerResources()` gathers future-layer CKV and indexer K/scales on alternate streams when the selected attention path uses gathered KV. Phased prefill shares gathered buffers between paired chunks.
@@ -187,9 +187,8 @@ When `--cp` is set on the GLM backend, GPUs operate as context-parallel shards f
 
 - Default physical `PAGE_SIZE=64`, defined in `src/paged_sequence.ts`; logical page size grows by world size under CP. GLM requires physical page size 64. Pages are ref-counted for prefix sharing; full pages are shared and partial-page copying is supported.
 - `Sequence` (`src/paged_sequence.ts`): ordered pages with allocation length, committed token history, and a pending `targetToken` for the next decode input.
-- `PagedKVCache` extends `WorkspaceBase` — KV cache tensors (`kData[]`/`vData[]` or `ckvData[]`/`kpeData[]`) are pre-allocated GPU buffers indexed by layer and page ID.
+- `PagedKVCache` extends `WorkspaceBase` — KV cache tensors (`kData[]`/`vData[]` or packed `ckvData[]` with indexer caches) are pre-allocated GPU buffers indexed by layer and page ID.
 - Planning metadata belongs to `ExecutionState` and is rebuilt/uploaded per plan; the old page/position dirty flags are gone.
-- Dense MLA uses BF16 `ckvData[layer]` `[maxPages, pageSize, kvLoraRank]` and `kpeData[layer]` `[maxPages, pageSize, qkRopeDim]`.
 - Sparse MLA packs FP8 CKV, FP32 block scales, and BF16 rotary keys into U8 `ckvData[layer]` `[maxPages, pageSize, bytesPerToken]`. Indexer keys use U8 `kData` with F32 `kScaleData`; shared-indexer layers omit their own indexer cache and reuse prior top-k selections.
 - Standard path: uses `kData[layer]` `[maxPages, nKv*pageSize*hd]` and `vData[layer]`.
 
@@ -199,7 +198,7 @@ When `--cp` is set on the GLM backend, GPUs operate as context-parallel shards f
 - `ExecutionState`: holds per-step context (batchSize, totalTokens, seqLens, isDecode, cache reference).
 - Each plan gets a distinct slot, allowing plan+plan+run+run without overwriting metadata. Tracking/clear boundaries reset the slot counter. Each slot packs metadata into one device/host buffer pair with stable views; page indices come last so changing page count does not shift other pointers.
 - **Plan/Run split**:
-  - `planPrefill()` / `planDecode()`: reserve pages, fill position/page/sequence metadata, invoke the appropriate dense FlashInfer or sparse-MLA planning path, and upload metadata. Sparse prefill has no attention-kernel plan but still prepares CP page lengths.
+  - `planPrefill()` / `planDecode()`: reserve pages, fill position/page/sequence metadata, invoke the standard-attention FlashInfer plan or prepare sparse-MLA CP page lengths, and upload metadata. Sparse MLA has no FlashInfer attention-kernel plan.
   - `state.setInput()`: uploads host token IDs or copies a GPU token tensor into the slot's input buffer.
   - `forwardPrefill/forwardDecode()`: runs the model forward pass using the planned state.
 - FlashInfer plan writes workspace buffers (floatWs, intWs, planInfo). Run reads them. This split is essential for CUDA graph capture — plan runs outside the graph, run is captured.

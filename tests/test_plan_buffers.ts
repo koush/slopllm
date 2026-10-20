@@ -11,7 +11,6 @@ const shards = (tensor: Tensor): readonly Tensor[] => tensor instanceof Parallel
 
 for (const { parallel, mode } of [
   { parallel: false, mode: "standard" },
-  { parallel: false, mode: "dense MLA" },
   { parallel: false, mode: "sparse MLA" },
   { parallel: true, mode: "sparse MLA" },
 ]) {

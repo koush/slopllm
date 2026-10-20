@@ -37,11 +37,10 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
   kScaleData: Tensor[];
   vData: Tensor[];
   ckvData: Tensor[];
-  kpeData: Tensor[];
   /** Indexed by model layer, independently of the compact attention-cache indices. */
   readonly convState: (Tensor | undefined)[];
   readonly recurrentState: (Tensor | undefined)[];
-  /** FlashInfer float workspace — shared across workspaces. Only allocated for non-sparse modes (MHA + dense MLA). */
+  /** FlashInfer float workspace — shared across workspaces. Only allocated for MHA. */
   floatWs!: Tensor;
   availablePages: number[];
   sequences: Sequence[];
@@ -61,6 +60,9 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.pageSize = contextParallel ? physicalPageSize * ops.worldSize : physicalPageSize;
     this.contextParallel = contextParallel;
     this.sparseMode = indexHeadDim > 0 && kvLoraRank > 0;
+    if (kvLoraRank > 0 && !this.sparseMode) {
+      throw new Error("MLA caches require sparse attention with an indexer");
+    }
     if (packedFormat === "dsv4" && (contextParallel || physicalPageSize !== 64 || !this.sparseMode)) {
       throw new Error("DSV4 packed caches require replicated 64-token sparse pages");
     }
@@ -71,7 +73,6 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     this.kScaleData = [];
     this.vData = [];
     this.ckvData = [];
-    this.kpeData = [];
     this.convState = new Array(recurrentLayers.length).fill(undefined);
     this.recurrentState = new Array(recurrentLayers.length).fill(undefined);
     for (const layout of recurrentLayers) {
@@ -86,12 +87,7 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       const alloc = (shape: number[], type: string, name: string, parallelism?: TensorParallelism): Tensor =>
         pinned ? this.allocPinned(shape, type, name, parallelism) : this.alloc(shape, type, name, parallelism);
       if (kvLoraRank > 0) {
-        if (this.sparseMode) {
-          this.ckvData.push(alloc([maxPages, this.pageSize, this.bytesPerToken], "U8", "ckv" + i, contextParallel ? TensorParallelism.Row : undefined));
-        } else {
-          this.ckvData.push(alloc([maxPages, this.pageSize, kvLoraRank], "BF16", "ckv" + i, contextParallel ? TensorParallelism.Row : undefined));
-          this.kpeData.push(alloc([maxPages, this.pageSize, qkRopeDim], "BF16", "kpe" + i, contextParallel ? TensorParallelism.Row : undefined));
-        }
+        this.ckvData.push(alloc([maxPages, this.pageSize, this.bytesPerToken], "U8", "ckv" + i, contextParallel ? TensorParallelism.Row : undefined));
         if (indexHeadDim > 0) {
           if (sharedLayers[i]) {
             this.kData.push(undefined!);
@@ -248,7 +244,6 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     add(this.kScaleData[layer], src.kScaleData[layer]);
     add(this.vData[layer], src.vData[layer]);
     add(this.ckvData[layer], src.ckvData[layer]);
-    add(this.kpeData[layer], src.kpeData[layer]);
     return pairs;
   }
 
@@ -278,7 +273,6 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
       check(this.kScaleData[i], src.kScaleData[i], "kScale");
       check(this.vData[i], src.vData[i], "v");
       check(this.ckvData[i], src.ckvData[i], "ckv");
-      check(this.kpeData[i], src.kpeData[i], "kpe");
     }
   }
 
@@ -475,9 +469,6 @@ export class PagedKVCache extends WorkspaceBase implements ChatCache {
     }
     for (let i = 0; i < this.ckvData.length; i++) {
       this.copyPageRow(this.ckvData[i], srcPageId, dstPageId);
-    }
-    for (let i = 0; i < this.kpeData.length; i++) {
-      this.copyPageRow(this.kpeData[i], srcPageId, dstPageId);
     }
   }
 

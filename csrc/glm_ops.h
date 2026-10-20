@@ -614,82 +614,9 @@ void glm_batch_prefill_ragged_run(
 // MLA (Multi-head Latent Attention) operations
 // ---------------------------------------------------------------------------
 
-// MLA Prefill: Plan phase
-// Allocates workspace and computes scheduling metadata for MLA prefill.
-// plan_info: output array of at least 18 int64_t elements (MLAPlanInfo)
-void glm_mla_prefill_plan(
-    GlmCtx* ctx,
-    void* float_ws, size_t float_ws_size,
-    void* int_ws, void* pinned_int_ws, size_t int_ws_size,
-    int64_t* plan_info,
-    int32_t* qo_indptr_h, int32_t* kv_indptr_h, int32_t* kv_len_h,
-    uint32_t batch_size, uint32_t num_heads, uint32_t head_dim_o,
-    bool causal, uint32_t cp_world_size = 0, uint32_t cp_rank = 0);
-
-// MLA Prefill: Run phase
-// Executes MLA paged attention (prefill/incremental-prefill).
-// q_nope: [packed_qo_len, num_heads, head_dim_ckv] BF16
-// q_pe:   [packed_qo_len, num_heads, head_dim_kpe] BF16
-// ckv_data: [num_pages, page_size, head_dim_ckv] BF16
-// kpe_data: [num_pages, page_size, head_dim_kpe] BF16
-// o: [packed_qo_len, num_heads, head_dim_ckv] BF16
-// lse: [packed_qo_len, num_heads] F32 (optional, pass nullptr to skip)
-void glm_mla_prefill_run(
-    GlmCtx* ctx,
-    void* q_nope, void* q_pe,
-    void* ckv_data, void* kpe_data,
-    int32_t* kv_indices,
-    void* o,
-    void* float_ws, void* int_ws,
-    int64_t* plan_info,
-    uint32_t num_heads, uint32_t page_size,
-    int mask_mode, float sm_scale,
-    uint32_t q_nope_stride_n, uint32_t q_nope_stride_h,
-    uint32_t q_pe_stride_n, uint32_t q_pe_stride_h,
-    uint32_t ckv_stride_page, uint32_t ckv_stride_n,
-    uint32_t kpe_stride_page, uint32_t kpe_stride_n,
-    uint32_t o_stride_n, uint32_t o_stride_h,
-    uint32_t head_dim_ckv, uint32_t head_dim_kpe,
-    float* lse,
-    uint32_t cp_world_size, uint32_t cp_rank,
-    void* custom_mask = nullptr, int32_t* mask_indptr = nullptr,
-    int32_t* mask_kv_len = nullptr);
-
-// MLA Decode: Plan phase
-// plan_info: output array of at least 10 int64_t elements (DecodePlanInfo)
-void glm_mla_decode_plan(
-    GlmCtx* ctx,
-    void* float_ws, size_t float_ws_size,
-    void* int_ws, void* pinned_int_ws, size_t int_ws_size,
-    int64_t* plan_info,
-    int32_t* indptr_h,
-    uint32_t batch_size, uint32_t num_qo_heads,
-    uint32_t page_size, bool enable_cuda_graph,
-    uint32_t head_dim_ckv, uint32_t head_dim_kpe);
-
-// MLA Decode: Run phase
-// q_nope: [batch_size, num_heads, head_dim_ckv] BF16
-// q_pe:   [batch_size, num_heads, head_dim_kpe] BF16
-// ckv_data: [num_pages, page_size, head_dim_ckv] BF16
-// kpe_data: [num_pages, page_size, head_dim_kpe] BF16
-// o: [batch_size, num_heads, head_dim_ckv] BF16
-// lse: [batch_size, num_heads] F32 (optional, pass nullptr to skip)
-void glm_mla_decode_run(
-    GlmCtx* ctx,
-    void* q_nope, void* q_pe,
-    void* ckv_data, void* kpe_data,
-    int32_t* indices, int32_t* indptr_d, int32_t* last_page_len,
-    void* o,
-    void* float_ws, void* int_ws,
-    int64_t* plan_info,
-    uint32_t batch_size, uint32_t num_qo_heads,
-    uint32_t page_size, float sm_scale,
-    uint32_t head_dim_ckv, uint32_t head_dim_kpe,
-    float* lse);
-
-// MLA: Append entries to paged KV cache
+// Sparse indexer: quantize and append K entries to the paged cache.
 // append_ckv: [nnz, head_dim_ckv] BF16
-// append_kpe: [nnz, head_dim_kpe] BF16
+// kpe_data holds FP32 scales; append_kpe is null and head_dim_kpe is zero.
 void glm_mla_kv_cache_append(
     GlmCtx* ctx,
     void* ckv_data, void* kpe_data,

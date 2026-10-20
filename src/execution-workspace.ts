@@ -10,8 +10,6 @@ import { WorkspaceBase } from "./workspace";
 
 export const DECODE_PLAN_INFO_SIZE = 10;
 export const PREFILL_PLAN_INFO_SIZE = 15;
-export const MLA_PREFILL_PLAN_INFO_SIZE = 19;
-export const MLA_DECODE_PLAN_INFO_SIZE = 10;
 export const BATCH_FLOAT_WS_SIZE = 128 * 1024 * 1024;
 export const BATCH_INT_WS_SIZE = 8 * 1024 * 1024;
 export const BATCH_PINNED_INT_WS_SIZE = 8 * 1024 * 1024;
@@ -86,8 +84,6 @@ export class ExecutionState {
   intWsH!: Tensor;
   decodePlanInfo!: Tensor;
   prefillPlanInfo!: Tensor;
-  mlaPrefillPlanInfo!: Tensor;
-  mlaDecodePlanInfo!: Tensor;
   inputIdsBuf!: Tensor;
   inputIdsBufH!: Tensor;
   positionIds!: Tensor;
@@ -135,8 +131,6 @@ export class ExecutionState {
     this.intWsH = ws.ensureAllocPinned([BATCH_PINNED_INT_WS_SIZE], "U8", s("intWsH"));
     this.decodePlanInfo = ws.ensureAllocPinned([DECODE_PLAN_INFO_SIZE * 8], "U8", s("decodePlanInfo"));
     this.prefillPlanInfo = ws.ensureAllocPinned([PREFILL_PLAN_INFO_SIZE * 8], "U8", s("prefillPlanInfo"));
-    this.mlaPrefillPlanInfo = ws.ensureAllocPinned([MLA_PREFILL_PLAN_INFO_SIZE * 8], "U8", s("mlaPrefillPlanInfo"));
-    this.mlaDecodePlanInfo = ws.ensureAllocPinned([MLA_DECODE_PLAN_INFO_SIZE * 8], "U8", s("mlaDecodePlanInfo"));
 
     this.buffers = ws.getStateBuffers(slot, cache.getPagedKV().maxPages);
     [this.inputIdsBuf, this.inputIdsBufH] = this.buffers.alloc(totalTokens);
@@ -221,28 +215,6 @@ export class ExecutionState {
     );
   }
 
-  mlaKvCacheAppend(appendCkv: Tensor, appendKpe: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number): { ckv: Tensor; kpe?: Tensor } {
-    const pagedKV = this.cache.getPagedKV();
-    if (pagedKV.sparseMode) {
-      return {
-        ckv: this.concatAndCacheDsMla(appendCkv, appendKpe, cacheIdx, kvLoraRank, qkRopeDim),
-      };
-    } else {
-      const ckv = pagedKV.ckvData[cacheIdx];
-      const kpe = pagedKV.kpeData[cacheIdx];
-      const nnz = this.isDecode ? this.batchSize : this.totalTokens;
-      return this.ws.ops.mlaKvCacheAppend(
-        this, cacheIdx,
-        ckv, kpe,
-        this.indices, this.indptrD, this.lastPageLen,
-        appendCkv, appendKpe,
-        this.mlaBatchIndices, this.positionIds,
-        nnz, kvLoraRank, qkRopeDim,
-        kvLoraRank, qkRopeDim,
-      );
-    }
-  }
-
   concatAndCacheDsMla(appendCkv: Tensor, appendKpe: Tensor, cacheIdx: number, kvLoraRank: number, qkRopeDim: number): Tensor {
     const pagedKV = this.cache.getPagedKV();
     const ckv = pagedKV.ckvData[cacheIdx];
@@ -291,14 +263,6 @@ export class ExecutionState {
       0,
       cm?.mask, cm?.indptr, cm?.maskKvLen, undefined, undefined, undefined, undefined, effectiveWeights,
     );
-  }
-
-  denseMla(qNope: Tensor, qPe: Tensor, ckv: Tensor, kpe: Tensor, smScale: number): { o: Tensor, lse: Tensor } {
-    if (this.isDecode) {
-      return this.ws.mlaDecodePaged(this, qNope, qPe, ckv, kpe, smScale);
-    } else {
-      return this.ws.mlaPrefillPaged(this, qNope, qPe, ckv, kpe, smScale, this.customMask?.mode ?? MaskMode.Causal, this.customMask?.mask, this.customMask?.indptr, this.customMask?.maskKvLen);
-    }
   }
 
   sparseMla(qAbsorbed: Tensor, qPe: Tensor, ckv: Tensor, indices: Tensor, length: Tensor, topk: number, smScale: number, qAbsorbedScales?: Tensor): { o: Tensor, lse: Tensor } {
@@ -486,30 +450,6 @@ export class ExecutionWorkspace extends WorkspaceBase {
     return out;
   }
 
-  mlaPrefillPaged(state: ExecutionState, qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, smScale: number, maskMode: MaskMode = MaskMode.Causal, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { o: Tensor, lse: Tensor } {
-    const pagedKV = state.cache.getPagedKV();
-    return this.ops.mlaPrefillRun(
-      state, qNope, qPe, ckvData, kpeData,
-      state.indices,
-      pagedKV.floatWs, state.intWs,
-      state.mlaPrefillPlanInfo,
-      smScale, maskMode,
-      undefined, undefined,
-      customMask, maskIndptr, maskKvLen
-    );
-  }
-
-  mlaDecodePaged(state: ExecutionState, qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, smScale: number): { o: Tensor, lse: Tensor } {
-    const pagedKV = state.cache.getPagedKV();
-    return this.ops.mlaDecodeRun(
-      state, qNope, qPe, ckvData, kpeData,
-      state.indices, state.indptrD, state.lastPageLen,
-      pagedKV.floatWs, state.intWs,
-      state.mlaDecodePlanInfo,
-      smScale,
-    );
-  }
-
   updateIndptr(state: ExecutionState, pagedKV: PagedKVCache): void {
     const batchSize = pagedKV.sequences.length;
     state.indptrH.withPinnedBuffer(buf => {
@@ -602,21 +542,10 @@ export class ExecutionWorkspace extends WorkspaceBase {
         for (let i = 0; i <= batchSize; i++) buf.writeInt32LE(i, i * I32);
       });
       const seqKvLens = pagedKV.sequences.map(sequence => sequence.allocLen);
-      if (pagedKV.sparseMode) {
-        this.ops.sparseMlaDecodePlan(
-          state.lastPageLenH, batchSize, seqKvLens,
-          pagedKV.pageSize, pagedKV.contextParallel,
-        );
-      } else {
-        this.ops.mlaDecodePlan(
-          pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
-          state.intWs, state.intWsH, BATCH_INT_WS_SIZE,
-          state.mlaDecodePlanInfo,
-          state.indptrH, state.lastPageLenH,
-          batchSize, model.cfg.numAttentionHeads, pagedKV.pageSize, enableCudaGraph,
-          cfg.kvLoraRank, cfg.qkRopeHeadDim!, seqKvLens, pagedKV.contextParallel,
-        );
-      }
+      this.ops.sparseMlaDecodePlan(
+        state.lastPageLenH, batchSize, seqKvLens,
+        pagedKV.pageSize, pagedKV.contextParallel,
+      );
     } else {
       state.slotMappingH.withPinnedBuffer(buf => {
         for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {
@@ -719,26 +648,12 @@ export class ExecutionWorkspace extends WorkspaceBase {
     });
 
     if (cfg.kvLoraRank) {
-      if (!pagedKV.sparseMode) {
-        this.ops.mlaPrefillPlan(
-          pagedKV.floatWs, BATCH_FLOAT_WS_SIZE,
-          state.intWs, state.intWsH, BATCH_INT_WS_SIZE,
-          state.mlaPrefillPlanInfo,
-          state.qoIndptrH, state.indptrH,
-          state.kvLenH, state.lastPageLenH,
-          batchSize, nHeads, cfg.kvLoraRank!, !customMask || (customMask.mode ?? MaskMode.Causal) === MaskMode.Causal || customMask.mode === MaskMode.CausalCustom,
-          pagedKV.pageSize, pagedKV.sequences.map(s => s.allocLen),
-          pagedKV.contextParallel
-        );
-      }
-      else {
-        // Sparse prefill has no kernel plan, but CP consumers still need
-        // per-rank physical-page lengths rather than the global logical length.
-        this.ops.sparseMlaDecodePlan(
-          state.lastPageLenH, batchSize, pagedKV.sequences.map(s => s.allocLen),
-          pagedKV.pageSize, pagedKV.contextParallel,
-        );
-      }
+      // Sparse prefill has no kernel plan, but CP consumers still need
+      // per-rank physical-page lengths rather than the global logical length.
+      this.ops.sparseMlaDecodePlan(
+        state.lastPageLenH, batchSize, pagedKV.sequences.map(s => s.allocLen),
+        pagedKV.pageSize, pagedKV.contextParallel,
+      );
       state.mlaBatchIndicesH.withPinnedBuffer(buf => {
         let off = 0;
         for (let seqIdx = 0; seqIdx < batchSize; seqIdx++) {

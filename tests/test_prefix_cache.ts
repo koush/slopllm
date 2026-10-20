@@ -195,7 +195,6 @@ function makeCopyCache(overrides?: { bytesPerToken?: number }) {
     kScaleData: [tensor([16, PAGE_SIZE], "F32")],
     vData: [],
     ckvData: [tensor([16, PAGE_SIZE, bytesPerToken], "U8")],
-    kpeData: [],
     ops: { memcpyBatchAsync(copies: readonly MemcpyBatchEntry[]) { entries.push(...copies); } },
   });
   return { cache, entries };

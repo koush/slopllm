@@ -2213,55 +2213,14 @@ const srcOps = (copies[0].src as GlmTensor).ops;
     getNativeAddon().graphExecDestroy(this.ctx, graphExec);
   }
 
-  mlaPrefillPlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, qoIndptrH: Tensor, kvIndptrH: Tensor, kvLenH: Tensor, lastPageLenH: Tensor, batchSize: number, numHeads: number, headDimO: number, causal: boolean, pageSize: number, seqKvLens: number[], contextParallel?: boolean, cpWorldSize: number = 0, cpRank: number = 0): void {
-    getNativeAddon().mlaPrefillPlan(this.ctx, ptr(floatWs), floatWsSize, ptr(intWs), ptr(pinnedIntWs), intWsSize, ptr(planInfo), ptr(qoIndptrH), ptr(kvIndptrH), ptr(kvLenH), batchSize, numHeads, headDimO, causal, cpWorldSize, cpRank);
-  }
-
-  mlaPrefillRun(state: ExecutionState, qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, kvIndices: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, smScale: number, maskMode: MaskMode, cpWorldSize: number = 0, cpRank: number = 0, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor): { o: Tensor, lse: Tensor } {
-    const numHeads = qNope.shape[1];
-    const headDimCkv = ckvData.shape[2];
-    const headDimKpe = kpeData.shape[2];
-    const pageSize = ckvData.shape[1];
-    const ckvStridePage = pageSize * headDimCkv;
-    const ckvStrideN = headDimCkv;
-    const kpeStridePage = kpeData.shape[1] * headDimKpe;
-    const kpeStrideN = headDimKpe;
-    const qNopeStrideN = qNope.shape[1] * qNope.shape[2];
-    const qNopeStrideH = qNope.shape[2];
-    const qPeStrideN = qPe.shape[1] * qPe.shape[2];
-    const qPeStrideH = qPe.shape[2];
-    const totalTokens = state.totalTokens;
-    const oStrideN = headDimCkv;
-    const oStrideH = totalTokens * headDimCkv;
-    const o = qNope.workspace.alloc([1, numHeads, totalTokens, headDimCkv], qNope.type);
-    const lse = qNope.workspace.alloc([totalTokens, numHeads], "F32");
-    getNativeAddon().mlaPrefillRun(this.ctx, ptr(qNope), ptr(qPe), ptr(ckvData), ptr(kpeData), ptr(kvIndices), ptr(o), ptr(floatWs), ptr(intWs), ptr(planInfo), numHeads, pageSize, maskMode, smScale, qNopeStrideN, qNopeStrideH, qPeStrideN, qPeStrideH, ckvStridePage, ckvStrideN, kpeStridePage, kpeStrideN, oStrideN, oStrideH, headDimCkv, headDimKpe, ptr(lse), cpWorldSize, cpRank, customMask ? ptr(customMask) : 0, maskIndptr ? ptr(maskIndptr) : 0, maskKvLen ? ptr(maskKvLen) : 0);
-    return { o, lse };
-  }
-
-  mlaDecodePlan(floatWs: Tensor, floatWsSize: number, intWs: Tensor, pinnedIntWs: Tensor, intWsSize: number, planInfo: Tensor, indptrH: Tensor, lastPageLenH: Tensor, batchSize: number, numQoHeads: number, pageSize: number, enableCudaGraph: boolean, headDimCkv: number, headDimKpe: number, _seqKvLens: number[], contextParallel?: boolean, cpWorldSize?: number, cpRank?: number): void {
-    getNativeAddon().mlaDecodePlan(this.ctx, ptr(floatWs), floatWsSize, ptr(intWs), ptr(pinnedIntWs), intWsSize, ptr(planInfo), ptr(indptrH), batchSize, numQoHeads, pageSize, enableCudaGraph, headDimCkv, headDimKpe);
-  }
-
   sparseMlaDecodePlan(_lastPageLenH: Tensor, _batchSize: number, _seqKvLens: number[], _pageSize: number, _contextParallel: boolean): void {
   }
 
-  mlaDecodeRun(state: ExecutionState, qNope: Tensor, qPe: Tensor, ckvData: Tensor, kpeData: Tensor, indices: Tensor, indptrD: Tensor, lastPageLen: Tensor, floatWs: Tensor, intWs: Tensor, planInfo: Tensor, smScale: number): { o: Tensor, lse: Tensor } {
-    const numQoHeads = qNope.shape[1];
-    const headDimCkv = ckvData.shape[2];
-    const headDimKpe = kpeData.shape[2];
-    const pageSize = ckvData.shape[1];
-    const o = qNope.workspace.alloc([state.batchSize, numQoHeads, 1, headDimCkv], qNope.type);
-    const lse = qNope.workspace.alloc([state.batchSize, numQoHeads], "F32");
-    getNativeAddon().mlaDecodeRun(this.ctx, ptr(qNope), ptr(qPe), ptr(ckvData), ptr(kpeData), ptr(indices), ptr(indptrD), ptr(lastPageLen), ptr(o), ptr(floatWs), ptr(intWs), ptr(planInfo), state.batchSize, numQoHeads, pageSize, smScale, headDimCkv, headDimKpe, ptr(lse));
-    return { o, lse };
-  }
-
   mlaKvCacheAppend(_state: ExecutionState, _cacheIdx: number, ckvData: Tensor, kpeData: Tensor | null, indices: Tensor | undefined, indptr: Tensor, lastPageLen: Tensor, appendCkv: Tensor, appendKpe: Tensor | null, batchIndices: Tensor, positions: Tensor, nnz: number, headDimCkv: number, headDimKpe: number, appendCkvStrideN: number, appendKpeStrideN: number, pageSize: number = ckvData.shape[1], cpWorldSize: number = 0, cpRank: number = 0): { ckv: Tensor; kpe?: Tensor } {
+    if (!kpeData || appendKpe !== null || headDimKpe !== 0) {
+      throw new Error("mlaKvCacheAppend requires indexer K and scale buffers");
+    }
     if (indices === undefined) {
-      if (!kpeData || appendKpe !== null || headDimKpe !== 0) {
-        throw new Error("mlaKvCacheAppend: flat mode requires indexer K and scale buffers");
-      }
       this.indexerKvCacheAppendFlat(ckvData, kpeData, appendCkv, indptr, batchIndices, positions, nnz, headDimCkv, appendCkvStrideN);
     } else {
       getNativeAddon().mlaKvCacheAppend(this.ctx, ptr(ckvData), kpeData ? ptr(kpeData) : 0, ptr(indices), ptr(indptr), ptr(lastPageLen), ptr(appendCkv), appendKpe ? ptr(appendKpe) : 0, ptr(batchIndices), ptr(positions), nnz, pageSize, headDimCkv, headDimKpe, appendCkvStrideN, appendKpeStrideN, cpWorldSize, cpRank);
