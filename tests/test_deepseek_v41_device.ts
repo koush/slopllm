@@ -231,8 +231,8 @@ for (const rows of [1, 4, 64, 65, 128]) for (const ratio of [1, 2] as const) {
       for (const row of new Set([0, Math.min(2, rows - 1), Math.min(3, rows - 1), Math.min(7, rows - 1), rows - 1])) {
         const expectedIds = Array.from({ length: counts[row] }, (_, k) => k);
         if (counts[row] > 512) expectedIds.sort((a, b) => actual[row * capacity + b] - actual[row * capacity + a] || a - b);
-        assert.deepEqual(selectedIds.slice(row * 512, (row + 1) * 512),
-          Array.from({ length: 512 }, (_, i) => expectedIds[i] ?? -1));
+        assert.deepEqual(selectedIds.slice(row * 512, (row + 1) * 512).sort((a, b) => a - b),
+          Array.from({ length: 512 }, (_, i) => expectedIds[i] ?? -1).sort((a, b) => a - b));
         const kv = keyValues[batchIds[row]];
         const reference = dsv41IndexScores(qQuant.subarray(row * 4096, (row + 1) * 4096),
           Array.from({ length: counts[row] }, (_, k) => kv.subarray(k * 128, (k + 1) * 128)), w.subarray(row * 32, (row + 1) * 32));
@@ -316,5 +316,69 @@ it("V4.1 BF16 selection respects ties at token and candidate-block cutoffs", () 
   using selected = ops.dsv41Select(scores, position, 1, candidates);
   const expected = Array.from({ length: count }, (_, i) => i).filter(i => allowed.has(Math.floor(i / 8)))
     .sort((a, b) => values[b] - values[a] || a - b).slice(0, 512);
-  assert.deepEqual(selected.readInt32LEArray(), expected);
+  assert.deepEqual(selected.readInt32LEArray().sort((a, b) => a - b), expected.sort((a, b) => a - b));
 });
+
+for (const rows of [1, 65]) {
+  it(`V4.1 radix selection replays changing lengths and sparse logical masks at 64K, rows=${rows}`, () => {
+    using ops = new GlmOps(0);
+    using ws = new WorkspaceBase(ops);
+    using manager = new CaptureManager(ops);
+    const capacity = 65539, blocks = Math.ceil(capacity / 8);
+    using scores = ws.alloc([rows, capacity], "BF16");
+    using positions = ws.alloc([rows], "I32");
+    using mask = ws.alloc([rows, blocks], "I32");
+    const values = Float32Array.from({ length: rows * capacity }, (_, i) => (i % 129) - 64);
+    // Signed zeros tie by logical position; include abundant cutoff ties.
+    for (let i = 0; i < values.length; i += 129) {
+      values[i] = -0;
+    }
+    scores.h2d(bf16Round(values));
+    for (let pass = 0; pass < 6; ++pass) {
+      const counts = Array.from({ length: rows }, (_, r) => [0, 511, 513, 16385, 32769, capacity][(r + pass) % 6]);
+      positions.h2d(Buffer.from(Int32Array.from(counts, n => Math.max(0, 2 * n - 1)).buffer));
+      const masks = Int32Array.from({ length: rows * blocks }, (_, i) =>
+        Number(pass % 3 === 0 || (pass % 3 === 1 ? i % blocks === 0 : i % 3 === 0)));
+      mask.h2d(Buffer.from(masks.buffer));
+      using result = manager.run({ scores, positions, mask }, (_capture, input) =>
+        ops.dsv41Select(input.scores, input.positions, 2, input.mask), ["radix-selection", rows]) as Tensor;
+      const actual = result.readInt32LEArray();
+      for (const r of new Set([0, Math.min(1, rows - 1), Math.min(4, rows - 1), rows - 1])) {
+        const expected = Array.from({ length: counts[r] }, (_, i) => i)
+          .filter(i => masks[r * blocks + Math.floor(i / 8)])
+          .sort((a, b) => values[r * capacity + b] - values[r * capacity + a] || a - b).slice(0, 512);
+        const got = actual.slice(r * 512, (r + 1) * 512).filter(i => i >= 0);
+        assert.deepEqual(got.sort((a, b) => a - b), expected.sort((a, b) => a - b));
+        assert.equal(actual.slice(r * 512, (r + 1) * 512).filter(i => i === -1).length, 512 - expected.length);
+      }
+    }
+    assert([...manager.captured.values()].some(graph => graph.graphExec !== null));
+  });
+
+  it(`V4.1 block candidates replay short and 64K contexts with a forced latest block, rows=${rows}`, () => {
+    using ops = new GlmOps(0);
+    using ws = new WorkspaceBase(ops);
+    using manager = new CaptureManager(ops);
+    const capacity = 65539, blocks = Math.ceil(capacity / 8);
+    using scores = ws.alloc([rows, capacity], "BF16");
+    using positions = ws.alloc([rows], "I32");
+    const values = Float32Array.from({ length: capacity }, (_, i) => (i % 71) - 35);
+    scores.h2d(bf16Round(Float32Array.from({ length: rows * capacity }, (_, i) => values[i % capacity])));
+    for (let pass = 0; pass < 4; ++pass) {
+      const counts = Array.from({ length: rows }, (_, r) => [1, 16384, 16385, capacity][(r + pass) % 4]);
+      positions.h2d(Buffer.from(Int32Array.from(counts, n => n - 1).buffer));
+      using result = manager.run({ scores, positions }, (_capture, input) =>
+        ops.dsv41Candidates(input.scores, input.positions), ["radix-blocks", rows]) as Tensor;
+      const actual = result.readInt32LEArray();
+      for (const r of new Set([0, Math.min(1, rows - 1), Math.min(2, rows - 1), rows - 1])) {
+        const count = counts[r], latest = Math.ceil(count / 8) - 1;
+        const maxima = Array.from({ length: latest }, (_, b) => Math.max(...values.subarray(b * 8, b * 8 + 8)));
+        const selected = maxima.map((_, b) => b).sort((a, b) => maxima[b] - maxima[a] || a - b).slice(0, 2047);
+        const allowed = new Set([...selected, latest]);
+        assert.deepEqual(actual.slice(r * blocks, (r + 1) * blocks),
+          Array.from({ length: blocks }, (_, b) => Number(allowed.has(b))));
+      }
+    }
+    assert([...manager.captured.values()].some(graph => graph.graphExec !== null));
+  });
+}

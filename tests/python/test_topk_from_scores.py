@@ -50,6 +50,19 @@ def _check_exact_topk(sel, scores_row, N, topk):
         f"missed {len(set(above.tolist()) - set(sel.tolist()))} elements above threshold"
 
 
+@pytest.mark.parametrize("stride,splits", [(4096, 1), (65536, 16)])
+def test_topk_sparse_mask_does_not_select_invalid_cutoff_ties(glm, device, stride, splits):
+    scores = torch.full((2, stride), float('-inf'), dtype=torch.bfloat16, device=device)
+    valid = torch.arange(0, 73 * 17, 17, device=device)
+    scores[0, valid] = torch.arange(73, device=device).to(torch.bfloat16) - 40
+    scores[0, 1] = float('nan')
+    selected, values = _select_with_scores(glm, scores, [stride, stride], 512, splits)
+    assert sorted(selected[0][selected[0] >= 0].tolist()) == valid.tolist()
+    assert (selected[0] == -1).sum().item() == 512 - len(valid)
+    assert (selected[1] == -1).all()
+    assert torch.isneginf(values[selected == -1]).all()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("N", [4096, 65536, 200000])
 @pytest.mark.parametrize("batch", [1, 4])

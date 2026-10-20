@@ -145,7 +145,21 @@ Small workloads use one query per CTA; larger workloads reuse a 64-key tile
 across four queries, with independent compressed causal bounds for each query.
 Mixed-sequence query tiles reload keys per query. Dispatch uses
 query count and compressed key capacity; `SLOPLLM_DSV41_INDEXER_QUERY_TILE=1|4`
-overrides it for kernel comparisons. mHC's projection and squared norm use FP32
+overrides it for kernel comparisons.
+
+Index selection shares GLM's BF16 radix top-k kernels. At most 64 query rows use
+the general split-radix dispatcher; larger batches use the prefill histogram
+pipeline with deterministic gathering. Selection keeps the lowest logical
+positions at cutoff ties; output follows GLM's threshold/position order rather
+than descending score order. Invalid or masked scores leave `-1` output slots.
+Preparation applies each query's compressed causal length and logical
+eight-position candidate-block mask to a temporary score buffer. Layer 20
+computes each block maximum once, selects 2047 non-latest blocks, and includes
+the latest block unconditionally. Scratch is workspace-owned and graph-reusable;
+the preparation pass refreshes padding and masks on every replay. FP8 scoring
+still evaluates all causal keys before this selection-time masking.
+
+mHC's projection and squared norm use FP32
 split-K partials; inverse RMS is applied to the merged projection before coefficient
 activation. Below 128 tokens the projection uses FP32 multiply/accumulate.
 Larger batches use Tensor Cores with TF32-exact BF16 activations and FP32 weights

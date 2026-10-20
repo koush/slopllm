@@ -1176,11 +1176,16 @@ export class GlmOps implements DeviceOps {
       output.shape[1], ratio, positions.numElements, pages.data, batchIndices?.data ?? 0, pages.shape[1] ?? 0);
     return output;
   }
+  private dsv41SelectionScratchBytes(tokens: number, stride: number, topk: number): number {
+    // Dsv41SelectionScratch: GLM radix histogram/meta, lengths, indices and BF16 scores.
+    return 16 + tokens * (4 * (1088 + 4 + 1 + topk) + 2 * (topk + Math.ceil(stride / 8) * 8));
+  }
   dsv41Candidates(scores: Tensor, positions: Tensor): Tensor {
     this.checkDsv41Tensors(scores, positions);
     if (scores.type !== "BF16" || scores.shape.length !== 2 || positions.type !== "I32" || positions.numElements !== scores.shape[0]) throw new Error("Invalid candidate scores");
     const output = scores.workspace.alloc([scores.shape[0], Math.ceil(scores.shape[1] / 8)], "I32");
-    getNativeAddon().dsv41Candidates(this.ctx, output.data, scores.data, positions.data, scores.shape[1], scores.shape[0]);
+    using scratch = scores.workspace.allocRaw(this.dsv41SelectionScratchBytes(scores.shape[0], output.shape[1], 2047));
+    getNativeAddon().dsv41Candidates(this.ctx, output.data, scores.data, positions.data, scores.shape[1], scores.shape[0], scratch.data);
     return output;
   }
   dsv41Select(scores: Tensor, positions: Tensor, ratio: number, candidates?: Tensor): Tensor {
@@ -1188,7 +1193,8 @@ export class GlmOps implements DeviceOps {
     if (scores.type !== "BF16" || scores.shape.length !== 2 || positions.type !== "I32" || positions.numElements !== scores.shape[0]
       || ![1, 2].includes(ratio) || (candidates && (candidates.type !== "I32" || candidates.numElements !== scores.shape[0] * Math.ceil(scores.shape[1] / 8)))) throw new Error("Invalid index selection");
     const output = scores.workspace.alloc([scores.shape[0], 512], "I32");
-    getNativeAddon().dsv41Select(this.ctx, output.data, scores.data, candidates?.data ?? 0, positions.data, scores.shape[1], ratio, scores.shape[0]);
+    using scratch = scores.workspace.allocRaw(this.dsv41SelectionScratchBytes(scores.shape[0], scores.shape[1], 512));
+    getNativeAddon().dsv41Select(this.ctx, output.data, scores.data, candidates?.data ?? 0, positions.data, scores.shape[1], ratio, scores.shape[0], scratch.data);
     return output;
   }
   private validateDsv4Pages(positions: Tensor, pages: Tensor, ratio: number, batchIndices?: Tensor): void {

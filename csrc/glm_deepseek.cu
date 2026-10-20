@@ -228,50 +228,79 @@ __global__ void paged_slots_device(int32_t* out, const int32_t* position, const 
     out[row * width + col] = ordinal < 0 ? -1 : pages[ordinal * ratio / 64] * 64 + ordinal % (64 / ratio);
 }
 
-// Fixed launch geometry; selection sizes depend solely on the device position.
-// Rank selection is deliberately simple here, preserving deterministic oracle
-// ties. It can be replaced with a tiled top-k without changing graph state.
-__global__ void candidates_device(int32_t* candidates, const __nv_bfloat16* scores, const int32_t* position, int capacity) {
-    candidates += size_t(blockIdx.y) * ((capacity + 7) / 8);
-    scores += size_t(blockIdx.y) * capacity;
-    position += blockIdx.y;
-    const int block = blockIdx.x * blockDim.x + threadIdx.x;
-    const int max_blocks = (capacity + 7) / 8;
-    if (block >= max_blocks) return;
-    const int count = min(*position + 1, capacity), blocks = (count + 7) / 8;
-    if (block >= blocks) { candidates[block] = 0; return; }
-    if (blocks <= 2048 || block == blocks - 1) { candidates[block] = 1; return; }
-    float value = -INFINITY;
-    for (int d = block * 8; d < min(count, block * 8 + 8); d++) value = fmaxf(value, scores[d]);
-    int rank = 1; // latest block is forced into the set
-    for (int other = 0; other < blocks - 1 && rank < 2048; other++) {
-        float v = -INFINITY;
-        for (int d = other * 8; d < min(count, other * 8 + 8); d++) v = fmaxf(v, scores[d]);
-        rank += v > value || (v == value && other < block);
+// Masks address logical compressed positions, independently of future CP storage.
+// Prepare every slot on replay, including padding, without modifying shared scores.
+template <bool BLOCK_MAX>
+__global__ void dsv41_selection_prepare(__nv_bfloat16* prepared, int32_t* lengths,
+    const __nv_bfloat16* scores, const int32_t* candidates, const int32_t* positions,
+    int capacity, int ratio) {
+    const int row = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int count = min((positions[row] + 1) / ratio, capacity);
+    const int blocks = (capacity + 7) / 8;
+    const int stride = ((BLOCK_MAX ? blocks : capacity) + 7) / 8 * 8;
+    if (i == 0) {
+        // Reserve the latest block; radix selection chooses up to 2047 others.
+        lengths[row] = BLOCK_MAX ? max(0, (count + 7) / 8 - 1) : count;
     }
-    candidates[block] = rank < 2048;
+    if (i >= stride) {
+        return;
+    }
+    float value = -INFINITY;
+    if constexpr (BLOCK_MAX) {
+        if (i < (count + 7) / 8 - 1) {
+            for (int j = i * 8; j < min(count, i * 8 + 8); ++j) {
+                value = fmaxf(value, float(scores[size_t(row) * capacity + j]));
+            }
+        }
+    } else if (i < count && (!candidates || candidates[size_t(row) * blocks + i / 8])) {
+        value = float(scores[size_t(row) * capacity + i]);
+    }
+    // Equal signed zeros must have the same radix key.
+    prepared[size_t(row) * stride + i] = __float2bfloat16(value == 0.f ? 0.f : value);
 }
 
-__global__ void selection_device(int32_t* out, const __nv_bfloat16* scores, const int32_t* candidates,
-                                   const int32_t* position, int ratio, int capacity) {
-    out += blockIdx.y * 512;
-    scores += size_t(blockIdx.y) * capacity;
-    if (candidates) candidates += size_t(blockIdx.y) * ((capacity + 7) / 8);
-    position += blockIdx.y;
-    const int token = blockIdx.x * blockDim.x + threadIdx.x;
-    const int count = min((*position + 1) / ratio, capacity);
-    if (token >= count || token >= capacity) return;
-    if (count <= 512) { out[token] = token; return; }
-    if (candidates && !candidates[token / 8]) return;
-    const float value = scores[token];
-    int rank = 0;
-    for (int other = 0; other < count && rank < 512; other++) {
-        if (candidates && !candidates[other / 8]) continue;
-        const float v = scores[other];
-        rank += v > value || (v == value && other < token);
+__global__ void dsv41_candidate_mask(int32_t* mask, const int32_t* selected,
+    const int32_t* positions, int capacity) {
+    const int row = blockIdx.x;
+    const int blocks = (capacity + 7) / 8;
+    for (int i = threadIdx.x; i < 2047; i += blockDim.x) {
+        const int index = selected[size_t(row) * 2047 + i];
+        if (index >= 0) {
+            mask[size_t(row) * blocks + index] = 1;
+        }
     }
-    if (rank < 512) out[rank] = token;
+    const int count = min(positions[row] + 1, capacity);
+    if (threadIdx.x == 0 && count > 0) {
+        mask[size_t(row) * blocks + (count - 1) / 8] = 1;
+    }
 }
+
+// Caller-owned scratch: hist[tokens,1088], meta[tokens,4], lengths[tokens],
+// indices[tokens,k], selected_scores[tokens,k], then 16-byte-aligned prepared
+// scores[tokens,stride]. Prefill vector loads require aligned rows and base.
+// Keep the byte calculation paired with GlmOps.dsv41SelectionScratchBytes.
+struct Dsv41SelectionScratch {
+    int32_t *hist, *meta, *lengths, *indices;
+    __nv_bfloat16 *selected_scores, *prepared;
+    Dsv41SelectionScratch(void* buffer, int tokens, int k) {
+        hist = static_cast<int32_t*>(buffer);
+        meta = hist + size_t(tokens) * 1088;
+        lengths = meta + size_t(tokens) * 4;
+        indices = lengths + tokens;
+        selected_scores = reinterpret_cast<__nv_bfloat16*>(indices + size_t(tokens) * k);
+        const uintptr_t prepared_base = reinterpret_cast<uintptr_t>(selected_scores + size_t(tokens) * k);
+        prepared = reinterpret_cast<__nv_bfloat16*>((prepared_base + 15) & ~uintptr_t(15));
+    }
+    void select(GlmCtx* ctx, int32_t* out, int tokens, int stride, int k) {
+        if (tokens <= 64) {
+            glm_topk_from_scores(ctx, out, selected_scores, prepared, lengths,
+                hist, meta, tokens, stride, k, 0, 1, 0);
+        } else {
+            glm_topk_from_scores_prefill(ctx, out, selected_scores, prepared, lengths,
+                hist, hist + size_t(tokens) * 1024, meta, tokens, stride, k, 1, 0, true);
+        }
+    }
+};
 
 __global__ void to_bf16_device(__nv_bfloat16* out, const float* input, int count) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -421,15 +450,23 @@ void glm_dsv41_index_quantize(GlmCtx* ctx, uint8_t* out, const void* input, cons
     cudaSetDevice(ctx->device_id);
     index_quant_device<<<dim3(heads,tokens),128,0,GLM_STREAM(ctx)>>>(out,(const __nv_bfloat16*)input,positions,heads,ratio,slots);
 }
-void glm_dsv41_candidates(GlmCtx* ctx, int32_t* out, const void* scores, const int32_t* positions, int capacity, int tokens) {
+void glm_dsv41_candidates(GlmCtx* ctx, int32_t* out, const void* scores, const int32_t* positions, int capacity, int tokens, void* scratch) {
     cudaSetDevice(ctx->device_id);
-    candidates_device<<<dim3(((capacity+7)/8+127)/128,tokens),128,0,GLM_STREAM(ctx)>>>(out,(const __nv_bfloat16*)scores,positions,capacity);
+    const int blocks = (capacity + 7) / 8;
+    Dsv41SelectionScratch s(scratch, tokens, 2047);
+    dsv41_selection_prepare<true><<<dim3((blocks + 255) / 256, tokens),256,0,GLM_STREAM(ctx)>>>(
+        s.prepared, s.lengths, (const __nv_bfloat16*)scores, nullptr, positions, capacity, 1);
+    s.select(ctx, s.indices, tokens, (blocks + 7) / 8 * 8, 2047);
+    cudaMemsetAsync(out, 0, size_t(tokens) * blocks * sizeof(int32_t), GLM_STREAM(ctx));
+    dsv41_candidate_mask<<<tokens,256,0,GLM_STREAM(ctx)>>>(out, s.indices, positions, capacity);
 }
 void glm_dsv41_select(GlmCtx* ctx, int32_t* out, const void* scores, const int32_t* candidates,
-    const int32_t* positions, int capacity, int ratio, int tokens) {
+    const int32_t* positions, int capacity, int ratio, int tokens, void* scratch) {
     cudaSetDevice(ctx->device_id);
-    cudaMemsetAsync(out,255,size_t(tokens)*512*sizeof(int32_t),GLM_STREAM(ctx));
-    selection_device<<<dim3((capacity+127)/128,tokens),128,0,GLM_STREAM(ctx)>>>(out,(const __nv_bfloat16*)scores,candidates,positions,ratio,capacity);
+    Dsv41SelectionScratch s(scratch, tokens, 512);
+    dsv41_selection_prepare<false><<<dim3((capacity + 255) / 256, tokens),256,0,GLM_STREAM(ctx)>>>(
+        s.prepared, s.lengths, (const __nv_bfloat16*)scores, candidates, positions, capacity, ratio);
+    s.select(ctx, out, tokens, (capacity + 7) / 8 * 8, 512);
 }
 void glm_dsv41_to_bf16(GlmCtx* ctx, void* out, const float* input, int count) {
     cudaSetDevice(ctx->device_id);

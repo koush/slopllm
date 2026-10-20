@@ -765,7 +765,7 @@ __global__ void idx_gather_count_kernel(
     for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
         const int key = bf16_key(&s[i]);
         nAbove += (key > tau);
-        nTie   += (key == tau);
+        nTie   += (key > 127 && key == tau);
     }
 
     __shared__ int sAbove, sTie;
@@ -830,7 +830,7 @@ __global__ void idx_gather_write_kernel(
         const bool inRange = i < hi;
         const int key = inRange ? bf16_key(&s[i]) : -1;   // -1 matches no tau
         const bool isAbove = inRange && key > tau;
-        const bool isTie = inRange && key == tau;
+        const bool isTie = inRange && key > 127 && key == tau;
         int aSlot, tRank, aTotal, tTotal;
 
         idx_ordered_slot_pair(isAbove, aboveOff, isTie, tieOff,
@@ -2562,7 +2562,7 @@ __global__ void idx_prefill_coarse_threshold_kernel(
         const __nv_bfloat16* s = scores + (size_t)row * maxKv;
         const int len = rowLen ? rowLen[row] : maxKv;
         for (int i = threadIdx.x; i < topk; i += blockDim.x) {
-            bool valid = (i < len && *reinterpret_cast<const unsigned short*>(&s[i]) != 0xFF80);
+            bool valid = (i < len && bf16_key(&s[i]) > 127);
             out_idx[(size_t)row * topk + i] = valid ? cp_remap(i, cpWorldSize, cpRank) : -1;
             out_scores[(size_t)row * topk + i] = valid ? s[i] : neg_inf;
         }
@@ -2735,7 +2735,7 @@ __global__ void idx_prefill_gather_buf_kernel(
         const bool inRange = i < len;
         const int key = inRange ? bf16_key(&s[i]) : -1;   // -1 matches no tau
         const bool isAbove = inRange && key > tau;
-        const bool isTie = inRange && key == tau;
+        const bool isTie = inRange && key > 127 && key == tau;
         int aSlot, tRank, aTotal, tTotal;
 
         idx_ordered_slot_pair(isAbove, aboveOff, isTie, tieOff,
@@ -2804,7 +2804,7 @@ __global__ void idx_prefill_gather_atomic_buf_kernel(
             }
         }
 
-        const unsigned tieVote = __ballot_sync(0xffffffffu, inRange && key == tau);
+        const unsigned tieVote = __ballot_sync(0xffffffffu, inRange && key > 127 && key == tau);
         const int tieCount = __popc(tieVote);
         int tieBase = 0;
         if (lane == 0 && tieCount)
@@ -2993,7 +2993,17 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
     // rows. Identity rows skip every fine-histogram reader. All producers follow
     // scoring on this stream, so the borrowed storage is no longer in use.
 
-    // Passes 2-6: histogram + gather from buffer.
+    glm_topk_from_scores_prefill(ctx, out_idx, out_scores, scores, rowLen,
+        coarseHist, fineHist, meta, totalQ, maxKv, topk, effectiveCpWorldSize, effectiveCpRank, false);
+}
+
+// Shared score-buffer selection; deterministic mode fixes cutoff ties by position.
+void glm_topk_from_scores_prefill(GlmCtx* ctx, int32_t* out_idx, void* out_scores,
+    const void* scores, const int32_t* rowLen, int32_t* coarseHist, int32_t* fineHist,
+    int32_t* meta, int totalQ, int maxKv, int topk, int effectiveCpWorldSize,
+    int effectiveCpRank, bool deterministic) {
+    cudaSetDevice(ctx->device_id);
+    const cudaStream_t stream = GLM_STREAM(ctx);
     {
         // Pass 2: coarse histogram — one block per row
         idx_prefill_coarse_hist_buf_kernel<<<totalQ, 256, 0, stream>>>(
@@ -3001,7 +3011,7 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
 
         // Pass 3: coarse threshold (1 block per query)
         idx_prefill_coarse_threshold_kernel<<<totalQ, 256, 0, stream>>>(
-            coarseHist, meta, out_idx, out_scores, topk, (const __nv_bfloat16*)scores, rowLen, maxKv, effectiveCpWorldSize, effectiveCpRank);
+            coarseHist, meta, out_idx, (__nv_bfloat16*)out_scores, topk, (const __nv_bfloat16*)scores, rowLen, maxKv, effectiveCpWorldSize, effectiveCpRank);
 
         // Pass 4: fine histogram — one block per row
         idx_prefill_fine_hist_buf_kernel<<<totalQ, 256, 0, stream>>>(
@@ -3015,14 +3025,14 @@ void glm_indexer_score_topk_prefill(GlmCtx* ctx, int32_t* out_idx,
         // remains available for diagnostics that require repeatable tie choice.
         const char* deterministicGather = std::getenv("SLOPLLM_INDEXER_PREFILL_DETERMINISTIC");
         // A single row scan has less scheduling overhead at short contexts.
-        if (maxKv < 32768 || (deterministicGather && std::strcmp(deterministicGather, "1") == 0)) {
+        if (deterministic || maxKv < 32768 || (deterministicGather && std::strcmp(deterministicGather, "1") == 0)) {
             idx_prefill_gather_buf_kernel<<<totalQ, 256, 0, stream>>>(
-                out_idx, out_scores, meta, (const __nv_bfloat16*)scores, rowLen,
+                out_idx, (__nv_bfloat16*)out_scores, meta, (const __nv_bfloat16*)scores, rowLen,
                 maxKv, topk, effectiveCpWorldSize, effectiveCpRank);
         } else {
             const int gatherSplits = min(32, max(1, (maxKv + 4095) / 4096));
             idx_prefill_gather_atomic_buf_kernel<<<dim3(gatherSplits, totalQ), 256, 0, stream>>>(
-                out_idx, out_scores, meta, (const __nv_bfloat16*)scores, rowLen,
+                out_idx, (__nv_bfloat16*)out_scores, meta, (const __nv_bfloat16*)scores, rowLen,
                 maxKv, topk, effectiveCpWorldSize, effectiveCpRank);
         }
     }

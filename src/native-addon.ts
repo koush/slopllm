@@ -73,8 +73,8 @@ export interface NativeAddon {
   dsv41Hash(ctx: number, out: number, lookback: number, tokens: number, map: number, primes: number, offsets: number, count: number, qoIndptr: number, batchSize: number): void;
   dsv41IndexQuantize(ctx: number, out: number, input: number, positions: number, heads: number, ratio: number, tokens: number, slots: number): void;
   dsv41IndexScores(ctx: number, out: number, query: number, keys: number, weights: number, positions: number, capacity: number, ratio: number, tokens: number, pages: number, batchIndices: number, pageStride: number): void;
-  dsv41Candidates(ctx: number, out: number, scores: number, positions: number, capacity: number, tokens: number): void;
-  dsv41Select(ctx: number, out: number, scores: number, candidates: number, positions: number, capacity: number, ratio: number, tokens: number): void;
+  dsv41Candidates(ctx: number, out: number, scores: number, positions: number, capacity: number, tokens: number, scratch: number): void;
+  dsv41Select(ctx: number, out: number, scores: number, candidates: number, positions: number, capacity: number, ratio: number, tokens: number, scratch: number): void;
   dsv41ToBf16(ctx: number, out: number, input: number, count: number): void;
   dsv4PagedSlots(ctx: number, out: number, positions: number, pages: number, selected: number, width: number, ratio: number, tokens: number, mode: number, batchIndices: number, pageStride: number): void;
   mxfp4MulMatId(ctx: number, out: number, input: number, pointers: number, ids: number, topK: number, count: number, n: number, k: number): void;
