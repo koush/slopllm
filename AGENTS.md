@@ -357,7 +357,7 @@ NCCL erroneously (the 8 GPUs are connected via 2 switches) sees device interconn
 
 ## Vendor
 
-`vendor/` contains external and forked reference implementations, including FlashInfer, llama.cpp, SGLang, vLLM variants, Transformers variants, and b12x. Use them for comparison when implementing CUDA kernels or inference algorithms, but treat `src/` and `csrc/` as authoritative for this project. The FlashInfer fork contains the project's context-parallel changes.
+`vendor/` contains external and forked reference implementations, including FlashInfer, llama.cpp, SGLang, vLLM variants, Transformers variants, and b12x. Use them for comparison when implementing CUDA kernels or inference algorithms, but treat `src/` and `csrc/` as authoritative for this project. The FlashInfer fork retains split/prequantized sparse MLA queries, compact heads, H8 specializations and bounded PDL consumption; see `vendor/flashinfer/FORK.md`. Sparse CP/cache/indexer operations are project-owned. The native adapter uses FlashInfer's `AttentionParams`/`ExecutionPlan` dispatch interfaces.
 
 # Workflow
 

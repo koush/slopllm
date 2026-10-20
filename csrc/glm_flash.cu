@@ -59,7 +59,7 @@ cudaError_t dispatch_batch_prefill_paged_run_inner(
     flashinfer::BatchPrefillPagedParams<DType, DType, DTypeO, IdType>& params,
     DTypeO* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream) {
   return flashinfer::BatchPrefillWithPagedKVCacheDispatched<
-      CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENC, false, MASK_MODE,
+      true, CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENC, false, MASK_MODE, false,
       AttentionVariant,
       flashinfer::BatchPrefillPagedParams<DType, DType, DTypeO, IdType>>(
       params, tmp_v, tmp_s, enable_pdl, stream);
@@ -70,7 +70,7 @@ cudaError_t dispatch_batch_prefill_ragged_run_inner(
     flashinfer::BatchPrefillRaggedParams<DType, DType, DTypeO, IdType>& params,
     DTypeO* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream) {
   return flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
-      CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENC, false, MASK_MODE,
+      CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENC, false, MASK_MODE, false,
       AttentionVariant,
       flashinfer::BatchPrefillRaggedParams<DType, DType, DTypeO, IdType>>(
       params, tmp_v, tmp_s, enable_pdl, stream);
@@ -218,6 +218,7 @@ void glm_flash_prefill(
           flashinfer::PosEncodingMode::kNone,
           false,
           flashinfer::MaskMode::kCausal,
+          false,
           AttentionVariant, Params>(
           params, static_cast<DTypeO*>(tmp), GLM_STREAM(ctx));
     } else {
@@ -226,6 +227,7 @@ void glm_flash_prefill(
           flashinfer::PosEncodingMode::kNone,
           false,
           flashinfer::MaskMode::kNone,
+          false,
           AttentionVariant, Params>(
           params, static_cast<DTypeO*>(tmp), GLM_STREAM(ctx));
     }

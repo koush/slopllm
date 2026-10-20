@@ -6,13 +6,15 @@ LIB_NAME = libglm_ops.so
 
 BUILD_DIR := build/Release
 
-SRCS_CU := csrc/glm_ops.cu csrc/glm_flash.cu csrc/glm_gemv.cu csrc/glm_gdn.cu csrc/glm_sampling.cu csrc/glm_p2p.cu csrc/glm_context_parallel.cu csrc/glm_mma_moe.cu csrc/glm_mma_moe_coop.cu csrc/glm_sparse_mla.cu csrc/glm_indexer.cu csrc/glm_gather_topk_ckv.cu vendor/flashinfer/csrc/sparse_mla_sm120_prefill.cu vendor/flashinfer/csrc/sparse_mla_sm120_decode_dsv3_2.cu vendor/flashinfer/csrc/sparse_mla_sm120_decode_dsv4.cu
+SRCS_CU := csrc/glm_ops.cu csrc/glm_flash.cu csrc/glm_gemv.cu csrc/glm_gdn.cu csrc/glm_sampling.cu csrc/glm_p2p.cu csrc/glm_context_parallel.cu csrc/glm_mma_moe.cu csrc/glm_mma_moe_coop.cu csrc/glm_sparse_mla.cu csrc/glm_indexer.cu csrc/glm_gather_topk_ckv.cu
+FLASHINFER_SRCS := prefill_dispatch dsv32_decode_dispatch decode_dispatch attention_resolve
 SRCS_CU += csrc/glm_quantize.cu
 SRCS_CU += csrc/glm_flash_hybrid.cu
 SRCS_CU += csrc/glm_deepseek.cu
 SRCS_CU += csrc/glm_fp8.cu
 SRCS_CPP := csrc/glm_nccl.cpp csrc/glm_device.cpp
-OBJS := $(patsubst csrc/%.cu,$(BUILD_DIR)/%.o,$(patsubst vendor/flashinfer/csrc/%.cu,$(BUILD_DIR)/flashinfer_%.o,$(SRCS_CU))) $(patsubst csrc/%.cpp,$(BUILD_DIR)/%.o,$(SRCS_CPP))
+OBJS := $(patsubst csrc/%.cu,$(BUILD_DIR)/%.o,$(SRCS_CU)) $(patsubst csrc/%.cpp,$(BUILD_DIR)/%.o,$(SRCS_CPP))
+OBJS += $(addprefix $(BUILD_DIR)/flashinfer_,$(addsuffix .o,$(FLASHINFER_SRCS)))
 DEPS := $(OBJS:.o=.d)
 
 .PHONY: all clean test
@@ -30,8 +32,8 @@ $(BUILD_DIR)/%.o: csrc/%.cu | $(BUILD_DIR)
 		$(FLASHINFER_INC) \
 		-I$(CUDA_PATH)/include
 
-$(BUILD_DIR)/flashinfer_%.o: vendor/flashinfer/csrc/%.cu | $(BUILD_DIR)
-	$(NVCC) $(NVCC_FLAGS) -MD -MF $(@:.o=.d) -c -o $@ $< \
+$(BUILD_DIR)/flashinfer_%.o: vendor/flashinfer/csrc/sparse_mla_sm120/%.cu | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -DFLASHINFER_SPARSE_MLA_STANDALONE -MD -MF $(@:.o=.d) -c -o $@ $< \
 		$(FLASHINFER_INC) \
 		-I$(CUDA_PATH)/include
 
