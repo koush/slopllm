@@ -162,9 +162,12 @@ it("V4.1 batched paged indexer masks future keys independently for each query", 
   using ws = new WorkspaceBase(ops);
   const positions = [0, 3, 7], count = positions.length, capacity = 8;
   using p = ws.alloc([count], "I32"); p.h2d(Buffer.from(Int32Array.from(positions).buffer));
-  using q = ws.alloc([count, 4096], "BF16"), quantized = ws.alloc([count, 32 * 132], "U8");
+  using q = ws.alloc([count, 4096], "BF16");
   const qValues = bf16BytesToF32(bf16Round(Float32Array.from({ length: count * 4096 }, (_, i) => Math.sin(i * 0.29))));
-  q.h2d(bf16Round(qValues)); ops.dsv41IndexQuantize(quantized, q, p);
+  q.h2d(bf16Round(qValues));
+  using quantized = ops.dsv41IndexQuantize(q, p);
+  assert.deepEqual(quantized.shape, [count, 32 * 132]);
+  assert.equal(quantized.workspace, q.workspace);
   const expectedQ = dsv41IndexQuantize(qValues), qBytes = Buffer.alloc(quantized.bytes);
   quantized.d2h(qBytes); assert.deepEqual(qBytes, packDsv41Index(qValues));
   using keys = ws.alloc([1, 64, 132], "U8"), weights = ws.alloc([count, 32], "BF16");
@@ -217,8 +220,7 @@ for (const rows of [1, 4, 64, 65, 128]) for (const ratio of [1, 2] as const) {
       const q = bf16BytesToF32(bf16Round(Float32Array.from({ length: rows * 4096 }, (_, i) => Math.sin(i * 0.29 + pass) * 2 ** (Math.floor(i / 128) % 5 - 2))));
       query.h2d(bf16Round(q));
       using result = manager.run({ query, keys, weights, positions, pages, batches }, (_capturing, input) => {
-        using quantized = ws.alloc([rows, 32 * 132], "U8");
-        ops.dsv41IndexQuantize(quantized, input.query, input.positions);
+        using quantized = ops.dsv41IndexQuantize(input.query, input.positions);
         return ops.dsv4IndexScores(quantized, input.keys, input.weights, input.positions, input.pages, ratio, capacity, input.batches);
       }, ["dsv41.scores", rows, ratio]) as Tensor;
       const data = Buffer.alloc(result.bytes); result.d2h(data);
@@ -266,8 +268,7 @@ it("V4.1 scoring handles an 8192-query prefill and refreshed causal bounds under
     const p = Int32Array.from({ length: rows }, (_, i) => (i + pass * 31) % capacity);
     positions.h2d(Buffer.from(p.buffer));
     using output = manager.run({ input, positions, keys, weights, pages }, (_capture, retained) => {
-      using q = ws.alloc([rows, 32 * 132], "U8");
-      ops.dsv41IndexQuantize(q, retained.input, retained.positions);
+      using q = ops.dsv41IndexQuantize(retained.input, retained.positions);
       return ops.dsv4IndexScores(q, retained.keys, retained.weights, retained.positions, retained.pages, 1, capacity);
     }, ["large-indexer"]) as Tensor;
     const data = Buffer.alloc(output.bytes); output.d2h(data);

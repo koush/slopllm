@@ -1155,12 +1155,15 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().dsv41Hash(this.ctx, output.data, lookback.data, tokens.data, map.data, primes.data, offsets.data, tokens.numElements, qoIndptr?.data ?? 0, batchSize);
     return output;
   }
-  dsv41IndexQuantize(output: Tensor, input: Tensor, positions: Tensor): void {
-    this.checkDsv41Tensors(output, input, positions);
-    if (input.type !== "BF16" || output.type !== "U8" || positions.type !== "I32" || !positions.numElements
-      || input.numElements % (positions.numElements * 128) || output.numElements !== input.numElements / 128 * 132) throw new Error("Invalid V4.1 index quantization");
+  dsv41IndexQuantize(input: Tensor, positions: Tensor): Tensor {
+    this.checkDsv41Tensors(input, positions);
+    if (input.type !== "BF16" || positions.type !== "I32" || !positions.numElements
+      || input.numElements % (positions.numElements * 128)) throw new Error("Invalid V4.1 index quantization");
+    const heads = input.numElements / positions.numElements / 128;
+    const output = input.workspace.alloc([positions.numElements, heads * 132], "U8");
     getNativeAddon().dsv41IndexQuantize(this.ctx, output.data, input.data, positions.data,
-      input.numElements / positions.numElements / 128, 0, positions.numElements, 0);
+      heads, 0, positions.numElements, 0);
+    return output;
   }
   dsv4IndexScores(query: Tensor, keys: Tensor, weights: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, capacity: number, batchIndices?: Tensor): Tensor {
     this.validateDsv4Pages(positions, pages, ratio, batchIndices);

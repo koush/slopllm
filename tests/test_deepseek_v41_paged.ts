@@ -29,7 +29,7 @@ for (const world of [1, 2]) it(`DSV4 batches unequal sequences without cross-seq
     using second = t.narrow(lengths[0], lengths[1]); second.fill(2, second.numElements);
   }
   using rawQuery = ws.alloc([tokens, 32 * 128], "BF16"); rawQuery.fill(1, rawQuery.numElements);
-  using query = ws.alloc([tokens, 32 * 132], "U8"); ops.dsv41IndexQuantize(query, rawQuery, positions);
+  using query = ops.dsv41IndexQuantize(rawQuery, positions);
   using weights = ws.alloc([tokens, 32], "BF16"); weights.fill(1, weights.numElements);
   for (const ratio of [1, 2] as const) {
     using cache = ws.alloc([6, 64, 584], "U8"); cache.fill(0, cache.numElements);
@@ -124,7 +124,7 @@ for (const world of [1, 2]) it(`DSV4 paged writes, slots and scores agree across
   using input = ws.alloc([tokens, 512], "BF16"); input.fill(1, input.numElements);
   using keys = ws.alloc([tokens, 128], "BF16"); keys.fill(1, keys.numElements);
   using rawQuery = ws.alloc([tokens, 32 * 128], "BF16"); rawQuery.fill(1, rawQuery.numElements);
-  using query = ws.alloc([tokens, 32 * 132], "U8"); ops.dsv41IndexQuantize(query, rawQuery, positions);
+  using query = ops.dsv41IndexQuantize(rawQuery, positions);
   using weights = ws.alloc([tokens, 32], "BF16"); weights.fill(1, weights.numElements);
   const slot = (ordinal: number, ratio: number) => pageIds[Math.floor(ordinal * ratio / 64)] * 64 + ordinal % (64 / ratio);
   for (const ratio of [1, 2] as const) {

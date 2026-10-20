@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
 import { CaptureManager } from "../src/capture-manager";
-import { DeepseekV41Model } from "../src/deepseek_v41_model";
+import { DeepseekV41Model, LayerHolders } from "../src/deepseek_v41_model";
 import { DeepseekV41Cache } from "../src/deepseek_v41_cache";
 import { ExecutionWorkspace } from "../src/execution-workspace";
 import { freeModelRuntime, loadModelRuntime, parseModelArgs } from "../src/model_cli";
@@ -39,16 +39,22 @@ it("DSpark accepts first-half projection rows without mutating the preceding car
   using model = new DeepseekV41Model(ops, { eosTokenId: 1 } as DeepseekV41Config);
   using cache = new DeepseekV41Cache(model, 2, 2, 128);
   using ws = new ExecutionWorkspace(ops, 2, 16);
-  const seed = { ws, slot: 0, batchSize: 2, totalTokens: 2, extras: new Map() } as ExecutionState;
-  const first = cache.planCompressor(seed);
-  for (const output of first.outputs.values()) { output.pending.fill(99, output.pending.numElements); output.pendingPosition.fill(2, 2); }
+  const seed = { cache, ws, slot: 0, batchSize: 2, totalTokens: 2, extras: new Map() } as unknown as ExecutionState;
+  using first = new LayerHolders(seed);
   using retained = cache.compressorCarry.get(2)!.value.viewClone();
-  const state = { ws, slot: 1, batchSize: 2, totalTokens: 10, seqLens: [5, 5], seqKvLens: [8, 9],
+  const state = { cache, ws, slot: 1, batchSize: 2, totalTokens: 10, seqLens: [5, 5], seqKvLens: [8, 9],
     extras: new Map([["dsv41.retainCompressorRows", true]]) } as unknown as ExecutionState;
-  const plan = cache.planCompressor(state);
+  using holders = new LayerHolders(state);
+  // Both steps are planned before the first producer writes its carry.
+  for (const output of first.compressorOutputs.values()) { output.pending.fill(99, output.pending.numElements); output.pendingPosition.fill(2, 2); }
+  first[Symbol.dispose]();
   const values = Float32Array.from({ length: 10 * 1024 }, (_, i) => Math.floor(i / 1024));
-  for (const rows of plan.rows.values()) rows.h2d(Buffer.from(values.buffer));
-  cache.commitCompressor(state, [0, 2]);
+  for (const rows of holders.compressorRows.values()) {
+    using raw = ws.alloc([10, 1024], "F32");
+    raw.h2d(Buffer.from(values.buffer));
+    rows.replace(raw.viewClone());
+  }
+  cache.commitCompressor(state, holders, [0, 2]);
   for (const holder of cache.compressorCarry.values()) {
     assert.deepEqual(holder.value.pendingPosition.readInt32LEArray(), [2, 6]);
     const bytes = Buffer.alloc(holder.value.pending.bytes); holder.value.pending.d2h(bytes);
@@ -56,10 +62,79 @@ it("DSpark accepts first-half projection rows without mutating the preceding car
     assert(actual.subarray(0, 1024).every(value => value === 99));
     assert(actual.subarray(1024).every(value => value === 7));
   }
-  cache.commitCompressor(state, [4, 0]);
+  cache.commitCompressor(state, holders, [4, 0]);
+  const rows = [...holders.compressorRows.values()].map(holder => holder.value);
+  holders[Symbol.dispose]();
+  assert(rows.every(row => row.disposed));
+  for (const holder of cache.compressorCarry.values()) {
+    assert.deepEqual(holder.value.pendingPosition.readInt32LEArray(), [6, 4]);
+  }
   const bytes = Buffer.alloc(retained.pending.bytes); retained.pending.d2h(bytes);
   assert(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.length / 4).every(value => value === 99));
   assert.deepEqual(retained.pendingPosition.readInt32LEArray(), [2, 2]);
+});
+
+it("DSpark layer holders release per-step rows after captured verification while carry survives", {
+  skip: process.env.SLOPLLM_TEST_DSV41_RESIDENT === "1",
+}, () => {
+  using ops = new GlmOps(0);
+  using model = new DeepseekV41Model(ops, { eosTokenId: 1 } as DeepseekV41Config);
+  using cache = new DeepseekV41Cache(model, 2, 1, 128);
+  using ws = new WorkspaceBase(ops);
+  using manager = new CaptureManager(ops);
+  using raw = ws.alloc([2, 1024], "F32");
+  using positions = ws.alloc([2], "I32");
+  using cu = ws.alloc([2], "I32");
+  using norm = ws.alloc([512], "BF16");
+  cu.h2d(Buffer.from(Int32Array.of(0, 2).buffer)); norm.fill(1, 512);
+  const seed = { cache, batchSize: 1, totalTokens: 2, extras: new Map() } as unknown as ExecutionState;
+  {
+    using holders = new LayerHolders(seed);
+    for (const output of holders.compressorOutputs.values()) {
+      output.pending.fill(0, output.pending.numElements);
+      output.pendingPosition.fill(-1, 1);
+    }
+  }
+  let forwardCalls = 0;
+  for (let step = 0; step < 24; ++step) {
+    const state = { cache, batchSize: 1, totalTokens: 2, seqLens: [2], seqKvLens: [step * 2 + 2],
+      extras: new Map([["dsv41.retainCompressorRows", true]]) } as unknown as ExecutionState;
+    using holders = new LayerHolders(state);
+    raw.fill(step + 1, raw.numElements);
+    positions.h2d(Buffer.from(Int32Array.of(step * 2, step * 2 + 1).buffer));
+    const buffers = [...holders.compressorInputs.values(), ...holders.compressorOutputs.values()]
+      .flatMap(carry => [carry.pending, carry.pendingPosition]);
+    const execution = manager.execute({ states: [], inputs: { raw, positions, cu, norm },
+      key: ["holder-carry", JSON.stringify(buffers.map(t => t.memoryRanges()))] }, input => {
+      forwardCalls++;
+      for (const [layer, output] of holders.compressorOutputs) {
+        // Retain an intermediate produced inside the graph, not its input.
+        using projected = input.raw.add(input.raw);
+        holders.compressorRows.get(layer)!.replace(projected.viewClone());
+        const previous = holders.compressorInputs.get(layer)!;
+        const result = projected.dsv41Compress(input.positions, input.cu, input.norm, 2,
+          previous.pending, previous.pendingPosition, 1e-20, output);
+        using latent = result.latent;
+        using valid = result.valid;
+      }
+      return { compressorRows: holders.detachCompressorRows() };
+    });
+    holders.replaceCompressorRows(execution.result.compressorRows);
+    cache.commitCompressor(state, holders, [0]);
+    const rows = [...holders.compressorRows.values()].map(holder => holder.value);
+    holders[Symbol.dispose]();
+    assert(rows.every(row => row.disposed));
+    for (const holder of cache.compressorCarry.values()) {
+      assert.deepEqual(holder.value.pendingPosition.readInt32LEArray(), [step * 2]);
+      const bytes = Buffer.alloc(holder.value.pending.bytes); holder.value.pending.d2h(bytes);
+      assert(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.length / 4).every(value => value === 2 * (step + 1)));
+    }
+    ws.assertClear([raw, positions, cu, norm]);
+    cache.compressorWorkspace.assertClear([...cache.compressorCarry.values()]
+      .flatMap(holder => [holder.value.pending, holder.value.pendingPosition]));
+  }
+  assert([...manager.captured.values()].some(graph => graph.graphExec !== null));
+  assert(forwardCalls < 24, "verification must consume refreshed rows from replay without running the callback");
 });
 
 it("DSpark block queries share the historical window and see every draft position", {

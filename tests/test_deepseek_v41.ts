@@ -140,8 +140,9 @@ for (const tp of [1, 2]) {
       indexPosition.h2d(Buffer.from(Int32Array.of(129).buffer));
       using indexRotary = indexPosition.dsv41RotaryEmbedding();
       using rotatedIndex = indexInput.dsv41Rope(indexRotary, true, false, 128);
-      using quantizedIndex = ws.alloc([1, 32 * 132], "U8", undefined, TensorParallelism.Row);
-      ops.dsv41IndexQuantize(quantizedIndex, rotatedIndex, indexPosition);
+      using quantizedIndex = ops.dsv41IndexQuantize(rotatedIndex, indexPosition);
+      assert.equal(quantizedIndex.parallelism, rotatedIndex.parallelism);
+      assert.deepEqual(quantizedIndex.shape, [1, 32 * 132]);
       using fullIndex = quantizedIndex.replicate();
       const indexBytes = Buffer.alloc(quantizedIndex.bytes);
       fullIndex.d2h(indexBytes);

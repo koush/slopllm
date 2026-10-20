@@ -424,11 +424,11 @@ export abstract class ChatModel extends WorkspaceBase {
           throw new Error("Decode batch changed; close and restart the generator");
         }
         const state = ws.planDecode(this, batchSize, cache, executionManager.captureEnabled);
-        this.prepareForward(state);
         const inputTokens = nextTokens;
         state.setInput([nextTokens]);
         let warmup: boolean;
         {
+          using forwardResources = this.prepareForward(state);
           const captureKey = ["decode", samplingPolicy.captureKey ?? "greedy", ...this.forwardCaptureKey(state)];
           const execution = executionManager.execute({ states: [state], inputs: {}, key: captureKey }, () => {
             using hidden = this.forwardModel(state);
@@ -463,8 +463,8 @@ export abstract class ChatModel extends WorkspaceBase {
     return new DefaultChatModelParser(this.tokenizer);
   }
 
-  /** Prepare persistent forward resources outside CUDA graph capture. */
-  prepareForward(_state: ExecutionState): void {}
+  /** Prepare metadata outside capture; callers retain returned resources through execution/replay. */
+  prepareForward(_state: ExecutionState): Disposable | undefined { return undefined; }
 
   /** Model-owned persistent resources that distinguish otherwise identical graphs. */
   forwardCaptureKey(_state: ExecutionState): (string | number)[] { return []; }

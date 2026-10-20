@@ -2512,11 +2512,12 @@ export class ParallelOps implements DeviceOps {
     const shards = this.devices.map((ops, r) => ops.dsv41Hash(this.local(tokens, r), this.local(lookback, r), this.local(map, r), this.local(primes, r), this.local(offsets, r), this.optionalLocal(qoIndptr, r)));
     return this.wrapShards(tokens.workspace, shards, [2, tokens.numElements, 24], "I32", TensorParallelism.Replicated);
   }
-  dsv41IndexQuantize(output: Tensor, input: Tensor, positions: Tensor): void {
+  dsv41IndexQuantize(input: Tensor, positions: Tensor): Tensor {
     this.requireDsv4Replicated(positions);
     this.assertParallel("Indexer query", this.cast(input), TensorParallelism.Row, TensorParallelism.Replicated);
-    this.assertParallel("Quantized query", this.cast(output), input.parallelism);
-    this.devices.forEach((ops, r) => ops.dsv41IndexQuantize(this.local(output, r), this.local(input, r), this.local(positions, r)));
+    const shards = this.devices.map((ops, r) => ops.dsv41IndexQuantize(this.local(input, r), this.local(positions, r)));
+    return this.wrapShards(input.workspace, shards,
+      [positions.numElements, input.numElements / positions.numElements / 128 * 132], "U8", input.parallelism);
   }
   dsv4IndexScores(query: Tensor, keys: Tensor, weights: Tensor, positions: Tensor, pages: Tensor, ratio: 1 | 2, capacity: number, batchIndices?: Tensor): Tensor {
     this.requireDsv4Replicated(keys, positions, pages, batchIndices);
