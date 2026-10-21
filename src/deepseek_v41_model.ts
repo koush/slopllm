@@ -692,7 +692,6 @@ export class DeepseekV41Model extends ChatModel {
     previous.replace(mlpMix.pre);
     using mlpNormed = fuseNorm ? mlpInput.viewClone() : mlpInput.rmsnorm(this.weight(pfx + ".ffn_norm.weight"), 1e-20);
     using downBuf = this.mlpSparse(mlpNormed, layer);
-    using rounded = downBuf.toType("BF16");
 
     yield;
     // Engram changes the next layer's residual before attention pre-mixing.
@@ -700,9 +699,9 @@ export class DeepseekV41Model extends ChatModel {
     const nextLayer = layer + 1;
     if (fusePost && nextLayer < (draft ? 43 : 40) && nextLayer !== 1 && nextLayer !== 14) {
       preparedMix.replace(this.prepareMhc(hidden, previous, nextLayer, "attn", fuseNorm,
-        { block: rounded, post: mlpPost, comb: mlpComb }));
+        { block: downBuf, post: mlpPost, comb: mlpComb }));
     } else {
-      hidden.replace(this.ops.mhcPost(hidden.value, rounded, mlpPost, mlpComb));
+      hidden.replace(this.ops.mhcPost(hidden.value, downBuf, mlpPost, mlpComb));
     }
     yield;
   }
@@ -841,8 +840,12 @@ export class DeepseekV41Model extends ChatModel {
     const gate = this.expertWeights.get(`${p}.w1`)!;
     sharedStream.streamWaitEvent();
     return normed.swiGluMlpMoeReduce({
-      gate, up: this.expertWeights.get(`${p}.w3`)!, down: this.expertWeights.get(`${p}.w2`)!,
-      normalizedWeightsStream: weightsStream, shared, activationLimit: 10, outputType: "F32",
+      gate,
+      up: this.expertWeights.get(`${p}.w3`)!,
+      down: this.expertWeights.get(`${p}.w2`)!,
+      normalizedWeightsStream: weightsStream,
+      shared,
+      activationLimit: 10,
     }, flatIds, topK, flatIds.numElements, gate[0].shape[0], normed.shape[1], p);
   }
 

@@ -6,20 +6,34 @@ import { TensorParallelism } from "../src/device_ops";
 import { WorkspaceBase } from "../src/workspace";
 import { getNativeAddon } from "../src/native-addon";
 
-it("BF16 conversion reduces F32 partial sums before rounding", () => {
+it("BF16 conversion preserves shard layout and converts locally without collectives", () => {
   using gpu0 = new GlmOps(0);
   using gpu1 = new GlmOps(1);
   using ops = new ParallelOps([gpu0, gpu1]);
   using ws = new WorkspaceBase(ops);
-  using partial = ws.alloc([1, 256], "F32", undefined, TensorParallelism.PartialSum) as ParallelTensor;
-  // Individually rounding 257 and -256 to BF16 would incorrectly produce zero.
-  partial.shards[0].fill(257, 256);
-  partial.shards[1].fill(-256, 256);
-  using result = partial.toType("BF16");
-  assert.equal(result.parallelism, TensorParallelism.Replicated);
-  const data = Buffer.alloc(result.bytes);
-  result.d2h(data);
-  assert.deepEqual(Array.from(bf16BytesToF32(data)), Array(256).fill(1));
+  for (const layout of [TensorParallelism.PartialSum, TensorParallelism.Row,
+    TensorParallelism.Column, TensorParallelism.Replicated]) {
+    using input = ws.alloc([2, 256], "F32", undefined, layout) as ParallelTensor;
+    // Distinguish local rounding from reduction-before-rounding (which gives 1).
+    input.shards[0].fill(257, input.shards[0].numElements);
+    input.shards[1].fill(-256, input.shards[1].numElements);
+    using result = input.toType("BF16") as ParallelTensor;
+    assert.equal(input.parallelism, layout);
+    assert.equal(result.parallelism, layout);
+    assert.deepEqual(result.shape, input.shape);
+    for (let rank = 0; rank < 2; rank++) {
+      const shard = result.shards[rank];
+      assert.deepEqual(shard.shape, input.shards[rank].shape);
+      const data = Buffer.alloc(shard.bytes);
+      shard.d2h(data);
+      assert.deepEqual(Array.from(bf16BytesToF32(data)), Array(shard.numElements).fill(rank ? -256 : 256));
+      const source = new Float32Array(input.shards[rank].numElements);
+      input.shards[rank].d2h(Buffer.from(source.buffer));
+      assert.ok(source.every(value => value === (rank ? -256 : 257)));
+    }
+    using sameType = result.toType("BF16") as ParallelTensor;
+    assert.equal(sameType.parallelism, layout);
+  }
 });
 
 it("packed formats and E8M0 retain their bytes and dtype through TP gather", () => {

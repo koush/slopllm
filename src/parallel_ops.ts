@@ -1332,9 +1332,7 @@ export class ParallelTensor extends Tensor {
 
   toType(type: "BF16"): Tensor {
     if (this.type === type) return this.viewClone();
-    // Round the logical value, not individual partial contributions. Keep the
-    // reduction in the source dtype before narrowing to BF16.
-    if (this.parallelism === TensorParallelism.PartialSum) this.allReduce();
+    // Conversion is shard-local; consumers own any required collectives.
     const shards = this.shards.map(t => t.toType(type));
     return this.parallelOps.wrapShards(this.workspace, shards, this.shape, type, this.parallelism);
   }
