@@ -2,6 +2,7 @@
 #include <cuda_bf16.h>
 #include <float.h>
 #include <cmath>
+#include <flashinfer/sampling.cuh>
 
 #define SAMPLING_BLOCK_SIZE 256
 
@@ -120,7 +121,7 @@ __device__ SamplingParams sampling_load_params(
     } else if (p.top_k > 0) {
         p.effective_k = (p.top_k < vocab_size) ? p.top_k : vocab_size;
     } else {
-        p.effective_k = 32;
+        p.effective_k = vocab_size;
     }
     return p;
 }
@@ -272,6 +273,100 @@ __device__ int sampling_softmax_topp_sample_and_append(
 // Batch sampling kernel: each block handles one sequence
 // ---------------------------------------------------------------------------
 
+// Full-vocabulary sampling keeps probabilities in the caller's vocabulary-sized
+// workspace. No sorted candidate list is constructed. Bounded rows use a dummy
+// distribution here and are handled by the existing top-k kernels afterwards.
+__global__ void sampling_full_probs(
+    float* workspace, float* effective_top_p, const __nv_bfloat16* logits,
+    int* penalty_tokens, int* penalty_count, int max_window, int vocab_size,
+    const float* temperatures, const float* repetition_penalties,
+    const float* presence_penalties, const int* top_ks, const float* top_ps) {
+    const int row = blockIdx.x, tid = threadIdx.x;
+    const auto p = sampling_load_params(row, temperatures, repetition_penalties,
+        presence_penalties, top_ks, top_ps, penalty_count, max_window, vocab_size);
+    float* probs = workspace + size_t(row) * vocab_size;
+    const bool full = p.temperature > 0.f && p.effective_k == vocab_size;
+    if (tid == 0) effective_top_p[row] = full ? fmaxf(p.top_p, FLT_MIN) : 1.f;
+    if (!full) {
+        for (int i = tid; i < vocab_size; i += blockDim.x) probs[i] = i == 0 ? 1.f : 0.f;
+        return;
+    }
+    sampling_scale_logits(tid, blockDim.x, logits + size_t(row) * vocab_size,
+        probs, vocab_size, fminf(1.f / p.temperature, FLT_MAX));
+    __syncthreads();
+    sampling_apply_penalties(tid, p, penalty_tokens, probs, vocab_size, max_window);
+    __syncthreads();
+    using Reduce = cub::BlockReduce<float, SAMPLING_BLOCK_SIZE>;
+    __shared__ typename Reduce::TempStorage temp;
+    __shared__ float maximum, total;
+    float local_max = -INFINITY;
+    for (int i = tid; i < vocab_size; i += blockDim.x) local_max = fmaxf(local_max, probs[i]);
+    float m = Reduce(temp).Reduce(local_max, [] __device__ (float a, float b) { return fmaxf(a, b); });
+    if (tid == 0) maximum = m;
+    __syncthreads();
+    float sum = 0.f;
+    for (int i = tid; i < vocab_size; i += blockDim.x) {
+        const float x = probs[i];
+        float v = 0.f;
+        if (maximum == -INFINITY) v = i == 0 ? 1.f : 0.f;
+        else if (maximum == INFINITY) v = x == INFINITY ? 1.f : 0.f;
+        else if (x > -INFINITY) v = __expf(x - maximum);
+        probs[i] = v;
+        sum += v;
+    }
+    float s = Reduce(temp).Sum(sum);
+    if (tid == 0) total = s;
+    __syncthreads();
+    for (int i = tid; i < vocab_size; i += blockDim.x) probs[i] /= total;
+}
+
+__global__ void sampling_full_draw(
+    int* out_tokens, const float* workspace, int* penalty_tokens, int* penalty_count,
+    int max_window, int vocab_size, const float* temperatures, const int* top_ks,
+    const unsigned int* step_counter, float* out_probs, int* out_ids, int support_capacity) {
+    const int row = blockIdx.x, tid = threadIdx.x;
+    if (temperatures[row] <= 0.f || (top_ks[row] > 0 && top_ks[row] < vocab_size)) return;
+    const float* probs = workspace + size_t(row) * vocab_size;
+    // Contiguous chunks retain token-ID CDF ordering independently of vocabulary
+    // size. Double accumulation keeps small but nonzero tail probabilities live.
+    const int begin = int(size_t(vocab_size) * tid / blockDim.x);
+    const int end = int(size_t(vocab_size) * (tid + 1) / blockDim.x);
+    double sum = 0.;
+    for (int i = begin; i < end; ++i) sum += probs[i];
+    using Scan = cub::BlockScan<double, SAMPLING_BLOCK_SIZE>;
+    __shared__ typename Scan::TempStorage temp;
+    __shared__ int sampled;
+    if (tid == 0) sampled = 0;
+    double prefix, total;
+    Scan(temp).ExclusiveSum(sum, prefix, total);
+    __syncthreads();
+    const double threshold = double(hash_to_random(*step_counter + row)) * total;
+    if (threshold >= prefix && threshold < prefix + sum) {
+        double cumulative = prefix;
+        int last = 0;
+        for (int i = begin; i < end; ++i) {
+            if (probs[i] <= 0.f) continue;
+            last = i;
+            cumulative += probs[i];
+            if (threshold < cumulative) break;
+        }
+        sampled = last;
+    }
+    for (int i = tid; i < support_capacity; i += blockDim.x) {
+        const size_t offset = size_t(row) * support_capacity + i;
+        if (out_probs) out_probs[offset] = i < vocab_size ? probs[i] : 0.f;
+        if (out_ids) out_ids[offset] = i < vocab_size ? i : -1;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        out_tokens[row] = sampled;
+        if (max_window > 0) {
+            penalty_tokens[size_t(row) * max_window + penalty_count[row] % max_window] = sampled;
+            penalty_count[row]++;
+        }
+    }
+}
+
 template<int MAX_K>
 __global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_batch(
     int* __restrict__ out_tokens,
@@ -297,6 +392,8 @@ __global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_batch(
 
     SamplingParams p = sampling_load_params(seq_idx, temperatures, repetition_penalties,
         presence_penalties, top_ks, top_ps, penalty_count, max_window, vocab_size);
+
+    if (p.temperature > 0.f && p.effective_k == vocab_size) return;
 
     const __nv_bfloat16* seq_logits = logits + (size_t)seq_idx * vocab_size;
     float* seq_workspace = workspace + (size_t)seq_idx * vocab_size;
@@ -425,6 +522,8 @@ __global__ void __launch_bounds__(SAMPLING_BLOCK_SIZE, 4) sampling_kernel_argmax
     SamplingParams p = sampling_load_params(seq_idx, temperatures, repetition_penalties,
         presence_penalties, top_ks, top_ps, penalty_count, max_window, vocab_size);
 
+    if (p.temperature > 0.f && p.effective_k == vocab_size) return;
+
     const __nv_bfloat16* seq_logits = logits + (size_t)seq_idx * vocab_size;
     float* seq_workspace = workspace + (size_t)seq_idx * vocab_size;
     int* seq_out = out_tokens + seq_idx;
@@ -508,6 +607,24 @@ void glm_sample_batch(GlmCtx* ctx, int* out_tokens, float* topk_vals, int* topk_
 
     int num_warps = block_size / 32;
 
+    if (max_effective_k >= vocab_size) {
+        // topk_vals is unused until bounded selection, so its first batch_size
+        // elements can hold the effective top-p values for this launch sequence.
+        sampling_full_probs<<<batch_size, block_size, 0, GLM_STREAM(ctx)>>>(
+            workspace, topk_vals, (const __nv_bfloat16*)logits,
+            penalty_tokens, penalty_count, max_window, vocab_size,
+            temperatures, repetition_penalties, presence_penalties, top_ks, top_ps);
+        auto error = flashinfer::sampling::TopPRenormProb(workspace, workspace, topk_vals,
+            batch_size, 1.f, vocab_size, GLM_STREAM(ctx));
+        if (error != cudaSuccess) {
+            fprintf(stderr, "sampling top-p: %s\n", cudaGetErrorString(error));
+            std::abort();
+        }
+        sampling_full_draw<<<batch_size, block_size, 0, GLM_STREAM(ctx)>>>(
+            out_tokens, workspace, penalty_tokens, penalty_count, max_window, vocab_size,
+            temperatures, top_ks, step_counter, out_probs, out_ids, support_capacity);
+    }
+
     if (max_effective_k <= 1) {
         size_t smem = num_warps * 2 * (sizeof(float) + sizeof(int));
         sampling_kernel_batch<2><<<batch_size, block_size, smem, GLM_STREAM(ctx)>>>(
@@ -568,7 +685,7 @@ __global__ void sampling_kernel_candidates(
     p.top_k = top_ks[row];
     p.top_p = top_ps[row];
     p.effective_k = p.temperature <= 0.0f ? 1
-        : min(p.top_k > 0 ? p.top_k : 32, candidate_count);
+        : min(p.top_k > 0 ? p.top_k : candidate_count, candidate_count);
     float inv_temp = p.temperature > 0.0f ? fminf(1.0f / p.temperature, FLT_MAX) : 1.0f;
     float val = -INFINITY;
     int id = -1;

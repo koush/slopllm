@@ -3368,9 +3368,9 @@ static Napi::Value SampleBatch(const Napi::CallbackInfo& info) {
         ? info[19].As<Napi::Number>().Int64Value() : 0;
     int support_capacity = info.Length() > 20 && info[20].IsNumber()
         ? info[20].As<Napi::Number>().Int32Value() : 0;
-    if (support_capacity < 0 || support_capacity > 256 ||
-        ((out_probs_ptr || out_ids_ptr) && support_capacity == 0)) {
-        Napi::RangeError::New(env, "sampleBatch export requires support_capacity in [1, 256]").ThrowAsJavaScriptException();
+    if (support_capacity < 0 ||
+        ((out_probs_ptr || out_ids_ptr) && (support_capacity == 0 || support_capacity < max_effective_k))) {
+        Napi::RangeError::New(env, "sampleBatch export requires support_capacity >= max_effective_k").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     glm_sample_batch(reinterpret_cast<GlmCtx*>(ctx_ptr),

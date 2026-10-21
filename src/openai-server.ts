@@ -650,7 +650,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       const presencePenalty = params.presence_penalty ?? args.presencePenalty;
 
       if (samplingWorkspace.mtpEnabled) {
-        const effectiveK = temperature <= 0 ? 1 : topK > 0 ? Math.min(topK, model.cfg.vocabSize) : 32;
+        const effectiveK = temperature <= 0 ? 1 : topK > 0 ? Math.min(topK, model.cfg.vocabSize) : model.cfg.vocabSize;
         if (![temperature, topP, topK, repetitionPenalty, presencePenalty].every(Number.isFinite)
           || !Number.isInteger(topK) || !Number.isInteger(effectiveK)) {
           sendJSON(res, 400, { error: { message: "Linear MTP requires finite numeric sampling parameters and an integer top_k", type: "invalid_request_error" } });

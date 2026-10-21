@@ -103,7 +103,7 @@ def _sample_buffers(glm, device, logits, top_ks, temperatures, top_ps, seed,
                        + [ctypes.c_void_p] * 6 + [ctypes.c_int]
                        + [ctypes.c_void_p] * 2 + [ctypes.c_int])
     batch, vocab = logits.shape
-    effective = [1 if t <= 0 else min(k, vocab) if k > 0 else 32
+    effective = [1 if t <= 0 else min(k, vocab) if k > 0 else vocab
                  for k, t in zip(top_ks, temperatures)]
     max_k = max(effective)
     scratch_k = next((k for k in (2, 8, 16, 32, 64) if k >= max_k), max_k)
@@ -163,20 +163,21 @@ def test_sample_batch_compact_distribution(glm, device, vocab, top_ks):
     top_ps = [0.55] * batch
     seed = 2**32 - 3
     launch, out, probs, ids, counter = _sample_buffers(
-        glm, device, logits, top_ks, temperatures, top_ps, seed)
+        glm, device, logits, top_ks, temperatures, top_ps, seed, capacity=vocab)
     for iteration in range(3):
         launch()
         glm.synchronize()
         actual_probs, actual_ids = probs.cpu(), ids.cpu().long()
         tokens = out.cpu()
         for row, (k, temperature) in enumerate(zip(top_ks, temperatures)):
-            effective = 1 if temperature <= 0 else k if k > 0 else 32
+            effective = 1 if temperature <= 0 else k if k > 0 else vocab
             values, expected_ids = torch.topk(
                 logits[row].float() / (temperature if temperature > 0 else 1), effective)
             expected_probs = values.softmax(0)
             if k <= 0 and top_ps[row] < 1:
                 cutoff = int(torch.nonzero(expected_probs.cumsum(0) > top_ps[row])[0]) + 1
-                expected_probs[cutoff:] = 0
+                # Full-vocabulary top-p retains all ties at the cutoff.
+                expected_probs[expected_probs < expected_probs[cutoff - 1].item()] = 0
                 expected_probs /= expected_probs.sum()
             assert set(actual_ids[row, :effective].tolist()) == set(expected_ids.tolist())
             # Sorting by ID compares distributions independently of kernel ordering.
@@ -242,6 +243,70 @@ def test_sample_batch_counter_graph_replay(glm, device, export):
         if executable is not None:
             glm.graph_exec_destroy(executable)
         glm.graph_destroy(graph)
+
+
+@pytest.mark.parametrize("top_k", [-1, 0, 129280])
+def test_unrestricted_sampling_full_vocabulary_graph_replay(glm, device, top_k):
+    vocab, seed = 129280, 317
+    logits = torch.zeros((2, vocab), device=device, dtype=torch.bfloat16)
+    launch, out, probs, ids, counter = _sample_buffers(
+        glm, device, logits, [top_k, 1], [1.0, 0.0], [1.0, 1.0], seed,
+        capacity=vocab + 3)
+    launch()
+    glm.synchronize()
+    glm.graph_begin_capture()
+    launch()
+    graph = glm.graph_end_capture()
+    executable = None
+    try:
+        executable = glm.graph_instantiate(graph)
+        for iteration in range(1, 4):
+            logits.zero_()
+            # Mutating logits must affect the captured distribution, including
+            # tokens well beyond both the former top-32 cutoff and 65536 scratch.
+            logits[:, 100000:] = iteration
+            torch.cuda.synchronize(device)
+            glm.graph_launch(executable)
+            glm.synchronize()
+            expected = logits[0].float().softmax(0).cpu()
+            actual = probs[0, :vocab].cpu()
+            torch.testing.assert_close(actual, expected, rtol=2e-5, atol=1e-10)
+            assert (actual > 0).all()
+            assert ids[0, :vocab].cpu().tolist() == list(range(vocab))
+            assert (ids[:, vocab:] == -1).all()
+            assert (probs[:, vocab:] == 0).all()
+            cumulative = actual.double().cumsum(0)
+            threshold = lowbias32_uniform(seed + iteration * 2) * cumulative[-1]
+            assert out[0].item() == torch.searchsorted(cumulative, threshold, right=True).item()
+            assert out[1].item() >= 100000
+            assert counter.item() == seed + (iteration + 1) * 2
+    finally:
+        if executable is not None:
+            glm.graph_exec_destroy(executable)
+        glm.graph_destroy(graph)
+
+
+@pytest.mark.parametrize("top_p", [0.0, 0.5, 1.0])
+def test_unrestricted_sampling_top_p_ties_and_invalid_logits(glm, device, top_p):
+    logits = torch.full((4, 1025), float("-inf"))
+    logits[0] = 0  # The nucleus boundary ties across the whole vocabulary.
+    logits[1] = float("nan")
+    logits[2, [73, 901]] = float("inf")
+    logits[3, 1000] = 0
+    launch, out, probs, ids, _ = _sample_buffers(
+        glm, device, logits, [-1] * 4, [1.0] * 4, [top_p] * 4, 12, capacity=1025)
+    launch()
+    glm.synchronize()
+    expected = torch.zeros_like(logits)
+    expected[0] = 1 / 1025
+    expected[1, 0] = 1
+    expected[2, [73, 901]] = 0.5
+    expected[3, 1000] = 1
+    torch.testing.assert_close(probs.cpu(), expected)
+    assert ids.cpu().tolist() == [list(range(1025))] * 4
+    assert out[1].item() == 0
+    assert out[2].item() in (73, 901)
+    assert out[3].item() == 1000
 
 
 @pytest.mark.parametrize("top_k", [8, 65])
@@ -337,7 +402,7 @@ def test_sample_candidates_full_logits_reference(
     if not sorted_candidates:
         assert not (values[:, :-1] > values[:, 1:]).all()
 
-    ks = [candidate_count, 1, 20, 0, 20, 20, -1,
+    ks = [candidate_count, 1, 20, 32, 20, 20, 32,
           65 if candidate_count > 64 else 32]
     temps = [1.0, 0.75, 1.5, 1.0, 0.0, -0.5, 0.75, 1.0]
     ps = [0.6] * batch

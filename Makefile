@@ -21,6 +21,9 @@ DEPS := $(OBJS:.o=.d)
 
 all: $(BUILD_DIR)/$(LIB_NAME)
 
+# Sampling uses CUB/Thrust through FlashInfer; match its vendored libcudacxx.
+$(BUILD_DIR)/glm_sampling.o: NVCC_FLAGS += -Ivendor/flashinfer/3rdparty/cccl/cub -Ivendor/flashinfer/3rdparty/cccl/thrust
+
 $(BUILD_DIR)/$(LIB_NAME): $(OBJS) | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -shared -o $@ $^ \
 		$(FLASHINFER_INC) \

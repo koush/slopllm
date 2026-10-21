@@ -189,7 +189,7 @@ export class SamplingWorkspace extends WorkspaceBase implements TokenSelector {
     }
     this.uploadParameters(this, params);
     this.batchSize = params.length;
-    this.captureKey = Math.max(0, ...params.map(p => p.temperature <= 0 ? 1 : p.topK > 0 ? Math.min(p.topK, this.vocabSize) : 32));
+    this.captureKey = Math.max(0, ...params.map(p => p.temperature <= 0 ? 1 : p.topK > 0 ? Math.min(p.topK, this.vocabSize) : this.vocabSize));
 
     if (tokenHistories !== undefined) {
       this.initPenaltyState(params, tokenHistories);
@@ -216,7 +216,7 @@ export class SamplingWorkspace extends WorkspaceBase implements TokenSelector {
       } else if (topK > 0) {
         effectiveK = topK < vs ? topK : vs;
       } else {
-        effectiveK = 32;
+        effectiveK = vs;
       }
       if (effectiveK > maxEffectiveK) maxEffectiveK = effectiveK;
     }
@@ -232,8 +232,8 @@ export class SamplingWorkspace extends WorkspaceBase implements TokenSelector {
     }
 
     const outToken = this.alloc([batchSize], "I32");
-    using topkVals = this.alloc([batchSize * 256 * 256], "F32");
-    using topkIdxs = this.alloc([batchSize * 256 * 256], "I32");
+    using topkVals = this.alloc([batchSize * Math.max(256 * 256, maxEffectiveK)], "F32");
+    using topkIdxs = this.alloc([batchSize * Math.max(256 * 256, maxEffectiveK)], "I32");
     using scratch = this.alloc([batchSize * vs], "F32");
     logits.workspace.ops.sampleBatch(
       outToken,
@@ -265,7 +265,7 @@ export class SamplingWorkspace extends WorkspaceBase implements TokenSelector {
     if (!this.mtpEnabled) throw new Error("MTP sampling is not enabled");
     let maxEffectiveK = 0;
     for (const param of params) {
-      const effectiveK = param.temperature <= 0 ? 1 : param.topK > 0 ? Math.min(param.topK, this.vocabSize) : 32;
+      const effectiveK = param.temperature <= 0 ? 1 : param.topK > 0 ? Math.min(param.topK, this.vocabSize) : this.vocabSize;
       if (![param.temperature, param.topP, param.topK].every(Number.isFinite) || !Number.isInteger(param.topK)
         || !Number.isInteger(effectiveK) || effectiveK > this.capacity
         || param.repetitionPenalty !== 1 || param.presencePenalty !== 0) {

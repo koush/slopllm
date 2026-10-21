@@ -64,6 +64,54 @@ for (const parallel of [false, true]) {
       return tensor;
     }
 
+    it("rejects unrestricted MTP support beyond its capacity", () => {
+      for (const topK of [-1, 0]) {
+        assert.throws(() => sampler.updateMtpSampler([{ ...greedy, temperature: 1, topK }]), /effective top_k <= 256/);
+      }
+    });
+
+    it("ordinary sampling preserves full support for nonpositive top-k", () => {
+      using reference = new SamplingWorkspace(ops, B, V, 0);
+      using input = ws.alloc([B, V], "BF16", undefined, parallel ? TensorParallelism.Row : TensorParallelism.Replicated);
+      input.fill(0, input.numElements);
+      using probs = ws.alloc([B, V], "F32");
+      using ids = ws.alloc([B, V], "I32");
+      reference.updateSampler([-1, 0].map(topK => ({ ...greedy, temperature: 1, topK })));
+      assert.equal(reference.captureKey, V);
+      using output = reference.sample(input, probs, ids, V);
+      assert.deepEqual(readI32(ids), Array.from({ length: B * V }, (_, i) => i % V));
+      const bytes = Buffer.alloc(probs.bytes);
+      probs.d2h(bytes);
+      for (let i = 0; i < B * V; ++i) assert.equal(bytes.readFloatLE(i * 4), 1 / V);
+      assert.ok(readI32(output).every(token => token >= 0 && token < V));
+    });
+
+    it("full sampling applies penalties and appends each token once", () => {
+      using reference = new SamplingWorkspace(ops, B, V, 2);
+      using input = ws.alloc([B, V], "BF16");
+      const values = new Float32Array(B * V);
+      for (let row = 0; row < B; ++row) {
+        values[row * V + 1] = 2;
+        values[row * V + V - 1] = -2;
+      }
+      input.h2d(f32ToBf16Bytes(values));
+      using probs = ws.alloc([B, V], "F32");
+      using ids = ws.alloc([B, V], "I32");
+      reference.updateSampler([-1, 0].map(topK => ({ ...greedy, temperature: 1, topK,
+        repetitionPenalty: 2, presencePenalty: 1, repetitionPenaltyWindow: 2 })), [[1, V - 1], [1, V - 1]]);
+      using output = reference.sample(input, probs, ids, V);
+      const tokens = readI32(output);
+      assert.deepEqual(readI32(reference.penaltyCount), [3, 3]);
+      assert.deepEqual(readI32(reference.penaltyTokens), tokens.flatMap(token => [token, V - 1]));
+      const bytes = Buffer.alloc(probs.bytes);
+      probs.d2h(bytes);
+      const denominator = V - 1 + Math.exp(-5);
+      for (let i = 0; i < B * V; ++i) {
+        const expected = (i % V === V - 1 ? Math.exp(-5) : 1) / denominator;
+        assert.ok(Math.abs(bytes.readFloatLE(i * 4) - expected) < 1e-7);
+      }
+    });
+
     function uploadLogits(tensor: Tensor, peaks: number[]): void {
       const values = new Float32Array(peaks.length * V).fill(-16);
       peaks.forEach((peak, row) => {
@@ -515,10 +563,10 @@ for (const parallel of [false, true]) {
 
     for (const { params, withNaNs } of [
       { params: [{ ...greedy, temperature: 0.75, topK: 20, topP: 0.6 }, { ...greedy, topK: 0 }], withNaNs: false },
-      { params: [{ ...greedy, temperature: 1.25, topK: 0, topP: 0.6 }, { ...greedy, temperature: 0.5, topK: 20 }], withNaNs: false },
+      { params: [{ ...greedy, temperature: 1.25, topK: 32, topP: 0.6 }, { ...greedy, temperature: 0.5, topK: 20 }], withNaNs: false },
       { params: [{ ...greedy, temperature: 0.75, topK: 20, topP: 0.6 }, { ...greedy, temperature: 0.5, topK: 20 }], withNaNs: true },
     ]) {
-      const maxK = params[0].topK === 0 ? 32 : 20;
+      const maxK = Math.max(...params.map(p => p.temperature <= 0 ? 1 : p.topK));
       it(`matches full sampling with Row-sharded ${withNaNs ? "finite and NaN " : ""}logits and heterogeneous maxK=${maxK}`, { skip: !parallel }, (t) => {
         assert.ok(ops instanceof ParallelOps);
         const reference = new SamplingWorkspace(ops, B, V, 0);
