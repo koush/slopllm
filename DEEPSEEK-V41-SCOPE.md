@@ -144,7 +144,12 @@ ReLU, followed by BF16 score rounding before candidate selection and top-k.
 More than 64 queries use a DeepSeek paged-layout specialization of GLM's FP8
 prefill scorer: 64 query tokens by 288 keys, 12 warps, and two head-staging
 buffers. FP8 MMA, weighted ReLU accumulation and BF16 output share GLM's compute
-body. Inline query/key scales and compressed page/causal addressing are specialized;
+body. Query staging uses 144-byte shared rows with a head-dependent payload offset
+matching the 132-byte global record alignment: aligned middles use 16-byte
+asynchronous copies, and edges use four-byte asynchronous copies. Shifted payloads
+use four-byte shared reads into MMA fragments instead of alignment-restricted
+`ldmatrix` reads. The two staging buffers add 2 KiB over unpadded rows.
+Inline query/key scales and compressed page/causal addressing are specialized;
 mixed-sequence tiles run contiguous sequence segments with independent bounds.
 Every padded score is refreshed to negative infinity on replay. Head accumulation
 uses GLM's order, so scores at BF16 rounding boundaries may differ from the

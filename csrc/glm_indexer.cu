@@ -1252,11 +1252,21 @@ __device__ __forceinline__ void ldm_x2(uint32_t& b0, uint32_t& b1,
                  : "=r"(b0), "=r"(b1) : "r"(addr));
 }
 
-template <bool SWIZZLED = false>
+template <bool SWIZZLED = false, int STRIDE = HD, bool SHIFTED = false>
 __device__ __forceinline__ void load_a(uint32_t& a0, uint32_t& a1,
                                        uint32_t& a2, uint32_t& a3,
                                        const uint8_t* base, int lane,
                                        int kOffset = 0) {
+    if constexpr (SHIFTED) {
+        // Shifted rows cannot use ldmatrix's 16-byte-aligned row addresses.
+        // Load its equivalent per-lane MMA fragment with aligned 32-bit reads.
+        const uint8_t* p = base + (lane >> 2) * STRIDE + kOffset + (lane & 3) * 4;
+        a0 = *reinterpret_cast<const uint32_t*>(p);
+        a1 = *reinterpret_cast<const uint32_t*>(p + 8 * STRIDE);
+        a2 = *reinterpret_cast<const uint32_t*>(p + 16);
+        a3 = *reinterpret_cast<const uint32_t*>(p + 8 * STRIDE + 16);
+        return;
+    }
     const int row = (lane & 7) + ((lane >> 3) & 1) * 8;
     const int col = kOffset + (lane >> 4) * 16;
     ldm_x4(a0, a1, a2, a3, smem_row_ptr<SWIZZLED>(base, row, col));
@@ -1893,6 +1903,12 @@ __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool pr
     asm volatile("cp.async.ca.shared.global.L2::128B [%0], [%1], %2, %3;\n"
         :: "r"(s), "l"(gmem), "n"(16), "r"(sz));
 }
+__device__ __forceinline__ void cp_async4(void* smem, const void* gmem, bool pred) {
+    unsigned s = __cvta_generic_to_shared(smem);
+    int sz = pred ? 4 : 0;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n"
+        :: "r"(s), "l"(gmem), "r"(sz));
+}
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 template <int N> __device__ __forceinline__ void cp_wait() {
     asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
@@ -2347,8 +2363,9 @@ idx_prefill_score_fp8_mma_kernel(
     uint8_t* sk = reinterpret_cast<uint8_t*>(smem);
     float* skScale = reinterpret_cast<float*>(sk + TN * idxfp8::HD);
     uint8_t* sq0 = reinterpret_cast<uint8_t*>(skScale + TN);
+    constexpr int Q_STRIDE = idxfp8::HD + (DSV41 ? 16 : 0);
     float* sharedWeights = reinterpret_cast<float*>(
-        sq0 + Q_BATCH * TM * idxfp8::HD);
+        sq0 + Q_BATCH * TM * Q_STRIDE);
     uint64_t* kBarrier = reinterpret_cast<uint64_t*>(
         sharedWeights + TM * idxfp8::NHEADS);
 
@@ -2407,7 +2424,7 @@ idx_prefill_score_fp8_mma_kernel(
     const int lane = threadIdx.x & 31;
     const int warpCol = warp * idxfp8::K_ROWS * NPW;
 
-    for (int i = threadIdx.x; i < Q_BATCH * TM * idxfp8::HD; i += CTA) sq0[i] = 0;
+    for (int i = threadIdx.x; i < Q_BATCH * TM * Q_STRIDE; i += CTA) sq0[i] = 0;
     __syncthreads();
 
     idxfp8::Acc acc[NUM_M][NPW];
@@ -2419,13 +2436,22 @@ idx_prefill_score_fp8_mma_kernel(
 
     auto issueQ = [&](int h, uint8_t* dst) {
         if constexpr (DSV41) {
-            // Inline scales make head records only four-byte aligned.
-            for (int i = threadIdx.x * 4; i < TM * idxfp8::HD; i += CTA * 4) {
-                const int ql = i / idxfp8::HD, col = i % idxfp8::HD;
+            // Match source alignment in padded SMEM rows. Copy aligned middle
+            // vectors asynchronously, with four-byte copies at either edge.
+            const int shift = (h * 132) & 15;
+            const int prefix = (16 - shift) & 15;
+            const int vectors = shift ? 7 : 8;
+            const int copies = shift ? 11 : 8;
+            for (int i = threadIdx.x; i < TM * copies; i += CTA) {
+                const int ql = i / copies, part = i % copies;
+                const int edge = part - vectors;
+                const int col = part < vectors ? prefix + part * 16
+                    : edge < prefix / 4 ? edge * 4
+                    : prefix + vectors * 16 + (edge - prefix / 4) * 4;
                 const uint8_t* src = q8Data + (size_t)(qStart + ql) * q8Stride + h * 132 + col;
-                uint8_t* qDst = dst + i;
-                if constexpr (TMA_SWIZZLE) qDst = const_cast<uint8_t*>(idxfp8::smem_row_ptr<true>(dst, ql, col));
-                *reinterpret_cast<uint32_t*>(qDst) = ql < mValid ? *reinterpret_cast<const uint32_t*>(src) : 0;
+                uint8_t* qDst = dst + ql * Q_STRIDE + shift + col;
+                if (part < vectors) idxmma::cp_async16(qDst, src, ql < mValid);
+                else idxmma::cp_async4(qDst, src, ql < mValid);
             }
         } else {
         for (int i = threadIdx.x * 16; i < TM * idxfp8::HD; i += CTA * 16) {
@@ -2446,14 +2472,14 @@ idx_prefill_score_fp8_mma_kernel(
         idxmma::cp_commit();
         for (int h = 0; h < idxfp8::NHEADS; h++) {
             if (h + 1 < idxfp8::NHEADS) {
-                issueQ(h + 1, sq0 + ((h + 1) & 1) * TM * idxfp8::HD);
+                issueQ(h + 1, sq0 + ((h + 1) & 1) * TM * Q_STRIDE);
                 idxmma::cp_commit();
                 idxmma::cp_wait<1>();
             } else {
                 idxmma::cp_wait<0>();
             }
             __syncthreads();
-            const uint8_t* qHead = sq0 + (h & 1) * TM * idxfp8::HD;
+            const uint8_t* qHead = sq0 + (h & 1) * TM * Q_STRIDE + (DSV41 ? (h * 132) & 15 : 0);
 
             idxfp8::Acc c[NUM_M][NPW];
 #pragma unroll
@@ -2467,8 +2493,8 @@ idx_prefill_score_fp8_mma_kernel(
                 uint32_t a0[NUM_M], a1[NUM_M], a2[NUM_M], a3[NUM_M];
 #pragma unroll
                 for (int mi = 0; mi < NUM_M; mi++)
-                    idxfp8::load_a<TMA_SWIZZLE>(a0[mi], a1[mi], a2[mi], a3[mi],
-                                   qHead + mi * 16 * idxfp8::HD, lane, kk);
+                    idxfp8::load_a<TMA_SWIZZLE, Q_STRIDE, DSV41>(a0[mi], a1[mi], a2[mi], a3[mi],
+                                   qHead + mi * 16 * Q_STRIDE, lane, kk);
 #pragma unroll
                 for (int ni = 0; ni < NPW; ni++) {
                     uint32_t b0, b1;
@@ -2504,7 +2530,7 @@ idx_prefill_score_fp8_mma_kernel(
         for (int hBase = 0; hBase < idxfp8::NHEADS; hBase += Q_BATCH) {
 #pragma unroll
             for (int hi = 0; hi < Q_BATCH; hi++)
-                issueQ(hBase + hi, sq0 + hi * TM * idxfp8::HD);
+                issueQ(hBase + hi, sq0 + hi * TM * Q_STRIDE);
             idxmma::cp_commit();
             idxmma::cp_wait<0>();
             __syncthreads();
@@ -2512,7 +2538,7 @@ idx_prefill_score_fp8_mma_kernel(
 #pragma unroll
             for (int hi = 0; hi < Q_BATCH; hi++) {
                 const int h = hBase + hi;
-                const uint8_t* qHead = sq0 + hi * TM * idxfp8::HD;
+                const uint8_t* qHead = sq0 + hi * TM * Q_STRIDE + (DSV41 ? (h * 132) & 15 : 0);
                 idxfp8::Acc c[NUM_M][NPW];
 #pragma unroll
                 for (int mi = 0; mi < NUM_M; mi++)
@@ -2525,8 +2551,8 @@ idx_prefill_score_fp8_mma_kernel(
                     uint32_t a0[NUM_M], a1[NUM_M], a2[NUM_M], a3[NUM_M];
 #pragma unroll
                     for (int mi = 0; mi < NUM_M; mi++)
-                        idxfp8::load_a<TMA_SWIZZLE>(a0[mi], a1[mi], a2[mi], a3[mi],
-                                       qHead + mi * 16 * idxfp8::HD, lane, kk);
+                        idxfp8::load_a<TMA_SWIZZLE, Q_STRIDE, DSV41>(a0[mi], a1[mi], a2[mi], a3[mi],
+                                       qHead + mi * 16 * Q_STRIDE, lane, kk);
 #pragma unroll
                     for (int ni = 0; ni < NPW; ni++) {
                         uint32_t b0, b1;
@@ -2598,7 +2624,7 @@ static void launch_dsv41_prefill_scores(GlmCtx* ctx, void* out, const uint8_t* q
     const int32_t* pages, const int32_t* batch_indices, int page_stride) {
     constexpr int TM = 64, TN = 288, WARPS = 12, Q_BATCH = 2;
     constexpr size_t smem = TN * idxfp8::HD + TN * sizeof(float)
-        + Q_BATCH * TM * idxfp8::HD + TM * idxfp8::NHEADS * sizeof(float) + sizeof(uint64_t);
+        + Q_BATCH * TM * (idxfp8::HD + 16) + TM * idxfp8::NHEADS * sizeof(float) + sizeof(uint64_t);
     cudaFuncSetAttribute(idx_prefill_score_fp8_mma_kernel<TM, TN, WARPS, Q_BATCH, false, false, true>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     CUtensorMap unused{};
