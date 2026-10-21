@@ -172,11 +172,12 @@ __global__ void scatter_input_scalar_kernel(const int* __restrict__ expert_ids, 
     sorted_to_original[pos] = i;
 }
 
-// Prefill uses top_k=8 for gate/up. A block owns one input token so the source
-// row is read once, while all threads issue coalesced stores to its eight
-// expert destinations. The scalar kernel above reads the same row eight times
+// A block owns one input token so the source row is read once, while all
+// threads issue coalesced stores to its TopK expert destinations.
+// The scalar kernel above reads the same row TopK times
 // and gives each thread an entire row to copy serially.
-__global__ void __launch_bounds__(256) scatter_input_top8_kernel(
+template <int TopK>
+__global__ void __launch_bounds__(256) scatter_input_topk_kernel(
     const int* __restrict__ expert_ids, int num_rows,
     const __nv_bfloat16* __restrict__ input, int K,
     __nv_bfloat16* __restrict__ sorted_input,
@@ -185,9 +186,9 @@ __global__ void __launch_bounds__(256) scatter_input_top8_kernel(
     int row = blockIdx.x;
     if (row >= num_rows) return;
 
-    __shared__ int positions[8];
-    if (threadIdx.x < 8) {
-        int route = row * 8 + threadIdx.x;
+    __shared__ int positions[TopK];
+    if (threadIdx.x < TopK) {
+        int route = row * TopK + threadIdx.x;
         int pos = atomicAdd(&expert_offsets[expert_ids[route]], 1);
         positions[threadIdx.x] = pos;
         sorted_to_original[pos] = route;
@@ -199,7 +200,7 @@ __global__ void __launch_bounds__(256) scatter_input_top8_kernel(
     for (int k = threadIdx.x; k < num_uint4; k += blockDim.x) {
         uint4 value = src[k];
 #pragma unroll
-        for (int route = 0; route < 8; route++) {
+        for (int route = 0; route < TopK; route++) {
             uint4* dst = reinterpret_cast<uint4*>(sorted_input + (size_t)positions[route] * K);
             dst[k] = value;
         }
@@ -207,7 +208,7 @@ __global__ void __launch_bounds__(256) scatter_input_top8_kernel(
     for (int k = num_uint4 * 8 + threadIdx.x; k < K; k += blockDim.x) {
         __nv_bfloat16 value = input[(size_t)row * K + k];
 #pragma unroll
-        for (int route = 0; route < 8; route++)
+        for (int route = 0; route < TopK; route++)
             sorted_input[(size_t)positions[route] * K + k] = value;
     }
 }
@@ -248,7 +249,11 @@ void launch_scatter_input(const int* expert_ids, int count, int top_k,
     constexpr int block = 256;
     if (top_k == 8 && count % 8 == 0) {
         int num_rows = count / 8;
-        scatter_input_top8_kernel<<<num_rows, block, 0, stream>>>(
+        scatter_input_topk_kernel<8><<<num_rows, block, 0, stream>>>(
+            expert_ids, num_rows, input, K, sorted_input, sorted_to_original, expert_offsets);
+    } else if (top_k == 6 && count % 6 == 0) {
+        int num_rows = count / 6;
+        scatter_input_topk_kernel<6><<<num_rows, block, 0, stream>>>(
             expert_ids, num_rows, input, K, sorted_input, sorted_to_original, expert_offsets);
     } else if (top_k == 1) {
         int grid = (count + 7) / 8;
