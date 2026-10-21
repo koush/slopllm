@@ -214,11 +214,9 @@ __global__ void __launch_bounds__(MaxThreads) rmsnorm_kernel(
     float eps,
     int dim
 ) {
-    // Large prefill grids must not occupy resources while waiting on peer barriers.
-    if (gridDim.x <= GLM_PDL_MAX_BLOCKS) {
-        cudaTriggerProgrammaticLaunchCompletion();
-        cudaGridDependencySynchronize();
-    }
+    // The host bounds early residency; keep both device dependency calls unconditional.
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
     int row = blockIdx.x;
     const __nv_bfloat16* x = input + row * dim;
     __nv_bfloat16* o = out + row * dim;
@@ -271,10 +269,8 @@ __global__ void __launch_bounds__(1024, 1) rmsnorm_kernel_stride(
     float eps,
     int dim
 ) {
-    if (gridDim.x <= GLM_PDL_MAX_BLOCKS) {
-        cudaTriggerProgrammaticLaunchCompletion();
-        cudaGridDependencySynchronize();
-    }
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
     int row = blockIdx.x;
     const __nv_bfloat16* x = input + row * dim;
     __nv_bfloat16* o = out + row * dim;
@@ -368,10 +364,8 @@ __global__ void __launch_bounds__(MaxThreads) fused_add_rmsnorm_kernel(
     // PDL: release our stream dependent (e.g. the cuBLAS linear that follows)
     // immediately, then wait for the upstream grid (the p2p barrier that
     // guards peers' all-reduce writes to input_b) before touching any input.
-    if (gridDim.x <= GLM_PDL_MAX_BLOCKS) {
-        cudaTriggerProgrammaticLaunchCompletion();
-        cudaGridDependencySynchronize();
-    }
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
     int row = blockIdx.x;
     const __nv_bfloat16* a = input_a + row * dim;
     const __nv_bfloat16* b = input_b + row * dim;
@@ -437,10 +431,8 @@ __global__ void __launch_bounds__(1024, 1) fused_add_rmsnorm_kernel_stride(
     float eps, int dim
 ) {
     // PDL: see fused_add_rmsnorm_kernel.
-    if (gridDim.x <= GLM_PDL_MAX_BLOCKS) {
-        cudaTriggerProgrammaticLaunchCompletion();
-        cudaGridDependencySynchronize();
-    }
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
     int row = blockIdx.x;
     const __nv_bfloat16* a = input_a + row * dim;
     const __nv_bfloat16* b = input_b + row * dim;

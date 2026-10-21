@@ -565,12 +565,10 @@ p2p_reduce_scatter_write_kernel(
     void* __restrict__ out4,  void* __restrict__ out5,
     void* __restrict__ out6,  void* __restrict__ out7,
     int chunk_bytes,
-    int rank, bool use_pdl)
+    int rank)
 {
-    if (use_pdl) {
-        cudaTriggerProgrammaticLaunchCompletion();
-        cudaGridDependencySynchronize();
-    }
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
 
     constexpr int VEC = 16;  // int4
     void* dsts[AG_SMEM_MAX_N] = {
@@ -633,13 +631,11 @@ p2p_reduce_gather_write_kernel(
     scalar_t* __restrict__ out4,  scalar_t* __restrict__ out5,
     scalar_t* __restrict__ out6,  scalar_t* __restrict__ out7,
     int chunk_len,
-    int rank, bool use_pdl)
+    int rank)
 {
-    if (use_pdl) {
-        cudaTriggerProgrammaticLaunchCompletion();
-        // In particular, wait for the preceding peer barrier before reading staging.
-        cudaGridDependencySynchronize();
-    }
+    cudaTriggerProgrammaticLaunchCompletion();
+    // In particular, wait for the preceding peer barrier before reading staging.
+    cudaGridDependencySynchronize();
 
     scalar_t* dsts[AG_SMEM_MAX_N] = {
         out0, out1, out2, out3, out4, out5, out6, out7,
@@ -876,7 +872,7 @@ void glm_p2p_allgather_row_write(GlmCtx* ctx,
     do { \
         cudaLaunchKernelEx(&config, p2p_reduce_scatter_write_kernel<N>, \
             local_shard, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], \
-            chunk_bytes, rank, use_pdl); \
+            chunk_bytes, rank); \
     } while(0)
 
 void glm_p2p_reduce_scatter_write(GlmCtx* ctx,
@@ -922,7 +918,7 @@ void glm_p2p_reduce_scatter_write(GlmCtx* ctx,
             (const SCT*)staging, \
             (SCT*)p[0], (SCT*)p[1], (SCT*)p[2], (SCT*)p[3], \
             (SCT*)p[4], (SCT*)p[5], (SCT*)p[6], (SCT*)p[7], \
-            chunk_len, rank, use_pdl); \
+            chunk_len, rank); \
     } while(0)
 
 void glm_p2p_reduce_gather_write(GlmCtx* ctx,

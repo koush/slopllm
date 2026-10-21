@@ -1399,11 +1399,9 @@ __global__ void score_kernel(
     const uint8_t* __restrict__ q8Data, int q8Stride,
     const float* __restrict__ effectiveWeights, int weightStride,
     const float* __restrict__ kScaleData) {
-    if (uint64_t(gridDim.x) * gridDim.y <= GLM_PDL_MAX_BLOCKS) {
-        cudaTriggerProgrammaticLaunchCompletion();
-        // Q and effective weights may still be completing their P2P gather barrier.
-        cudaGridDependencySynchronize();
-    }
+    cudaTriggerProgrammaticLaunchCompletion();
+    // Q and effective weights may still be completing their P2P gather barrier.
+    cudaGridDependencySynchronize();
 
     const int qi = blockIdx.y;
     const int globalQuery = qi + qGlobalStart;
