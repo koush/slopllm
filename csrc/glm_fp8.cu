@@ -1,13 +1,10 @@
 #include "glm_ops.h"
 #include "glm_nvfp4.cuh"
+#include "glm_quantize.cuh"
 #include <cublasLt.h>
 
 namespace {
-// cuBLASLt VEC32_UE8M0: 128 rows x four K32 scales per tile.
-__device__ size_t mx_scale_offset(int row, int group, int k) {
-    return size_t(row / 128) * (k / 128) * 512 + (group / 4) * 512
-        + (row % 32) * 16 + ((row % 128) / 32) * 4 + group % 4;
-}
+using glm_quantize::mx_scale_offset;
 
 __global__ void fp8_pack_scales(uint8_t* packed, const uint8_t* scales, int n, int k) {
     int padded_k = (k + 127) / 128 * 128;
@@ -22,21 +19,6 @@ __global__ void fp8_pad_weight(uint8_t* out, const uint8_t* weight, int n, int k
     if (i < size_t(n) * padded_k) out[i] = i % padded_k < k ? weight[(i / padded_k) * k + i % padded_k] : 0;
 }
 
-__global__ void fp8_quantize_rows(uint8_t* out, uint8_t* scales, const __nv_bfloat16* input,
-                                int m, int k, int stride) {
-    int lane = threadIdx.x % 32;
-    int padded_k = (k + 127) / 128 * 128;
-    int group = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    int row = group / (padded_k / 32), g = group % (padded_k / 32);
-    if (row >= ((m + 127) / 128) * 128) return;
-    float value = row < m && g * 32 + lane < k ? __bfloat162float(input[size_t(row) * stride + g * 32 + lane]) : 0.f;
-    float amax = fabsf(value);
-    for (int d = 16; d; d /= 2) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, d));
-    int exponent = max(-127, min(127, int(ceilf(log2f(fmaxf(amax, 1e-4f) / 448.f)))));
-    if (lane == 0) scales[mx_scale_offset(row, g, padded_k)] = row < m && g * 32 < k ? exponent + 127 : 0;
-    if (row < m) out[size_t(row) * padded_k + g * 32 + lane] =
-        __nv_cvt_float_to_fp8(ldexpf(value, -exponent), __NV_SATFINITE, __NV_E4M3);
-}
 }
 
 // Scratch belongs to the caller; no device allocation or weight transformation
@@ -77,8 +59,10 @@ extern "C" int glm_fp8_linear_lt(GlmCtx* ctx, void* output, const void* input,
         for (int g = 0; g < groups; ++g) {
             fp8_pack_scales<<<(((rows + 127) / 128) * 128 * (padded_k / 32) + 255) / 256, 256, 0, GLM_STREAM(ctx)>>>(
                 (uint8_t*)weight_scales, (const uint8_t*)scales + size_t(g) * (rows / 32) * (k / 32), rows, k);
-            fp8_quantize_rows<<<(((m + 127) / 128) * 128 * padded_k + 255) / 256, 256, 0, GLM_STREAM(ctx)>>>(
-                (uint8_t*)quantized, (uint8_t*)input_scales, (const __nv_bfloat16*)input + g * k, m, k, groups * k);
+            const size_t blocks = size_t((m + 127) / 128) * 128 * (padded_k / 32);
+            glm_quantize::quantize_fp8_kernel<true, true><<<(blocks + 63) / 64, 256, 0, GLM_STREAM(ctx)>>>(
+                (const __nv_bfloat16*)input + g * k, (uint8_t*)quantized, input_scales,
+                blocks, 32, m, k, groups * k);
             const uint8_t* w = (const uint8_t*)weight + size_t(g) * rows * k;
             if (k != padded_k) {
                 auto* padded = (uint8_t*)scratch + scratch_bytes;

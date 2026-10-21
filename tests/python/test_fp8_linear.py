@@ -12,15 +12,26 @@ def native(glm):
     return fn
 
 
-@pytest.mark.parametrize("m,n,k,groups", [(9, 160, 1280, 1), (129, 256, 512, 1), (17, 384, 256, 3), (33, 160, 288, 1)])
+@pytest.mark.parametrize("m,n,k,groups", [(9, 160, 1280, 1), (129, 256, 512, 1), (17, 384, 256, 3), (33, 160, 288, 1),
+                                          (1, 32, 32, 1), (127, 96, 96, 3), (65280, 32, 32, 1)])
 def test_fp8_cublaslt_quantized_oracle(glm, device, m, n, k, groups):
     torch.manual_seed(528)
     x = torch.randn(m, groups * k, device=device).bfloat16()
     x[0] = 0
     w = torch.randn(n, k, device=device).to(torch.float8_e4m3fn)
+    if m == 65280:
+        # Every finite BF16 encoding as the group maximum, including signed
+        # zero/subnormals and power-of-two scale boundaries of both signs.
+        codes = torch.arange(65536, device=device, dtype=torch.int32)
+        codes = codes[(codes & 0x7f80) != 0x7f80].to(torch.uint16)
+        x = codes.view(torch.bfloat16)[:, None].expand(-1, k).contiguous()
+        w.zero_()
     s = torch.randint(119, 131, (n // 32, k // 32), device=device, dtype=torch.uint8)
     blocks = x.double().reshape(m, groups, k // 32, 32)
-    scale = 2. ** torch.ceil(torch.log2(blocks.abs().amax(-1, keepdim=True).clamp_min(1e-4) / 448))
+    # frexp avoids CUDA log2 rounding exact powers just above an integer.
+    mantissa, exponent = torch.frexp(blocks.abs().amax(-1, keepdim=True).clamp_min(1e-4) / 448)
+    scale_exponent = exponent - (mantissa == .5).int()
+    scale = 2. ** scale_exponent.double()
     qx = ((blocks / scale).float().to(torch.float8_e4m3fn).double() * scale).reshape(m, groups, k)
     dw = w.double() * (2. ** (s.double() - 127)).repeat_interleave(32, 0).repeat_interleave(32, 1)
     expected = torch.einsum("mgk,gnk->mgn", qx, dw.reshape(groups, n // groups, k)).reshape(m, n).bfloat16()
@@ -37,6 +48,17 @@ def test_fp8_cublaslt_quantized_oracle(glm, device, m, n, k, groups):
     assert fn(glm.ctx, *[t.data_ptr() for t in (out, x, w, s, q, xs, ws, scratch)], m, n, k, groups) == 0
     torch.cuda.synchronize(device)
     torch.testing.assert_close(out, expected, atol=.005, rtol=.008)
+    # Scratch retains the final projection group's quantized input. Check exact
+    # bytes and all padded tiled scales, independently of GEMM tolerance.
+    expected_q = torch.zeros((m, pk), device=device, dtype=torch.uint8)
+    expected_q[:, :k] = (blocks[:, -1] / scale[:, -1]).float().to(torch.float8_e4m3fn).view(torch.uint8).reshape(m, k)
+    torch.testing.assert_close(q, expected_q, atol=0, rtol=0)
+    r = torch.arange(xs.shape[0], device=device)[:, None]
+    g = torch.arange(pk // 32, device=device)[None, :]
+    offsets = (r // 128) * (pk // 128) * 512 + (g // 4) * 512 + (r % 32) * 16 + ((r % 128) // 32) * 4 + g % 4
+    expected_scales = torch.zeros_like(xs)
+    expected_scales[:m, :k // 32] = (scale_exponent[:, -1, :, 0] + 127).to(torch.uint8)
+    torch.testing.assert_close(xs.flatten()[offsets], expected_scales, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("block,kind", [(128, 0), (32, 1)])
