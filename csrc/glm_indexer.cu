@@ -1622,6 +1622,10 @@ __global__ void dsv41_index_score_mma_kernel(
     }
 }
 
+static void launch_dsv41_prefill_scores(GlmCtx* ctx, void* out, const uint8_t* query, const uint8_t* keys,
+    const void* weights, const int32_t* positions, int capacity, int ratio, int tokens,
+    const int32_t* pages, const int32_t* batch_indices, int page_stride);
+
 void glm_dsv41_index_scores(GlmCtx* ctx, void* out, const uint8_t* query, const uint8_t* keys,
     const void* weights, const int32_t* positions, int capacity, int ratio, int tokens,
     const int32_t* pages, const int32_t* batch_indices, int page_stride) {
@@ -1629,6 +1633,11 @@ void glm_dsv41_index_scores(GlmCtx* ctx, void* out, const uint8_t* query, const 
     #define DSV41_SCORE(Q) dsv41_index_score_mma_kernel<Q><<<dim3((capacity + 63) / 64, (tokens + Q - 1) / Q), 256, 0, GLM_STREAM(ctx)>>>( \
         (__nv_bfloat16*)out, query, keys, (const __nv_bfloat16*)weights, positions, pages, batch_indices, page_stride, ratio, capacity, tokens)
     const char* tile = std::getenv("SLOPLLM_DSV41_INDEXER_QUERY_TILE");
+    if (tokens > 64 && !tile) {
+        launch_dsv41_prefill_scores(ctx, out, query, keys, weights, positions, capacity, ratio,
+            tokens, pages, batch_indices, page_stride);
+        return;
+    }
     if (tile && std::strcmp(tile, "1") && std::strcmp(tile, "4")) {
         fprintf(stderr, "SLOPLLM_DSV41_INDEXER_QUERY_TILE must be 1 or 4\n");
         std::abort();
@@ -2213,7 +2222,16 @@ idx_prefill_score_mma_kernel(
 // across a query tile and all 32 heads. Q_BATCH=2 preserves the pipelined
 // single-head staging path; larger batches keep several heads resident and
 // amortize block-wide synchronization across them.
-template <int TM, int TN, int WARPS, int Q_BATCH, bool FLAT, bool TMA_SWIZZLE = false>
+// Layout-specific metadata is independent of the shared tiling/MMA strategy.
+struct Dsv41IndexerLayout {
+    const int32_t* positions = nullptr;
+    const int32_t* batches = nullptr;
+    const __nv_bfloat16* weights = nullptr;
+    int page_stride = 0;
+    int ratio = 1;
+};
+
+template <int TM, int TN, int WARPS, int Q_BATCH, bool FLAT, bool TMA_SWIZZLE = false, bool DSV41 = false>
 __global__ void __launch_bounds__(WARPS * 32)
 idx_prefill_score_fp8_mma_kernel(
     __grid_constant__ CUtensorMap const kTensorMap,
@@ -2228,7 +2246,7 @@ idx_prefill_score_fp8_mma_kernel(
     const uint8_t* __restrict__ custom_mask,
     const int32_t* __restrict__ mask_indptr, const int32_t* __restrict__ mask_kv_len,
     int cpWorldSize, int cpRank, const int32_t* __restrict__ globalLastPageLen,
-    const int32_t* __restrict__ kvTokenIndptr)
+    const int32_t* __restrict__ kvTokenIndptr, Dsv41IndexerLayout dsv = {})
 {
     constexpr int CTA = WARPS * 32;
     constexpr int NUM_M = TM / 16;
@@ -2237,10 +2255,26 @@ idx_prefill_score_fp8_mma_kernel(
     static_assert(TN % (idxfp8::K_ROWS * WARPS) == 0);
     static_assert(Q_BATCH >= 2 && idxfp8::NHEADS % Q_BATCH == 0);
     static_assert(!TMA_SWIZZLE || (FLAT && TN == 256));
+    static_assert(!DSV41 || !FLAT, "DeepSeek gathered-key layout is not implemented yet");
 
+    // A mixed-sequence DeepSeek tile is processed in contiguous segments so
+    // each segment can reuse one K tile. Ordinary GLM executes this body once.
+    for (int segment = 0; segment < (DSV41 ? TM : 1);) {
     const int gy = blockIdx.y;
     int seq = -1, qStart = 0;
-    {
+    int dsvRows = 0, dsvKvLen = 0;
+    if constexpr (DSV41) {
+        qStart = gy * TM + segment;
+        if (qStart >= totalQ) return;
+        seq = dsv.batches ? dsv.batches[qStart] : 0;
+        dsvRows = min(TM - segment, totalQ - qStart);
+        for (int r = 0; r < dsvRows; ++r) {
+            if (dsv.batches && dsv.batches[qStart + r] != seq) { dsvRows = r; break; }
+            dsvKvLen = max(dsvKvLen, (dsv.positions[qStart + r] + 1) / dsv.ratio);
+        }
+        segment += dsvRows;
+    } else {
+        segment = 1;
         int acc = 0;
         for (int s = 0; ; s++) {
             const int qs = max(qoIndptr[s], qGlobalStart);
@@ -2261,13 +2295,13 @@ idx_prefill_score_fp8_mma_kernel(
         return;
     }
 
-    const int qoStart = qoIndptr[seq];
-    const int numQueries = qoIndptr[seq + 1] - qoStart;
-    const int mValid = min(TM, min(qoIndptr[seq + 1] - qGlobalStart, totalQ) - qStart);
-    const int pageStart = FLAT ? 0 : pageIndptr[seq];
-    const int numPages = FLAT ? 0 : pageIndptr[seq + 1] - pageStart;
+    const int qoStart = DSV41 ? qStart : qoIndptr[seq];
+    const int numQueries = DSV41 ? dsvRows : qoIndptr[seq + 1] - qoStart;
+    const int mValid = DSV41 ? dsvRows : min(TM, min(qoIndptr[seq + 1] - qGlobalStart, totalQ) - qStart);
+    const int pageStart = DSV41 ? seq * dsv.page_stride : FLAT ? 0 : pageIndptr[seq];
+    const int numPages = DSV41 || FLAT ? 0 : pageIndptr[seq + 1] - pageStart;
     const int flatStart = FLAT ? kvTokenIndptr[seq] : 0;
-    const int kvLen = FLAT
+    const int kvLen = DSV41 ? min(maxKv, dsvKvLen) : FLAT
         ? kvTokenIndptr[seq + 1] - flatStart
         : (numPages ? (numPages - 1) * pageSize + lastPageLen[seq] : 0);
     const int cpW = (cpWorldSize > 1 && globalLastPageLen) ? cpWorldSize : 1;
@@ -2275,16 +2309,26 @@ idx_prefill_score_fp8_mma_kernel(
         ? (numPages ? (numPages - 1) * pageSize * cpW + globalLastPageLen[seq] : 0)
         : kvLen;
     const int tileStart = blockIdx.x * TN;
-    if (tileStart >= kvLen) return;
+    if constexpr (DSV41) {
+        // DeepSeek selection consumes the full padded score matrix on replay.
+        for (int i = threadIdx.x; i < mValid * TN; i += CTA) {
+            const int pos = tileStart + i % TN;
+            if (pos < maxKv) scores[(size_t)(qStart + i / TN) * maxKv + pos] = __float2bfloat16(-INFINITY);
+        }
+        __syncthreads();
+        if (tileStart >= kvLen) continue;
+    } else if (tileStart >= kvLen) return;
 
     __shared__ int causalLimit[TM];
     for (int ql = threadIdx.x; ql < mValid; ql += CTA) {
-        causalLimit[ql] = idx_local_causal_limit(
+        causalLimit[ql] = DSV41 ? (dsv.positions[qStart + ql] + 1) / dsv.ratio - 1 : idx_local_causal_limit(
             qStart + ql - qoStart + qGlobalStart, numQueries, causal,
             kvLen, globalKvLen, cpW, cpRank);
     }
     __syncthreads();
-    if (tileStart > causalLimit[mValid - 1]) return;
+    if constexpr (!DSV41) {
+        if (tileStart > causalLimit[mValid - 1]) return;
+    }
 
     const uint8_t* mask = nullptr;
     int maskKv = 0, maskPrefix = 0;
@@ -2294,7 +2338,7 @@ idx_prefill_score_fp8_mma_kernel(
         maskPrefix = max(0, globalKvLen - maskKv);
     }
     const int cpMaskW = cpW > 1 ? cpW : 0;
-    if (blockIdx.x == 0) {
+    if (!DSV41 && blockIdx.x == 0) {
         for (int ql = threadIdx.x; ql < mValid; ql += CTA)
             rowLen[qStart + ql] = causalLimit[ql] + 1;
     }
@@ -2332,12 +2376,12 @@ idx_prefill_score_fp8_mma_kernel(
                 if constexpr (FLAT) {
                     rowId = (size_t)flatStart + pos;
                 } else {
-                    const int pageId = pageIndices[pageStart + pos / pageSize];
-                    rowId = (size_t)pageId * pageSize + pos % pageSize;
+                    const int pageId = pageIndices[pageStart + (DSV41 ? pos * dsv.ratio : pos) / pageSize];
+                    rowId = (size_t)pageId * pageSize + pos % (DSV41 ? pageSize / dsv.ratio : pageSize);
                 }
-                const uint8_t* row = kData + rowId * idxfp8::HD;
+                const uint8_t* row = kData + rowId * (DSV41 ? idxfp8::HD + sizeof(float) : idxfp8::HD);
                 value = *reinterpret_cast<const uint32_t*>(row + col);
-                if (col == 0) rowScale = kScaleData[rowId];
+                if (col == 0) rowScale = DSV41 ? *reinterpret_cast<const float*>(row + idxfp8::HD) : kScaleData[rowId];
             }
             *reinterpret_cast<uint32_t*>(sk + i) = value;
             if (col == 0) skScale[n] = rowScale;
@@ -2345,8 +2389,14 @@ idx_prefill_score_fp8_mma_kernel(
     }
     for (int i = threadIdx.x; i < TM * idxfp8::NHEADS; i += CTA) {
         const int ql = i / idxfp8::NHEADS, h = i % idxfp8::NHEADS;
-        sharedWeights[i] = ql < mValid
-            ? effectiveWeights[(size_t)(qStart + ql) * weightStride + h] : 0.f;
+        if constexpr (DSV41) {
+            const uint8_t* record = q8Data + (size_t)(qStart + ql) * q8Stride + h * 132;
+            sharedWeights[i] = ql < mValid ? float(dsv.weights[(size_t)(qStart + ql) * 32 + h])
+                * (*reinterpret_cast<const float*>(record + 128) / 64.f) : 0.f;
+        } else {
+            sharedWeights[i] = ql < mValid
+                ? effectiveWeights[(size_t)(qStart + ql) * weightStride + h] : 0.f;
+        }
     }
     if constexpr (TMA_SWIZZLE) {
         if (threadIdx.x == 0) idxfp8::mbarrier_wait(kBarrier);
@@ -2368,6 +2418,16 @@ idx_prefill_score_fp8_mma_kernel(
             acc[mi][ni] = {0.f, 0.f, 0.f, 0.f};
 
     auto issueQ = [&](int h, uint8_t* dst) {
+        if constexpr (DSV41) {
+            // Inline scales make head records only four-byte aligned.
+            for (int i = threadIdx.x * 4; i < TM * idxfp8::HD; i += CTA * 4) {
+                const int ql = i / idxfp8::HD, col = i % idxfp8::HD;
+                const uint8_t* src = q8Data + (size_t)(qStart + ql) * q8Stride + h * 132 + col;
+                uint8_t* qDst = dst + i;
+                if constexpr (TMA_SWIZZLE) qDst = const_cast<uint8_t*>(idxfp8::smem_row_ptr<true>(dst, ql, col));
+                *reinterpret_cast<uint32_t*>(qDst) = ql < mValid ? *reinterpret_cast<const uint32_t*>(src) : 0;
+            }
+        } else {
         for (int i = threadIdx.x * 16; i < TM * idxfp8::HD; i += CTA * 16) {
             const int ql = i / idxfp8::HD, col = i % idxfp8::HD;
             const uint8_t* src = q8Data + (size_t)(qStart + ql) * q8Stride
@@ -2377,6 +2437,7 @@ idx_prefill_score_fp8_mma_kernel(
                 qDst = const_cast<uint8_t*>(idxfp8::smem_row_ptr<true>(dst, ql, col));
             }
             idxmma::cp_async16(qDst, src, ql < mValid);
+        }
         }
     };
 
@@ -2528,6 +2589,25 @@ idx_prefill_score_fp8_mma_kernel(
             writeOne(q1, pos + 1, acc[mi][ni].x3);
         }
     }
+    if constexpr (DSV41) __syncthreads();
+    } // sequence segments
+}
+
+static void launch_dsv41_prefill_scores(GlmCtx* ctx, void* out, const uint8_t* query, const uint8_t* keys,
+    const void* weights, const int32_t* positions, int capacity, int ratio, int tokens,
+    const int32_t* pages, const int32_t* batch_indices, int page_stride) {
+    constexpr int TM = 64, TN = 288, WARPS = 12, Q_BATCH = 2;
+    constexpr size_t smem = TN * idxfp8::HD + TN * sizeof(float)
+        + Q_BATCH * TM * idxfp8::HD + TM * idxfp8::NHEADS * sizeof(float) + sizeof(uint64_t);
+    cudaFuncSetAttribute(idx_prefill_score_fp8_mma_kernel<TM, TN, WARPS, Q_BATCH, false, false, true>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    CUtensorMap unused{};
+    Dsv41IndexerLayout layout{positions, batch_indices, static_cast<const __nv_bfloat16*>(weights), page_stride, ratio};
+    idx_prefill_score_fp8_mma_kernel<TM, TN, WARPS, Q_BATCH, false, false, true>
+        <<<dim3((capacity + TN - 1) / TN, (tokens + TM - 1) / TM), WARPS * 32, smem, GLM_STREAM(ctx)>>>(
+            unused, static_cast<__nv_bfloat16*>(out), nullptr, query, 32 * 132, nullptr, 32,
+            keys, nullptr, pages, nullptr, nullptr, nullptr, tokens, 64, capacity, 1, 0,
+            nullptr, nullptr, nullptr, 0, 0, nullptr, nullptr, layout);
 }
 
 // ---------------------------------------------------------------------------

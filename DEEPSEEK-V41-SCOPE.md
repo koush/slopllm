@@ -141,11 +141,17 @@ then four rows per block. Draft routing uses 128 score threads through 2,048
 tokens, then four rows per block. Index scoring
 uses FP8 Tensor Core dot products with FP32 accumulation and weighted per-head
 ReLU, followed by BF16 score rounding before candidate selection and top-k.
-Small workloads use one query per CTA; larger workloads reuse a 64-key tile
-across four queries, with independent compressed causal bounds for each query.
-Mixed-sequence query tiles reload keys per query. Dispatch uses
-query count and compressed key capacity; `SLOPLLM_DSV41_INDEXER_QUERY_TILE=1|4`
-overrides it for kernel comparisons.
+More than 64 queries use a DeepSeek paged-layout specialization of GLM's FP8
+prefill scorer: 64 query tokens by 288 keys, 12 warps, and two head-staging
+buffers. FP8 MMA, weighted ReLU accumulation and BF16 output share GLM's compute
+body. Inline query/key scales and compressed page/causal addressing are specialized;
+mixed-sequence tiles run contiguous sequence segments with independent bounds.
+Every padded score is refreshed to negative infinity on replay. Head accumulation
+uses GLM's order, so scores at BF16 rounding boundaries may differ from the
+small-query reduction order within the existing numerical tolerance.
+Small workloads retain the one/four-query, 64-key scorer. The existing
+`SLOPLLM_DSV41_INDEXER_QUERY_TILE=1|4` override selects that scorer for comparisons.
+DeepSeek does not yet supply the gathered-key layout needed by the TMA path.
 
 For at most eight query rows and compressed key capacities of at least 32,768,
 decode scoring can use an occupancy-bounded grid-stride launch. Each CTA retains
