@@ -310,6 +310,7 @@ __device__ __forceinline__ uint32_t fp8_scale_to_bf16x2(uint8_t scale) {
     return high | (high << 16);
 }
 
+template <bool MXFP4 = false>
 __device__ __forceinline__ void direct_dequant_b_regs(
     uint32_t regB_0, uint32_t regB_1, uint32_t sfb_packed, uint32_t s2_pair,
     int sub_ks, int t0, int t1, uint32_t& b_reg_0, uint32_t& b_reg_1) {
@@ -321,13 +322,23 @@ __device__ __forceinline__ void direct_dequant_b_regs(
     uint32_t src1 = __shfl_sync(0xffffffff, (k1 & 32) ? regB_1 : regB_0, src_lane1);
     uint8_t packed0 = (src0 >> (4 * (k0 & 7))) & 0xff;
     uint8_t packed1 = (src1 >> (4 * (k1 & 7))) & 0xff;
-    uint32_t scale_pair = fp8_scale_to_bf16x2((sfb_packed >> (8 * sub_ks)) & 0xff);
+    const uint8_t scale = (sfb_packed >> (8 * sub_ks)) & 0xff;
+    uint32_t scale_pair;
+    if constexpr (MXFP4) {
+        // E8M0: code zero is 2^-127, code 255 is NaN.
+        const uint32_t bits = scale == 255 ? 0x7fc0u : scale == 0 ? 0x0040u : uint32_t(scale) << 7;
+        scale_pair = bits | (bits << 16);
+    } else {
+        scale_pair = fp8_scale_to_bf16x2(scale);
+    }
     uint32_t fp4_0 = fp4x2_to_bf16x2(packed0);
     uint32_t fp4_1 = fp4x2_to_bf16x2(packed1);
     asm("mul.rn.bf16x2 %0,%1,%2;" : "=r"(b_reg_0) : "r"(fp4_0), "r"(scale_pair));
     asm("mul.rn.bf16x2 %0,%1,%2;" : "=r"(b_reg_1) : "r"(fp4_1), "r"(scale_pair));
-    asm("mul.rn.bf16x2 %0,%1,%2;" : "=r"(b_reg_0) : "r"(b_reg_0), "r"(s2_pair));
-    asm("mul.rn.bf16x2 %0,%1,%2;" : "=r"(b_reg_1) : "r"(b_reg_1), "r"(s2_pair));
+    if constexpr (!MXFP4) {
+        asm("mul.rn.bf16x2 %0,%1,%2;" : "=r"(b_reg_0) : "r"(b_reg_0), "r"(s2_pair));
+        asm("mul.rn.bf16x2 %0,%1,%2;" : "=r"(b_reg_1) : "r"(b_reg_1), "r"(s2_pair));
+    }
 }
 
 template <int SPLIT_K>
@@ -344,7 +355,7 @@ __device__ __forceinline__ void store_coop_output(__nv_bfloat16* output, float* 
 }
 
 template <int TM, int TN, int DEPTH, int NWARPS, int MaxExperts, bool SPLIT_M,
-          int TK = 32, bool DIRECT_DEQUANT = false, bool HYBRID = false, int SPLIT_K = 1>
+          int TK = 32, bool DIRECT_DEQUANT = false, bool HYBRID = false, int SPLIT_K = 1, bool MXFP4 = false>
 // The 128x128/four-warp tile needs 128 accumulator registers per thread.
 // Requiring four resident CTAs caps the whole thread at 128 registers, spilling
 // the accumulators. Two CTAs leave room for staging/dequantization registers.
@@ -479,9 +490,11 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
         if (m_valid <= 0 || n_valid <= 0) continue;
 
         const __nv_bfloat16* expert_input = HYBRID ? sorted_input : sorted_input + (size_t)expert_offsets[expert_id] * K;
-        const uint8_t* wbase = reinterpret_cast<const uint8_t* const*>(weight_ptrs)[expert_id];
-        const __nv_fp8_e4m3* scale_base = reinterpret_cast<const __nv_fp8_e4m3* const*>(scale_ptrs)[expert_id];
-        float scale_2_val = *reinterpret_cast<const float* const*>(scale2_ptrs)[expert_id];
+        static_assert(!MXFP4 || DIRECT_DEQUANT, "MXFP4 requires direct dequantization");
+        const uint8_t* wbase = reinterpret_cast<const uint8_t* const*>(weight_ptrs)[expert_id * (MXFP4 ? 2 : 1)];
+        const __nv_fp8_e4m3* scale_base = reinterpret_cast<const __nv_fp8_e4m3* const*>(scale_ptrs)[expert_id * (MXFP4 ? 2 : 1)];
+        float scale_2_val = 1.0f;
+        if constexpr (!MXFP4) scale_2_val = *reinterpret_cast<const float* const*>(scale2_ptrs)[expert_id];
         uint16_t s2_u16;
         asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(s2_u16) : "f"(scale_2_val));
         uint32_t s2_pair = (uint32_t)s2_u16 | ((uint32_t)s2_u16 << 16);
@@ -546,6 +559,20 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
                 }
                 // --- stage scales (first DEPTH k-steps of each batch) ---
                 if (ks < DEPTH) {
+                  if constexpr (MXFP4) {
+                    // Keep the pipeline indexed in 16-element MMA slices. Duplicate
+                    // each native group-32 scale only in shared memory.
+                    for (int i = tid; i < TN * batch_size; i += CTA_THREADS) {
+                        const int n = i / batch_size, b = i % batch_size;
+                        if (n_start + n < N) {
+                            const auto* scales = reinterpret_cast<const uint8_t*>(scale_base);
+                            const uint8_t value = scales[(size_t)(n_start + n) * (K / 32)
+                                + (k_group_begin + k_group_batch + b) / 2];
+                            reinterpret_cast<uint8_t*>(smem->scale_batch[buf])[
+                                n * SCALE_BATCH + (b ^ (((n >> 2) & 1) * 16))] = value;
+                        }
+                    }
+                  } else {
                     int batch_16b = batch_size / 16;
                     int total_16b = TN * batch_16b;
                     for (int i = tid; i < total_16b; i += CTA_THREADS) {
@@ -572,8 +599,8 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
                             }
                         }
                     }
+                  }
                 }
-
                 cp_async_commit();
 
                 // --- compute on the oldest completed buffer ---
@@ -609,7 +636,7 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
                         for (int sub_ks = 0; sub_ks < KGPS; sub_ks++) {
                             uint32_t b_reg_0, b_reg_1;
                             if constexpr (DIRECT_DEQUANT) {
-                                direct_dequant_b_regs(regB_0, regB_1, sfb_packed, s2_pair,
+                                direct_dequant_b_regs<MXFP4>(regB_0, regB_1, sfb_packed, s2_pair,
                                                       sub_ks, t0, t1, b_reg_0, b_reg_1);
                             } else {
                                 int shift = sub_ks * QUANT_GROUP;
@@ -705,7 +732,7 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
                 for (int sub_ks = 0; sub_ks < KGPS; sub_ks++) {
                     uint32_t b_reg_0, b_reg_1;
                     if constexpr (DIRECT_DEQUANT) {
-                        direct_dequant_b_regs(regB_0, regB_1, sfb_packed, s2_pair,
+                        direct_dequant_b_regs<MXFP4>(regB_0, regB_1, sfb_packed, s2_pair,
                                               sub_ks, t0, t1, b_reg_0, b_reg_1);
                     } else {
                         int shift = sub_ks * QUANT_GROUP;
@@ -800,7 +827,7 @@ coop_moe_kernel(const __nv_bfloat16* __restrict__ sorted_input,
 }
 
 template <int TM, int TN, int DEPTH, int NWARPS, int MaxExperts, bool SPLIT_M,
-          int TK = 32, bool DIRECT_DEQUANT = false>
+          int TK = 32, bool DIRECT_DEQUANT = false, bool MXFP4 = false>
 static void launch_coop(GlmCtx* ctx, int num_experts, int N,
                         const __nv_bfloat16* sorted_input, __nv_bfloat16* output, int K,
                         const void* const* weight_ptrs, const void* const* scale_ptrs,
@@ -817,9 +844,9 @@ static void launch_coop(GlmCtx* ctx, int num_experts, int N,
     int cta_per_sm = cta_from_smem < cta_from_threads ? cta_from_smem : cta_from_threads;
     if (cta_per_sm < 1) cta_per_sm = 1;
     int grid = num_SMs * cta_per_sm;
-    cudaFuncSetAttribute((void*)coop_moe_kernel<TM, TN, DEPTH, NWARPS, MaxExperts, SPLIT_M, TK, DIRECT_DEQUANT>,
+    cudaFuncSetAttribute((void*)coop_moe_kernel<TM, TN, DEPTH, NWARPS, MaxExperts, SPLIT_M, TK, DIRECT_DEQUANT, false, 1, MXFP4>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    coop_moe_kernel<TM, TN, DEPTH, NWARPS, MaxExperts, SPLIT_M, TK, DIRECT_DEQUANT><<<grid, NWARPS * 32, smem, stream>>>(
+    coop_moe_kernel<TM, TN, DEPTH, NWARPS, MaxExperts, SPLIT_M, TK, DIRECT_DEQUANT, false, 1, MXFP4><<<grid, NWARPS * 32, smem, stream>>>(
         sorted_input, output, K, weight_ptrs, scale_ptrs, scale2_ptrs,
         expert_offsets, num_experts, N, tile_counter, sorted_to_original);
 }
@@ -1078,11 +1105,14 @@ size_t glm_mma_moe_coop_workspace_size(int count, int N, int K, int num_experts)
     return sorted_input + expert_counts + expert_offsets + sorted_to_original + tile_counter;
 }
 
-void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output, const void* input,
+} // extern "C"
+
+template <bool MXFP4>
+static void fp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output, const void* input,
                                            const void* const* weight_ptrs, const void* const* scale_ptrs,
                                            const void* const* scale2_ptrs, const int* expert_ids,
                                            int top_k, int count, int N, int K, int num_experts,
-                                           void* workspace) {
+                                            void* workspace) {
     cudaSetDevice(ctx->device_id);
     cudaStream_t stream = GLM_STREAM(ctx);
     if (count == 0 || N == 0 || K == 0) return;
@@ -1107,11 +1137,31 @@ void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output, const void
     // The following GEMM runs after every restore CTA completes on this stream.
     restore_offsets_kernel<<<grid, block, 0, stream>>>(expert_offsets, expert_counts, num_experts, tile_counter);
 
+    if constexpr (MXFP4) {
+        launch_coop<128, 128, 2, 4, 512, false, 32, true, true>(ctx, num_experts, N,
+            sorted_input, reinterpret_cast<__nv_bfloat16*>(output), K,
+            weight_ptrs, scale_ptrs, nullptr, expert_offsets, tile_counter, stream, sorted_to_original);
+        return;
+    }
     launch_coop_configured(ctx, num_experts, N, sorted_input, reinterpret_cast<__nv_bfloat16*>(output), K,
                            weight_ptrs, scale_ptrs, scale2_ptrs, expert_offsets, tile_counter, stream, sorted_to_original);
 }
 
 // ---------------------------------------------------------------------------
+extern "C" {
+
+void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output, const void* input,
+    const void* const* weights, const void* const* scales, const void* const* global_scales,
+    const int* ids, int top_k, int count, int N, int K, int experts, void* workspace, bool mxfp4) {
+    if (mxfp4) {
+        fp4_mul_mat_id_grouped_mma_coop<true>(ctx, output, input, weights, scales, nullptr,
+            ids, top_k, count, N, K, experts, workspace);
+    } else {
+        fp4_mul_mat_id_grouped_mma_coop<false>(ctx, output, input, weights, scales, global_scales,
+            ids, top_k, count, N, K, experts, workspace);
+    }
+}
+
 // Split MoE coop: scatter once, run GEMM multiple times with different weights
 // (e.g. gate + up share the same scatter). The GEMM kernel writes directly to
 // the final output buffer via sorted_to_original lookup (no unscatter step).

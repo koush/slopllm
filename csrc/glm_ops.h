@@ -1060,6 +1060,7 @@ void glm_bf16_mul_mat_id_grouped_mma(GlmCtx* ctx, void* output, const void* inpu
 // Uses TM=64, TN=128, DEPTH=2, NWARPS=2 by default (SLOPLLM_COOP_CONFIG env override).
 size_t glm_mma_moe_coop_workspace_size(int count, int N, int K, int num_experts);
 
+// MXFP4 uses stride-two interleaved weight/scale pointer views and no scale2.
 void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output,
                                             const void* input,
                                             const void* const* weight_ptrs,
@@ -1067,7 +1068,7 @@ void glm_nvfp4_mul_mat_id_grouped_mma_coop(GlmCtx* ctx, void* output,
                                             const void* const* scale2_ptrs,
                                             const int* expert_ids, int top_k,
                                             int count, int N, int K,
-                                            int num_experts, void* workspace);
+                                            int num_experts, void* workspace, bool mxfp4 = false);
 
 // Split MoE coop: scatter once, then optionally keep GEMM outputs expert-sorted.
 size_t glm_moe_hybrid_workspace_size(int count, int N);

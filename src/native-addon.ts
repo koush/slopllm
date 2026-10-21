@@ -221,7 +221,7 @@ export interface NativeAddon {
   nvfp4MulMatIdReduce(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, routingWeights: number, numRows: number): void;
   mmaMoeWorkspaceSize(count: number, N: number, K: number, numExperts: number): number;
   mmaMoeCoopWorkspaceSize(count: number, N: number, K: number, numExperts: number): number;
-  nvfp4MulMatIdGroupedMmaCoop(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number): void;
+  nvfp4MulMatIdGroupedMmaCoop(ctx: number, output: number, input: number, weightPtrs: number, scalePtrs: number, scale2Ptrs: number, expertIds: number, topK: number, count: number, N: number, K: number, numExperts: number, workspace: number, mxfp4?: boolean): void;
   // Includes reusable FP32 split-K partials. Each MMA invocation must be
   // followed by moeHybridMmaReduce on the same stream before reusing them.
   moeHybridWorkspaceSize(count: number, N: number): number;

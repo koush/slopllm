@@ -1546,6 +1546,11 @@ static Napi::Value Nvfp4MulMatIdGroupedMmaCoop(const Napi::CallbackInfo& info) {
     int K = info[10].As<Napi::Number>().Int32Value();
     int num_experts = info[11].As<Napi::Number>().Int32Value();
     uintptr_t ws_ptr = info[12].As<Napi::Number>().Int64Value();
+    const bool mxfp4 = info.Length() > 13 && info[13].As<Napi::Boolean>().Value();
+    if (mxfp4 && (num_experts < 1 || num_experts > 512 || K <= 0 || K % 32)) {
+        Napi::TypeError::New(env, "Invalid grouped MXFP4 geometry").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
     glm_nvfp4_mul_mat_id_grouped_mma_coop(reinterpret_cast<GlmCtx*>(ctx_ptr),
                                            reinterpret_cast<void*>(out_ptr),
                                            reinterpret_cast<const void*>(in_ptr),
@@ -1554,7 +1559,7 @@ static Napi::Value Nvfp4MulMatIdGroupedMmaCoop(const Napi::CallbackInfo& info) {
                                            reinterpret_cast<const void* const*>(s2ptrs_ptr),
                                            reinterpret_cast<const int*>(eids_ptr),
                                            top_k, count, N, K, num_experts,
-                                           reinterpret_cast<void*>(ws_ptr));
+                                           reinterpret_cast<void*>(ws_ptr), mxfp4);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         Napi::Error::New(env, std::string("nvfp4MulMatIdGroupedMmaCoop failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();

@@ -135,11 +135,11 @@ def test_grouped_moe_resets_dirty_counters(glm, device, mode):
             size.argtypes, size.restype = [integer] * 4, ctypes.c_size_t
             workspace = torch.empty(size(count, n, k, experts), dtype=torch.uint8, device=device)
             launch = glm.lib.glm_nvfp4_mul_mat_id_grouped_mma_coop
-            launch.argtypes, launch.restype = [vp] * 7 + [integer] * 5 + [vp], None
+            launch.argtypes, launch.restype = [vp] * 7 + [integer] * 5 + [vp, ctypes.c_bool], None
 
             def run():
                 launch(glm.ctx, output.data_ptr(), x.data_ptr(), *(p.data_ptr() for p in pointers),
-                       ids.data_ptr(), topk, count, n, k, experts, workspace.data_ptr())
+                       ids.data_ptr(), topk, count, n, k, experts, workspace.data_ptr(), False)
             scratch = [workspace]
         else:
             size = glm.lib.glm_mma_moe_coop_scatter_workspace_size

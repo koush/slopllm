@@ -784,7 +784,15 @@ export class GlmTensor extends Tensor {
         table.writePointers(pointers);
       }
       const out = this.workspace.alloc([count, N], "BF16");
-      getNativeAddon().mxfp4MulMatId(this.ops.ctx, out.data, this.data, table.data, expertIds.data, topK, count, N, K);
+      if (count > NVFP4_MUL_MAT_ID_GROUPED_THRESHOLD && weights.length <= 512) {
+        const addon = getNativeAddon();
+        using scratch = this.workspace.allocRaw(addon.mmaMoeCoopWorkspaceSize(count, N, K, weights.length));
+        // Native MXFP4 tables interleave weight and scale pointers.
+        addon.nvfp4MulMatIdGroupedMmaCoop(this.ops.ctx, out.data, this.data, table.data, table.data + 8,
+          0, expertIds.data, topK, count, N, K, weights.length, scratch.data, true);
+      } else {
+        getNativeAddon().mxfp4MulMatId(this.ops.ctx, out.data, this.data, table.data, expertIds.data, topK, count, N, K);
+      }
       return out;
     }
     if (weights[0]?.type !== "BF16" && weights[0]?.type !== "U8_NVFP4") {
