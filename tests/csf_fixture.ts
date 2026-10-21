@@ -265,7 +265,7 @@ export function buildCsfFixture(root: string): CsfFixture {
       return sum + tensor.data.length;
     }, 0),
     source: "/fixture/source/snapshot",
-    source_model_id: "local-inference-lab/GLM-5.3-NVFP4",
+    source_model_id: "local-inference-lab/GLM-5.3-NVFP4-CSF",
     source_revision: "b472e4ee53f6a9862da5486c56c6ca21be3dab70",
     source_index_sha256: sha256(Buffer.from(metadataFiles["model.safetensors.index.json"], "utf-8")),
     source_index_size_semantics: "safetensors_files",
@@ -276,7 +276,7 @@ export function buildCsfFixture(root: string): CsfFixture {
     ...identity,
     compressed_scale_count: compressedScales.length,
     source: "/fixture/source/snapshot",
-    source_model_id: "local-inference-lab/GLM-5.3-NVFP4",
+    source_model_id: "local-inference-lab/GLM-5.3-NVFP4-CSF",
     source_revision: "b472e4ee53f6a9862da5486c56c6ca21be3dab70",
     source_index_sha256: sha256(Buffer.from(metadataFiles["model.safetensors.index.json"], "utf-8")),
     source_index_size_semantics: "safetensors_files",
