@@ -23,6 +23,8 @@ it("V4.1 text prompts match the reference role transitions and thinking prefixes
   const history = [{ role: "user", content: "Hi" }, { role: "assistant", content: "Hello", reasoning_content: "discard me" },
     { role: "user", content: "Part one" }, { role: "user", content: [{ type: "text", text: "Part two" }, { type: "text", text: "Part three" }] }];
   assert.equal(render(history, { reasoning_effort: 1 }), bos + "<｜System｜>Reasoning Effort: 1 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+    + "<｜User｜>Hi<｜Assistant｜><think>discard me</think>Hello" + eos + "<｜User｜>Part one\n\nPart two\n\nPart three<｜Assistant｜><think>");
+  assert.equal(render(history, { reasoning_effort: 1, drop_thinking: true }), bos + "<｜System｜>Reasoning Effort: 1 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
     + "<｜User｜>Hi<｜Assistant｜></think>Hello" + eos + "<｜User｜>Part one\n\nPart two\n\nPart three<｜Assistant｜><think>");
 });
 
@@ -60,6 +62,34 @@ it("V4.1 renders tool schemas, typed call history, and results in call order", (
   assert.ok(prompt.includes(parameter("count", "2", false)));
   assert.ok(prompt.includes(invoke("clock", "") + "\n</｜DSML｜ calls>" + eos));
   assert.ok(prompt.endsWith("<｜User｜><tool_result>Sunny</tool_result>\n\n<tool_result>12:00</tool_result><｜Assistant｜></think>"));
+});
+
+it("V4.1 tool results preserve current-turn reasoning when dropping earlier thinking", () => {
+  const history = [
+    { role: "user", content: "Previous question" },
+    { role: "assistant", content: "Previous answer", reasoning_content: "Old reasoning" },
+    { role: "user", content: "Find the bug" },
+    { role: "assistant", content: null, reasoning_content: "Read main first", tool_calls: [
+      { id: "a", type: "function", function: { name: "read_file", arguments: { path: "main.ts" } } },
+    ] },
+    { role: "tool", tool_call_id: "a", content: "Main file contents" },
+    { role: "assistant", content: null, reasoning_content: "Check the helper next", tool_calls: [
+      { id: "b", type: "function", function: { name: "read_file", arguments: { path: "helper.ts" } } },
+    ] },
+    { role: "tool", tool_call_id: "b", content: "Helper file contents" },
+  ];
+  const options = { drop_thinking: true };
+  const prompt = render(history, options);
+  assert.ok(!prompt.includes("Old reasoning"));
+  assert.ok(prompt.includes("<｜User｜>Find the bug<｜Assistant｜><think>Read main first</think>"));
+  assert.ok(prompt.includes("<tool_result>Main file contents</tool_result><｜Assistant｜><think>Check the helper next</think>"));
+  assert.ok(prompt.endsWith("<tool_result>Helper file contents</tool_result><｜Assistant｜><think>"));
+  for (const role of ["user", "system"]) {
+    const nextTurn = render([...history, { role, content: "Now fix it" }], options);
+    assert.ok(!nextTurn.includes("Read main first"));
+    assert.ok(!nextTurn.includes("Check the helper next"));
+    assert.ok(nextTurn.endsWith("Now fix it<｜Assistant｜><think>"));
+  }
 });
 
 describe("V4.1 tool parser", () => {

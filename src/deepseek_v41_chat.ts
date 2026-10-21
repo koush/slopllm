@@ -42,7 +42,7 @@ export const DEEPSEEK_V41_CHAT_TEMPLATE = `
       {%- if reply not in group.ordered -%}{%- set group.ordered = group.ordered + [reply] -%}{%- endif -%}
     {%- endfor -%}
     {%- for reply in group.ordered -%}
-      {%- set normalized.messages = normalized.messages + [{'role': 'user', 'content': '<tool_result>' + text(reply['content']) + '</tool_result>'}] -%}
+      {%- set normalized.messages = normalized.messages + [{'role': 'user', 'content': '<tool_result>' + text(reply['content']) + '</tool_result>', 'tool_result_only': true}] -%}
     {%- endfor -%}
   {%- endif -%}
 {%- endfor -%}
@@ -60,7 +60,7 @@ export const DEEPSEEK_V41_CHAT_TEMPLATE = `
 {%- else -%}{{ raise_exception('Invalid V4.1 reasoning_effort') }}{%- endif -%}
 {%- set last = namespace(user=-1) -%}
 {%- for message in messages -%}
-  {%- if message['role'] == 'user' or (message['role'] == 'system' and not loop.first) -%}{%- set last.user = loop.index0 -%}{%- endif -%}
+  {%- if (message['role'] == 'user' and not message['tool_result_only']) or (message['role'] == 'system' and not loop.first) -%}{%- set last.user = loop.index0 -%}{%- endif -%}
 {%- endfor -%}
 {{- bos_token -}}
 {%- if enabled -%}{{ '<｜System｜>Reasoning Effort: ' + (budget | string) + ' (range 1-100, the higher the value, the more thorough the reasoning)\n\n' }}{%- endif -%}
@@ -76,7 +76,7 @@ export const DEEPSEEK_V41_CHAT_TEMPLATE = `
   {%- elif role == 'user' -%}
     {%- if not loop.first and messages[loop.index0 - 1]['role'] == 'user' -%}{{ '\n\n' }}{%- else -%}{{ '<｜User｜>' }}{%- endif -%}
   {%- elif role == 'assistant' -%}
-    {%- if enabled and (not (drop_thinking | default(true)) or loop.index0 > last.user) -%}{{ (message['reasoning_content'] | default('', true)) + '</think>' }}{%- endif -%}
+    {%- if enabled and (not (drop_thinking | default(false)) or loop.index0 > last.user) -%}{{ (message['reasoning_content'] | default('', true)) + '</think>' }}{%- endif -%}
   {%- else -%}{{ raise_exception('Unsupported V4.1 text message role: ' + role) }}{%- endif -%}
   {{- text(message['content']) -}}
   {%- if role == 'system' and loop.first and tools -%}{{ '\n\n' + tool_prompt(tools) }}{%- endif -%}
@@ -100,7 +100,7 @@ export const DEEPSEEK_V41_CHAT_TEMPLATE = `
   {%- if role == 'assistant' and not (loop.last and (continue_final_message | default(false))) -%}{{ eos_token }}{%- endif -%}
   {%- if (role == 'user' or (role == 'system' and not loop.first)) and ((loop.last and add_generation_prompt) or (not loop.last and messages[loop.index0 + 1]['role'] == 'assistant')) -%}
     {{- '<｜Assistant｜>' -}}
-    {%- if enabled and (not (drop_thinking | default(true)) or loop.index0 >= last.user) -%}{{ '<think>' }}{%- else -%}{{ '</think>' }}{%- endif -%}
+    {%- if enabled and (not (drop_thinking | default(false)) or loop.index0 >= last.user) -%}{{ '<think>' }}{%- else -%}{{ '</think>' }}{%- endif -%}
   {%- endif -%}
 {%- endfor -%}`;
 

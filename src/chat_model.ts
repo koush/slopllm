@@ -134,12 +134,20 @@ export function loadMaxPositionEmbeddings(modelDir: string): number | undefined 
   return typeof config.max_position_embeddings === "number" ? config.max_position_embeddings : undefined;
 }
 
-export function loadGenerationConfig(modelDir: string): GenerationConfig {
+export function loadGenerationConfig(modelDir: string, defaults?: GenerationConfig): GenerationConfig {
   const readJson = (filename: string): Record<string, unknown> => {
     const filePath = path.join(modelDir, filename);
     return fs.existsSync(filePath) ? JSON.parse(fs.readFileSync(filePath, "utf-8")) : {};
   };
-  const raw = { ...readJson("config.json"), ...readJson("generation_config.json") } as Record<string, any>;
+  const raw = {
+    temperature: defaults?.temperature,
+    top_p: defaults?.topP,
+    top_k: defaults?.topK,
+    repetition_penalty: defaults?.repetitionPenalty,
+    max_new_tokens: defaults?.maxNewTokens,
+    ...readJson("config.json"),
+    ...readJson("generation_config.json"),
+  } as Record<string, any>;
   return {
     temperature: typeof raw.temperature === "number" ? raw.temperature : undefined,
     topP: typeof raw.top_p === "number" ? raw.top_p : undefined,
@@ -160,6 +168,7 @@ export interface ChatTemplateKwargs {
 export abstract class ChatModel extends WorkspaceBase {
   abstract readonly eosIds: Set<number>;
   abstract readonly cfg: CommonModelConfig;
+  readonly generationConfig?: GenerationConfig;
   tokenizer!: Tokenizer;
 
   constructor(ops: DeviceOps) {
@@ -759,7 +768,7 @@ export abstract class ChatModel extends WorkspaceBase {
         .replace(/\.(\d+)\b/g, "[$1]");
     }
     this.cfg.maxPositionEmbeddings = loadMaxPositionEmbeddings(configDir);
-    this.cfg.generationConfig = loadGenerationConfig(configDir);
+    this.cfg.generationConfig = loadGenerationConfig(configDir, this.generationConfig);
     await this.initializeConstants();
     this.freeze();
   }

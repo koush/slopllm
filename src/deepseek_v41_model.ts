@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { ChatModel, type ChatCache, type CommonModelConfig, type TokenSelector, type ChunkedPrefillPlan, type ChatTemplateKwargs, type MtpDecodeStepResult } from "./chat_model";
+import { ChatModel, type ChatCache, type CommonModelConfig, type GenerationConfig, type TokenSelector, type ChunkedPrefillPlan, type ChatTemplateKwargs, type MtpDecodeStepResult } from "./chat_model";
 import { resolveCheckpointConfigDir, type CheckpointTensor } from "./checkpoint_source";
 import { type DeviceOps, TensorParallelism } from "./device_ops";
 import type { ExecutionState, ExecutionWorkspace } from "./execution-workspace";
@@ -221,6 +221,13 @@ export function loadDeepseekV41Config(dir: string): DeepseekV41Config {
 
 /** Checkpoint-native text weights with explicit MXFP4 and E8M0 storage types. */
 export class DeepseekV41Model extends ChatModel {
+  // https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference
+  override readonly generationConfig: GenerationConfig = {
+    temperature: 1,
+    topP: 1,
+    topK: -1,
+    maxNewTokens: 262144,
+  };
   protected readonly loadSyncInterval = 1024;
   readonly eosIds: Set<number>;
   readonly sourceMetadata = new Map<string, TensorMeta>();

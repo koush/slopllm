@@ -421,7 +421,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const model = await loadModel(ops, args, modelDir);
   const maxModelLen = model.cfg.maxPositionEmbeddings ?? loadMaxPositionEmbeddings(modelDir) ?? args.chunkSize;
   model.cfg.maxPositionEmbeddings = maxModelLen;
-  const generationConfig = model.cfg.generationConfig ?? loadGenerationConfig(modelDir);
+  const generationConfig = model.cfg.generationConfig ?? loadGenerationConfig(modelDir, model.generationConfig);
   model.cfg.generationConfig = generationConfig;
   if (!argv.includes("--temperature") && generationConfig.temperature !== undefined) args.temperature = generationConfig.temperature;
   if (!argv.includes("--top-p") && generationConfig.topP !== undefined) args.topP = generationConfig.topP;
