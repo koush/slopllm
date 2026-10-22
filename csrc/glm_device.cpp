@@ -141,13 +141,16 @@ void* glm_mmap_open(const char* path) {
     void* ptr = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
 
-    // madvise the full length
-    madvise(ptr, size, MADV_SEQUENTIAL | MADV_WILLNEED);
-
     if (ptr == MAP_FAILED) {
         fprintf(stderr, "glm_mmap_open: mmap failed for %s (size=%llu)\n", path, (unsigned long long)size);
         return nullptr;
     }
+
+    // madvise takes a single advice value, not flags. Apply both separately:
+    // SEQUENTIAL sets the read-ahead/drop-behind policy, WILLNEED starts the
+    // readahead for the copy loop.
+    madvise(ptr, size, MADV_SEQUENTIAL);
+    madvise(ptr, size, MADV_WILLNEED);
 
     return ptr;
 }

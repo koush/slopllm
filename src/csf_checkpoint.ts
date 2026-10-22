@@ -13,6 +13,7 @@ import {
   fixedStreamLength,
   nvfp4ScaleGeometry,
   requireLocalSafetensorsName,
+  type CsfScaleCodec,
 } from "./csf_codec";
 import { SafeTensorFile, type TensorMeta } from "./safetensors";
 import { MXFP4_CSF_SCHEMA, MXFP4_CSF_CODEC, mxfp4FixedStreamLength,
@@ -461,7 +462,8 @@ export function readCsfContract(root: string): CsfOpenResult {
 
 /**
  * Logical reads and compressed-plane access over a validated CSF container.
- * NVFP4 loaders may consume the planes directly; MXFP4 loads expanded bytes.
+ * Loaders consume the planes for GPU expansion; readTensor expands on the
+ * host for tests, slicing, and source reconstruction.
  */
 export class CsfContainer {
   readonly contract: CsfContract;
@@ -543,6 +545,7 @@ export class CsfContainer {
     const st = this.handle(located.file);
     const [rows, columns] = entry.record.shape;
     return {
+      codec: (this.contract.codec === MXFP4_CSF_CODEC ? "mxfp4" : "nvfp4") as CsfScaleCodec,
       rows, columns,
       file: located.file,
       fixedOffset: st.tensorOffset(entry.fixedName),

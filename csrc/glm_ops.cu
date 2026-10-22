@@ -1385,6 +1385,23 @@ __global__ void csf_expand_kernel(uint8_t* out, const uint8_t* fixed, int32_t* s
     out[i] = base + ((packed >> (4 * (col % 2))) & 15);
 }
 
+// MXFP4 checkpoint scales: 16 row bases followed by one bit per column,
+// packed row-major per 16-row slab. The reconstructed byte wraps in [0,255];
+// unlike NVFP4 E4M3 scales it has no restricted value range.
+__global__ void csf_mxfp4_expand_kernel(uint8_t* out, const uint8_t* fixed,
+    int columns, int row_offset, int column_offset, int out_rows, int out_columns) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= int64_t(out_rows) * out_columns) return;
+    const int row = row_offset + i / out_columns;
+    const int col = column_offset + i % out_columns;
+    const int selectors = (columns + 7) / 8;
+    const int64_t slab = int64_t(row / 16) * (16 + 16 * selectors);
+    const unsigned base = fixed[slab + row % 16];
+    const int64_t bits = slab + 16 + int64_t(row % 16) * selectors;
+    out[i] = (base + ((fixed[bits + (col >> 3)] >> (col & 7)) & 1)) & 0xff;
+}
+
+template <bool ValidateE4M3>
 __global__ void csf_exceptions_kernel(uint8_t* out, const uint32_t* exceptions, int32_t* status,
     int rows, int columns, int count, int row_offset, int column_offset, int out_rows, int out_columns) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1392,7 +1409,7 @@ __global__ void csf_exceptions_kernel(uint8_t* out, const uint32_t* exceptions, 
     const uint32_t word = exceptions[i];
     const int position = word & 0xffffff;
     const unsigned value = word >> 24;
-    if (position >= int64_t(rows) * columns || value > 0x7e
+    if (position >= int64_t(rows) * columns || (ValidateE4M3 && value > 0x7e)
         || (i && position <= (exceptions[i - 1] & 0xffffff))) {
         atomicOr(status, 2);
         return;
@@ -1410,8 +1427,10 @@ __global__ void csf_validate_kernel(const uint8_t* out, int32_t* status, int64_t
 
 cudaError_t glm_decode_csf(GlmCtx* ctx, uint8_t* out, const uint8_t* fixed,
     const uint32_t* exceptions, int32_t* status, int rows, int columns,
-    int exception_count, int row_offset, int column_offset, int out_rows, int out_columns) {
-    if (rows <= 0 || rows % 16 || columns <= 0 || columns % 2
+    int exception_count, int row_offset, int column_offset, int out_rows, int out_columns,
+    int codec) {
+    if (rows <= 0 || rows % 16 || columns <= 0 || (codec == 0 && columns % 2)
+        || codec < 0 || codec > 1
         || int64_t(rows) * columns > 0x1000000 || exception_count < 0
         || exception_count > int64_t(rows) * columns || row_offset < 0 || column_offset < 0
         || out_rows <= 0 || out_columns <= 0 || int64_t(row_offset) + out_rows > rows
@@ -1420,17 +1439,31 @@ cudaError_t glm_decode_csf(GlmCtx* ctx, uint8_t* out, const uint8_t* fixed,
     // for one readback at the end of model loading.
     cudaError_t err;
     const int64_t count = int64_t(out_rows) * out_columns;
-    csf_expand_kernel<<<(count + 255) / 256, 256, 0, GLM_STREAM(ctx)>>>(
-        out, fixed, status, columns, row_offset, column_offset, out_rows, out_columns);
+    if (codec == 0) {
+        csf_expand_kernel<<<(count + 255) / 256, 256, 0, GLM_STREAM(ctx)>>>(
+            out, fixed, status, columns, row_offset, column_offset, out_rows, out_columns);
+    } else {
+        csf_mxfp4_expand_kernel<<<(count + 255) / 256, 256, 0, GLM_STREAM(ctx)>>>(
+            out, fixed, columns, row_offset, column_offset, out_rows, out_columns);
+    }
     if ((err = cudaGetLastError()) != cudaSuccess) return err;
     if (exception_count) {
-        csf_exceptions_kernel<<<(exception_count + 255) / 256, 256, 0, GLM_STREAM(ctx)>>>(
-            out, exceptions, status, rows, columns, exception_count,
-            row_offset, column_offset, out_rows, out_columns);
+        if (codec == 0) {
+            csf_exceptions_kernel<true><<<(exception_count + 255) / 256, 256, 0, GLM_STREAM(ctx)>>>(
+                out, exceptions, status, rows, columns, exception_count,
+                row_offset, column_offset, out_rows, out_columns);
+        } else {
+            csf_exceptions_kernel<false><<<(exception_count + 255) / 256, 256, 0, GLM_STREAM(ctx)>>>(
+                out, exceptions, status, rows, columns, exception_count,
+                row_offset, column_offset, out_rows, out_columns);
+        }
         if ((err = cudaGetLastError()) != cudaSuccess) return err;
     }
-    csf_validate_kernel<<<(count + 255) / 256, 256, 0, GLM_STREAM(ctx)>>>(out, status, count);
-    return cudaGetLastError();
+    if (codec == 0) {
+        csf_validate_kernel<<<(count + 255) / 256, 256, 0, GLM_STREAM(ctx)>>>(out, status, count);
+        return cudaGetLastError();
+    }
+    return cudaSuccess;
 }
 
 cudaError_t glm_fill(GlmCtx* ctx, void* out, double value, int n, const char* dtype) {

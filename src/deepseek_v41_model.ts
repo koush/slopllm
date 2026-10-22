@@ -144,7 +144,6 @@ export class DeepseekV41Model extends ChatModel {
     topK: -1,
     maxNewTokens: 262144,
   };
-  protected readonly loadSyncInterval = 1024;
   readonly eosIds: Set<number>;
   readonly sourceMetadata = new Map<string, TensorMeta>();
   readonly engramRows = new Map<string, number>();

@@ -31,6 +31,8 @@ import path from "node:path";
 
 export const NVFP4_CSF_SCHEMA = "lil-nvfp4-csf-checkpoint/1";
 export const NVFP4_CSF_CODEC = "byte-window4-fixed-stream-u24-exceptions/1";
+/** Runtime scale codecs with GPU expansion support. */
+export type CsfScaleCodec = "nvfp4" | "mxfp4";
 /** Exact supported schema/codec/family combinations — not the lil-*-csf wildcard. */
 export const SUPPORTED_CSF_FAMILIES: readonly string[] = ["glm53_744b_nvfp4"];
 

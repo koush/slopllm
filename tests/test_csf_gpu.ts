@@ -4,14 +4,46 @@ import os from "node:os";
 import path from "node:path";
 import { it } from "node:test";
 import { ChatModel } from "../src/chat_model";
+import type { CheckpointTensor } from "../src/checkpoint_source";
 import { CsfContainer } from "../src/csf_checkpoint";
 import { type DeviceOps } from "../src/device_ops";
 import { Glm51Model } from "../src/glm51_model";
 import { GlmOps, GlmTensor } from "../src/glm_ops";
+import { mmapClose, mmapOpen } from "../src/native-addon";
 import { ParallelOps } from "../src/parallel_ops";
 import { modelArenaLayoutSignatures } from "../src/model_cli";
 import { WorkspaceBase } from "../src/workspace";
+import { expandMxfp4ScalePlanes, expandMxfp4ScaleWindow } from "../src/mxfp4_csf_codec";
 import { buildCsfFixture, makeScaleMatrix } from "./csf_fixture";
+
+interface Mxfp4Planes {
+  fixed: Buffer;
+  exceptions: Buffer;
+  logical: Buffer;
+}
+
+function makeMxfp4Planes(rows: number, columns: number, seed: number,
+  exceptionPositions: number[] = [], exceptionValues: number[] = []): Mxfp4Planes {
+  const selectors = Math.ceil(columns / 8);
+  const stride = 16 * (1 + selectors);
+  const fixed = Buffer.alloc((rows / 16) * stride);
+  for (let row = 0; row < rows; row++) {
+    const slab = Math.floor(row / 16) * stride;
+    fixed[slab + row % 16] = (row * 37 + seed) & 0xff;
+    for (let byte = 0; byte < selectors; byte++) {
+      fixed[slab + 16 + (row % 16) * selectors + byte] = (row * 53 + byte * 17 + seed) & 0xff;
+    }
+  }
+  const exceptions = Buffer.alloc(exceptionPositions.length * 4);
+  let previous = -1;
+  for (let i = 0; i < exceptionPositions.length; i++) {
+    const position = exceptionPositions[i];
+    if (position <= previous) throw new Error("fixture exception positions must be sorted and unique");
+    previous = position;
+    exceptions.writeUInt32LE((((exceptionValues[i] & 0xff) << 24) | position) >>> 0, i * 4);
+  }
+  return { fixed, exceptions, logical: expandMxfp4ScalePlanes(fixed, exceptions, rows, columns) };
+}
 
 it("GPU CSF expansion is byte-exact for full matrices, odd windows, and empty exceptions", () => {
   using ops = new GlmOps(0);
@@ -39,6 +71,54 @@ it("GPU CSF expansion is byte-exact for full matrices, odd windows, and empty ex
       }
     }
   }
+});
+
+it("GPU MXFP4 CSF expansion is byte-exact for full matrices, windows, and wrapped values", () => {
+  using ops = new GlmOps(0);
+  using ws = new WorkspaceBase(ops);
+  for (const [rows, columns] of [[32, 8], [48, 22], [2048, 384], [6144, 128]]) {
+    for (const positions of [[], [0, columns - 1, columns, rows * columns / 2, rows * columns - 1]]) {
+      const matrix = makeMxfp4Planes(rows, columns, 17, positions,
+        positions.map((_, i) => [0xf0, 0x00, 0xff, 0x7f, 0x80][i % 5]));
+      using fixed = ws.alloc([matrix.fixed.length], "U8");
+      using exceptions = ws.alloc([Math.max(4, matrix.exceptions.length)], "U8");
+      using status = ws.alloc([1], "I32");
+      fixed.h2d(matrix.fixed);
+      if (matrix.exceptions.length) exceptions.h2d(matrix.exceptions);
+      for (const [r, c, nr, nc] of [[0, 0, rows, columns], [7, 1, 19, columns - 3]]) {
+        using out = ws.alloc([nr, nc], "F8_E8M0");
+        ops.decodeCsfScales(out, fixed, exceptions, status, rows, columns, r, c,
+          matrix.exceptions.length / 4, true, "mxfp4");
+        ops.synchronize();
+        assert.deepEqual(status.readInt32LEArray(), [0]);
+        const actual = Buffer.alloc(out.bytes);
+        out.d2h(actual);
+        assert.deepEqual(actual, expandMxfp4ScaleWindow(matrix.fixed, matrix.exceptions,
+          rows, columns, r, nr, c, nc));
+      }
+    }
+  }
+});
+
+it("GPU MXFP4 CSF accepts wrapped bytes and rejects malformed exception order", () => {
+  using ops = new GlmOps(0);
+  using ws = new WorkspaceBase(ops);
+  const matrix = makeMxfp4Planes(32, 8, 3, [0, 255], [0xf0, 0xff]);
+  using fixed = ws.alloc([matrix.fixed.length], "U8");
+  using exceptions = ws.alloc([matrix.exceptions.length], "U8");
+  using status = ws.alloc([1], "I32");
+  using out = ws.alloc([32, 8], "F8_E8M0");
+  fixed.h2d(matrix.fixed);
+  exceptions.h2d(matrix.exceptions);
+  ops.decodeCsfScales(out, fixed, exceptions, status, 32, 8, 0, 0, 2, true, "mxfp4");
+  ops.synchronize();
+  assert.deepEqual(status.readInt32LEArray(), [0]);
+  const corrupt = Buffer.from(matrix.exceptions);
+  corrupt.writeUInt32LE(corrupt.readUInt32LE(0), 4);
+  exceptions.h2d(corrupt);
+  ops.decodeCsfScales(out, fixed, exceptions, status, 32, 8, 0, 0, 2, true, "mxfp4");
+  ops.synchronize();
+  assert.notEqual(status.readInt32LEArray()[0], 0);
 });
 
 it("GPU CSF rejects malformed planes and validates scales after exception replacement", () => {
@@ -204,6 +284,48 @@ it("CSF loads normal named GLM scales concurrently, shards both TP axes, and ski
     CsfContainer.prototype.readTensor = originalRead;
     if (originalReplay === undefined) delete process.env.SLOPLLM_MODEL_LOAD_REPLAY;
     else process.env.SLOPLLM_MODEL_LOAD_REPLAY = originalReplay;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it("MXFP4 CSF scales load through GPU expansion without host decoding", async () => {
+  const rows = 48, columns = 22;
+  const matrix = makeMxfp4Planes(rows, columns, 29, [0, columns - 1, rows * columns - 1],
+    [0xf0, 0x00, 0xff]);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mxfp4-csf-"));
+  const file = path.join(dir, "planes.bin");
+  const fileBytes = Buffer.concat([matrix.fixed, matrix.exceptions]);
+  fs.writeFileSync(file, fileBytes);
+  const mmapPtr = mmapOpen(file);
+  try {
+    using ops = new GlmOps(0);
+    using model = weightLoader(ops);
+    using out = model.alloc([rows, columns], "F8_E8M0");
+    const source: CheckpointTensor = {
+      name: "layer.weight_scale",
+      meta: { dtype: "F8_E8M0", shape: [rows, columns], dataOffsets: [0, rows * columns] },
+      csf: {
+        codec: "mxfp4",
+        rows, columns,
+        fixedBytes: matrix.fixed.length,
+        exceptionBytes: matrix.exceptions.length,
+        mapping: () => ({
+          fixed: { mmapPtr, offset: 0, size: matrix.fixed.length },
+          exceptions: { mmapPtr, offset: matrix.fixed.length, size: matrix.exceptions.length },
+        }),
+        read: () => { throw new Error("host CSF expansion must not run"); },
+      },
+      mapping: () => { throw new Error("logical mapping must not run"); },
+      read: () => { throw new Error("logical read must not run"); },
+      readSlice: () => { throw new Error("logical slice read must not run"); },
+    };
+    await model["loadTensorBytes"](out, source);
+    await model["drainLoadTransfers"]();
+    const actual = Buffer.alloc(out.bytes);
+    out.d2h(actual);
+    assert.deepEqual(actual, matrix.logical);
+  } finally {
+    mmapClose(mmapPtr, fileBytes.length);
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

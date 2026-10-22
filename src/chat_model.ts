@@ -590,7 +590,7 @@ export abstract class ChatModel extends WorkspaceBase {
         const failure = copies.find(result => result.status === "rejected");
         if (failure?.status === "rejected") throw failure.reason;
         this.ops.decodeCsfScales(tensor, fixed, exceptions, this.csfLoadStatus, csf.rows, csf.columns,
-          0, 0, csf.exceptionBytes / 4, false);
+          0, 0, csf.exceptionBytes / 4, false, csf.codec);
       }
       return;
     }

@@ -1,3 +1,4 @@
+import type { CsfScaleCodec } from "./csf_codec";
 import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StreamResult, StridedMmap, TensorParallelism, type MemcpyBatchEntry } from "./device_ops";
 import { Heap, type HeapAllocation, type HeapKey } from "./heap";
 import type { Dsv4CacheSelection } from "./device_ops";
@@ -1508,11 +1509,13 @@ export class GlmOps implements DeviceOps {
 
   decodeCsfScales(output: Tensor, fixed: Tensor, exceptions: Tensor, status: Tensor,
     rows: number, columns: number, rowOffset = 0, columnOffset = 0,
-    exceptionCount = exceptions.bytes / 4, resetStatus = true): void {
-    validateCsfScaleDecode(output, fixed, exceptions, status, rows, columns, rowOffset, columnOffset, exceptionCount);
+    exceptionCount = exceptions.bytes / 4, resetStatus = true, codec: CsfScaleCodec = "nvfp4"): void {
+    validateCsfScaleDecode(output, fixed, exceptions, status, rows, columns, rowOffset, columnOffset,
+      exceptionCount, codec);
     if (resetStatus) status.fill(0, 1);
     getNativeAddon().decodeCsf(this.ctx, output.data, fixed.data, exceptions.data, status.data,
-      rows, columns, exceptionCount, rowOffset, columnOffset, output.shape[0], output.shape[1]);
+      rows, columns, exceptionCount, rowOffset, columnOffset, output.shape[0], output.shape[1],
+      codec === "mxfp4" ? 1 : 0);
   }
 
   prefetchL2Linear(tensors: readonly Tensor[], _batch?: number): void {

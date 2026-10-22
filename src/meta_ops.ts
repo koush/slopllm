@@ -1,3 +1,4 @@
+import type { CsfScaleCodec } from "./csf_codec";
 import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type MemcpyBatchEntry } from "./device_ops";
 import type { ExecutionState } from "./execution-workspace";
 import { GlmOps } from "./glm_ops";
@@ -381,8 +382,9 @@ export class MetaOps implements DeviceOps {
 
     decodeCsfScales(output: Tensor, fixed: Tensor, exceptions: Tensor, status: Tensor,
         rows: number, columns: number, rowOffset = 0, columnOffset = 0,
-        exceptionCount = exceptions.bytes / 4, _resetStatus = true): void {
-        validateCsfScaleDecode(output, fixed, exceptions, status, rows, columns, rowOffset, columnOffset, exceptionCount);
+        exceptionCount = exceptions.bytes / 4, _resetStatus = true, codec: CsfScaleCodec = "nvfp4"): void {
+        validateCsfScaleDecode(output, fixed, exceptions, status, rows, columns, rowOffset, columnOffset,
+            exceptionCount, codec);
     }
 
     prefetchL2Linear(_tensors: readonly Tensor[], _batch?: number): void {

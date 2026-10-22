@@ -1,4 +1,5 @@
 import { CaptureManager } from "./capture-manager";
+import type { CsfScaleCodec } from "./csf_codec";
 import type { Dsv4CacheSelection } from "./device_ops";
 import { DeviceOps, fp8ScaleShape, MaskMode, notifyHostWorldSynchronization, notifySynchronizedWorkspaces, SlotSet, StridedMmap, TensorParallelism, type MemcpyBatchEntry, type MlaQuery, type StreamResult } from "./device_ops";
 import { MemcpyKind } from "./enums";
@@ -3720,8 +3721,9 @@ export class ParallelOps implements DeviceOps {
 
   decodeCsfScales(output: Tensor, fixed: Tensor, exceptions: Tensor, status: Tensor,
     rows: number, columns: number, rowOffset = 0, columnOffset = 0,
-    exceptionCount = exceptions.bytes / 4, resetStatus = true): void {
-    validateCsfScaleDecode(output, fixed, exceptions, status, rows, columns, rowOffset, columnOffset, exceptionCount);
+    exceptionCount = exceptions.bytes / 4, resetStatus = true, codec: CsfScaleCodec = "nvfp4"): void {
+    validateCsfScaleDecode(output, fixed, exceptions, status, rows, columns, rowOffset, columnOffset,
+      exceptionCount, codec);
     const out = this.cast(output);
     const f = this.cast(fixed);
     const e = this.cast(exceptions);
@@ -3734,7 +3736,8 @@ export class ParallelOps implements DeviceOps {
     out.shards.forEach((shard, rank) => this.devices[rank].decodeCsfScales(shard,
       f.shards[rank], e.shards[rank], s.shards[rank], rows, columns,
       rowOffset + (out.parallelism === TensorParallelism.Column ? rank * shard.shape[0] : 0),
-      columnOffset + (out.parallelism === TensorParallelism.Row ? rank * shard.shape[1] : 0), exceptionCount, resetStatus));
+      columnOffset + (out.parallelism === TensorParallelism.Row ? rank * shard.shape[1] : 0),
+      exceptionCount, resetStatus, codec));
   }
 
   prefetchL2Linear(tensors: readonly Tensor[], batch?: number): void {

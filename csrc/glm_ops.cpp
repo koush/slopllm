@@ -675,8 +675,8 @@ static Napi::Value Fill(const Napi::CallbackInfo& info) {
 
 static Napi::Value DecodeCsf(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    if (info.Length() != 12) {
-        Napi::TypeError::New(env, "Expected (ctx, out, fixed, exceptions, status, rows, columns, exceptionCount, rowOffset, columnOffset, outRows, outColumns)").ThrowAsJavaScriptException();
+    if (info.Length() != 13) {
+        Napi::TypeError::New(env, "Expected (ctx, out, fixed, exceptions, status, rows, columns, exceptionCount, rowOffset, columnOffset, outRows, outColumns, codec)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     auto ptr = [&](int i) { return info[i].As<Napi::Number>().Int64Value(); };
@@ -684,7 +684,7 @@ static Napi::Value DecodeCsf(const Napi::CallbackInfo& info) {
     cudaError_t err = glm_decode_csf(reinterpret_cast<GlmCtx*>(ptr(0)),
         reinterpret_cast<uint8_t*>(ptr(1)), reinterpret_cast<const uint8_t*>(ptr(2)),
         reinterpret_cast<const uint32_t*>(ptr(3)), reinterpret_cast<int32_t*>(ptr(4)),
-        n(5), n(6), n(7), n(8), n(9), n(10), n(11));
+        n(5), n(6), n(7), n(8), n(9), n(10), n(11), n(12));
     if (err != cudaSuccess)
         Napi::Error::New(env, std::string("decodeCsf failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
     return env.Undefined();

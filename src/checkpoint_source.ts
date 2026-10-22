@@ -1,8 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { CsfContractError } from "./csf_codec";
-import { MXFP4_CSF_CODEC } from "./mxfp4_csf_codec";
+import { CsfContractError, type CsfScaleCodec } from "./csf_codec";
 import {
   CsfContainer,
   detectCsfContainer,
@@ -38,6 +37,7 @@ export interface CheckpointTensor {
   readonly meta: TensorMeta;
   /** Compressed source planes for GPU expansion; sizes are available during allocation replay. */
   readonly csf?: {
+    codec: CsfScaleCodec;
     rows: number;
     columns: number;
     fixedBytes: number;
@@ -263,9 +263,7 @@ class CsfCheckpointSource implements CheckpointSource {
     const located = this.container.locate(name);
     const container = this.container;
     const self = this;
-    // MXFP4 scales expand on the host at load time. The exposed GPU plane
-    // contract belongs to the NVFP4 decoder and must not accept MXFP4 bytes.
-    const planes = this.contract.codec === MXFP4_CSF_CODEC ? undefined : container.compressedPlanes(name);
+    const planes = container.compressedPlanes(name);
     return {
       name,
       meta: located.meta,
