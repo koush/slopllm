@@ -2,9 +2,64 @@
 #include <cuda_bf16.h>
 #include <float.h>
 #include <cmath>
+#include <curand_kernel.h>
 #include <flashinfer/sampling.cuh>
 
 #define SAMPLING_BLOCK_SIZE 256
+
+// Separate logits and noise so equal, very large finite logits still receive
+// independent noise instead of rounding it away when added to the logits.
+struct GumbelWinner { float logit, noise; int token; };
+static_assert(sizeof(GumbelWinner) == 12);
+struct GumbelMax {
+    __device__ GumbelWinner operator()(GumbelWinner a, GumbelWinner b) const {
+        float delta;
+        if (a.logit == b.logit) delta = a.noise - b.noise;
+        else if (isinf(a.logit) || isinf(b.logit)) delta = a.logit > b.logit ? 1.f : -1.f;
+        else delta = (a.logit - b.logit) + (a.noise - b.noise);
+        return delta > 0.f || (delta == 0.f && a.token < b.token) ? a : b;
+    }
+};
+
+__global__ void sampling_gumbel_tiles(GumbelWinner* winners, const __nv_bfloat16* logits,
+                                     const float* temperatures, const unsigned* counter,
+                                     int vocab_size, int tiles) {
+    const int row = blockIdx.y, tile = blockIdx.x, tid = threadIdx.x;
+    const float inv_temp = fminf(1.f / temperatures[row], FLT_MAX);
+    GumbelWinner winner = {-INFINITY, 0.f, 0};
+    for (int token = tile * 1024 + tid; token < min((tile + 1) * 1024, vocab_size); token += blockDim.x) {
+        float logit = __bfloat162float(logits[size_t(row) * vocab_size + token]) * inv_temp;
+        if (isnan(logit) || logit == -INFINITY) continue;
+        curandStatePhilox4_32_10_t rng;
+        curand_init(static_cast<unsigned>(*counter + row), static_cast<unsigned long long>(token), 0, &rng);
+        // A flipped Gumbel transform resolves the winning tail near zero.
+        const float u = fmaxf(float(curand(&rng) >> 1) * 0x1p-31f, 0x1p-32f);
+        const float noise = -logf(-log1pf(-fminf(u, 0x1.fffffep-1f)));
+        winner = GumbelMax{}(winner, {logit, noise, token});
+    }
+    using Reduce = cub::BlockReduce<GumbelWinner, SAMPLING_BLOCK_SIZE>;
+    __shared__ typename Reduce::TempStorage temp;
+    winner = Reduce(temp).Reduce(winner, GumbelMax{});
+    if (tid == 0) winners[size_t(row) * tiles + tile] = winner;
+}
+
+__global__ void sampling_gumbel_finish(int* out_tokens, const GumbelWinner* winners,
+                                      int* penalty_tokens, int* penalty_count, int max_window, int tiles) {
+    const int row = blockIdx.x, tid = threadIdx.x;
+    GumbelWinner winner = {-INFINITY, 0.f, 0};
+    for (int tile = tid; tile < tiles; tile += blockDim.x)
+        winner = GumbelMax{}(winner, winners[size_t(row) * tiles + tile]);
+    using Reduce = cub::BlockReduce<GumbelWinner, SAMPLING_BLOCK_SIZE>;
+    __shared__ typename Reduce::TempStorage temp;
+    winner = Reduce(temp).Reduce(winner, GumbelMax{});
+    if (tid == 0) {
+        out_tokens[row] = winner.token;
+        if (max_window > 0) {
+            penalty_tokens[size_t(row) * max_window + penalty_count[row] % max_window] = winner.token;
+            penalty_count[row]++;
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Device helpers
@@ -66,6 +121,20 @@ __device__ float hash_to_random(unsigned int seed) {
 // Stream ordering keeps the base stable for every row, including graph replay.
 __global__ void sampling_advance_counter(unsigned int* counter, unsigned int count) {
     *counter += count;
+}
+
+void glm_sample_gumbel(GlmCtx* ctx, int* out_tokens, void* scratch, const void* logits,
+                       const float* temperatures, unsigned* counter, int* penalty_tokens,
+                       int* penalty_count, int max_window, int vocab_size, int batch_size) {
+    cudaSetDevice(ctx->device_id);
+    if (batch_size <= 0) return;
+    const int tiles = (vocab_size + 1023) / 1024;
+    auto* winners = static_cast<GumbelWinner*>(scratch);
+    sampling_gumbel_tiles<<<dim3(tiles, batch_size), SAMPLING_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+        winners, static_cast<const __nv_bfloat16*>(logits), temperatures, counter, vocab_size, tiles);
+    sampling_gumbel_finish<<<batch_size, SAMPLING_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+        out_tokens, winners, penalty_tokens, penalty_count, max_window, tiles);
+    sampling_advance_counter<<<1, 1, 0, GLM_STREAM(ctx)>>>(counter, batch_size);
 }
 
 __device__ void insertion_sort_descending(HeapEntry* arr, int size) {
@@ -320,37 +389,70 @@ __global__ void sampling_full_probs(
     for (int i = tid; i < vocab_size; i += blockDim.x) probs[i] /= total;
 }
 
+// Each block reduces a contiguous vocabulary interval with coalesced reads.
+// Keep double totals, but distribute their accumulation across SMs instead of
+// making each draw thread serially sum an entire interval in double precision.
+__global__ void sampling_full_tile_sums(
+    double* totals, const float* workspace, int vocab_size,
+    const float* temperatures, const int* top_ks) {
+    const int row = blockIdx.y, tile = blockIdx.x, tid = threadIdx.x;
+    if (temperatures[row] <= 0.f || (top_ks[row] > 0 && top_ks[row] < vocab_size)) return;
+    const int begin = int(size_t(vocab_size) * tile / SAMPLING_BLOCK_SIZE);
+    const int end = int(size_t(vocab_size) * (tile + 1) / SAMPLING_BLOCK_SIZE);
+    const float* probs = workspace + size_t(row) * vocab_size;
+    double sum = 0.;
+    for (int i = begin + tid; i < end; i += blockDim.x) sum += double(probs[i]);
+    using Reduce = cub::BlockReduce<double, SAMPLING_BLOCK_SIZE>;
+    __shared__ typename Reduce::TempStorage temp;
+    const double total = Reduce(temp).Sum(sum);
+    if (tid == 0) totals[size_t(row) * SAMPLING_BLOCK_SIZE + tile] = total;
+}
+
 __global__ void sampling_full_draw(
     int* out_tokens, const float* workspace, int* penalty_tokens, int* penalty_count,
     int max_window, int vocab_size, const float* temperatures, const int* top_ks,
-    const unsigned int* step_counter, float* out_probs, int* out_ids, int support_capacity) {
+    const unsigned int* step_counter, float* out_probs, int* out_ids, int support_capacity,
+    const double* tile_totals) {
     const int row = blockIdx.x, tid = threadIdx.x;
     if (temperatures[row] <= 0.f || (top_ks[row] > 0 && top_ks[row] < vocab_size)) return;
     const float* probs = workspace + size_t(row) * vocab_size;
-    // Contiguous chunks retain token-ID CDF ordering independently of vocabulary
-    // size. Double accumulation keeps small but nonzero tail probabilities live.
+    // Scan interval totals in token-ID order, then cooperatively scan only the
+    // selected interval. Small vocabularies need no separate reduction launch.
     const int begin = int(size_t(vocab_size) * tid / blockDim.x);
     const int end = int(size_t(vocab_size) * (tid + 1) / blockDim.x);
     double sum = 0.;
-    for (int i = begin; i < end; ++i) sum += probs[i];
+    if (tile_totals) sum = tile_totals[size_t(row) * blockDim.x + tid];
+    else for (int i = begin; i < end; ++i) sum += double(probs[i]);
     using Scan = cub::BlockScan<double, SAMPLING_BLOCK_SIZE>;
     __shared__ typename Scan::TempStorage temp;
     __shared__ int sampled;
-    if (tid == 0) sampled = 0;
+    __shared__ int selected_begin, selected_end;
+    __shared__ double remaining;
+    if (tid == 0) {
+        sampled = vocab_size;
+        selected_begin = selected_end = 0;
+    }
     double prefix, total;
     Scan(temp).ExclusiveSum(sum, prefix, total);
     __syncthreads();
     const double threshold = double(hash_to_random(*step_counter + row)) * total;
     if (threshold >= prefix && threshold < prefix + sum) {
-        double cumulative = prefix;
-        int last = 0;
-        for (int i = begin; i < end; ++i) {
-            if (probs[i] <= 0.f) continue;
-            last = i;
-            cumulative += probs[i];
-            if (threshold < cumulative) break;
-        }
-        sampled = last;
+        selected_begin = begin;
+        selected_end = end;
+        remaining = threshold - prefix;
+    }
+    __syncthreads();
+    for (int base = selected_begin; base < selected_end; base += blockDim.x) {
+        const int i = base + tid;
+        const double probability = i < selected_end ? double(probs[i]) : 0.;
+        Scan(temp).ExclusiveSum(probability, prefix, total);
+        __syncthreads();
+        if (probability > 0. && remaining >= prefix && remaining < prefix + probability)
+            atomicMin(&sampled, i);
+        __syncthreads();
+        if (sampled < vocab_size) break;
+        if (tid == 0) remaining -= total;
+        __syncthreads();
     }
     for (int i = tid; i < support_capacity; i += blockDim.x) {
         const size_t offset = size_t(row) * support_capacity + i;
@@ -359,6 +461,7 @@ __global__ void sampling_full_draw(
     }
     __syncthreads();
     if (tid == 0) {
+        if (sampled == vocab_size) sampled = 0;
         out_tokens[row] = sampled;
         if (max_window > 0) {
             penalty_tokens[size_t(row) * max_window + penalty_count[row] % max_window] = sampled;
@@ -620,9 +723,15 @@ void glm_sample_batch(GlmCtx* ctx, int* out_tokens, float* topk_vals, int* topk_
             fprintf(stderr, "sampling top-p: %s\n", cudaGetErrorString(error));
             std::abort();
         }
+        // topk_vals has at least batch_size * vocab_size floats here. Reuse
+        // it only after top-p has finished reading its per-row thresholds.
+        double* tile_totals = vocab_size >= 2 * SAMPLING_BLOCK_SIZE
+            ? reinterpret_cast<double*>(topk_vals) : nullptr;
+        if (tile_totals) sampling_full_tile_sums<<<dim3(SAMPLING_BLOCK_SIZE, batch_size), block_size, 0, GLM_STREAM(ctx)>>>(
+            tile_totals, workspace, vocab_size, temperatures, top_ks);
         sampling_full_draw<<<batch_size, block_size, 0, GLM_STREAM(ctx)>>>(
             out_tokens, workspace, penalty_tokens, penalty_count, max_window, vocab_size,
-            temperatures, top_ks, step_counter, out_probs, out_ids, support_capacity);
+            temperatures, top_ks, step_counter, out_probs, out_ids, support_capacity, tile_totals);
     }
 
     if (max_effective_k <= 1) {
@@ -752,6 +861,9 @@ void glm_sample_candidates(GlmCtx* ctx, int* out_tokens, float* out_probs, int* 
 
 __device__ float sampling_sparse_lookup(const float* probs, const int* ids,
                                         int capacity, int token) {
+    // Full-vocabulary exports use token-ID order; point-mass and bounded
+    // proposals retain compact IDs with a -1 tail.
+    if (token >= 0 && token < capacity && ids[token] == token) return probs[token];
     for (int i = 0; i < capacity && ids[i] >= 0; i++) {
         if (ids[i] == token) return probs[i];
     }
@@ -811,15 +923,140 @@ __global__ void spec_reject_linear_kernel(
     }
 }
 
+template <typename Weight>
+__device__ int sampling_parallel_draw(const int* ids, int capacity, float uniform, Weight weight) {
+    const int tid = threadIdx.x;
+    const int begin = int(size_t(capacity) * tid / blockDim.x);
+    const int end = int(size_t(capacity) * (tid + 1) / blockDim.x);
+    double sum = 0.;
+    for (int i = begin; i < end; ++i) if (ids[i] >= 0) sum += weight(i);
+    using Scan = cub::BlockScan<double, SAMPLING_BLOCK_SIZE>;
+    __shared__ typename Scan::TempStorage temp;
+    __shared__ int sampled;
+    if (tid == 0) sampled = -1;
+    double prefix, total;
+    Scan(temp).ExclusiveSum(sum, prefix, total);
+    __syncthreads();
+    const double threshold = double(uniform) * total;
+    if (threshold >= prefix && threshold < prefix + sum) {
+        double cumulative = prefix;
+        int last = -1;
+        for (int i = begin; i < end; ++i) {
+            if (ids[i] < 0) continue;
+            const double probability = weight(i);
+            if (probability <= 0.) continue;
+            last = ids[i];
+            cumulative += probability;
+            if (threshold < cumulative) break;
+        }
+        sampled = last;
+    }
+    __syncthreads();
+    const int result = sampled;
+    __syncthreads();
+    return result;
+}
+
+// Parallel rejection over full-vocabulary distributions. Dense Q lookup is O(1)
+// per token; deterministic DSpark Q has a one-entry compact support. Compute
+// residual weights on demand rather than allocating a vocabulary-sized shared
+// array or truncating the target distribution.
+__global__ void spec_reject_full_kernel(
+    int* out_tokens, int* out_accepted, const int* draft_tokens,
+    const float* q_probs, const int* q_ids, const float* p_probs, const int* p_ids,
+    const unsigned int* step_counter, int depth, int capacity) {
+    const size_t seq = blockIdx.x;
+    const size_t p_base = seq * (size_t(depth) + 1) * capacity;
+    const size_t q_base = seq * size_t(depth) * capacity;
+    int* out = out_tokens + seq * (size_t(depth) + 1);
+    const unsigned stride = 2u * unsigned(depth) + 2u;
+    const unsigned base = *step_counter + unsigned(seq) * stride;
+    for (int d = 0; d <= depth; ++d) {
+        const float* p = p_probs + p_base + size_t(d) * capacity;
+        const int* pi = p_ids + p_base + size_t(d) * capacity;
+        const int token = sampling_parallel_draw(pi, capacity, hash_to_random(base + unsigned(d)),
+            [=] __device__ (int i) { return double(p[i]); });
+        if (threadIdx.x == 0) out[d] = token;
+    }
+    using Reduce = cub::BlockReduce<double, SAMPLING_BLOCK_SIZE>;
+    __shared__ typename Reduce::TempStorage temp;
+    __shared__ double p_total, q_total;
+    __shared__ bool accept;
+    if (threadIdx.x == 0) out_accepted[seq] = depth;
+    for (int d = 0; d < depth; ++d) {
+        const float* p = p_probs + p_base + size_t(d) * capacity;
+        const int* pi = p_ids + p_base + size_t(d) * capacity;
+        const float* q = q_probs + q_base + size_t(d) * capacity;
+        const int* qi = q_ids + q_base + size_t(d) * capacity;
+        double ps = 0., qs = 0.;
+        for (int i = threadIdx.x; i < capacity; i += blockDim.x) {
+            if (pi[i] >= 0) ps += p[i];
+            if (qi[i] >= 0) qs += q[i];
+        }
+        const double pt = Reduce(temp).Sum(ps);
+        if (threadIdx.x == 0) p_total = pt;
+        __syncthreads();
+        const double qt = Reduce(temp).Sum(qs);
+        if (threadIdx.x == 0) q_total = qt;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            const int token = draft_tokens[seq * size_t(depth) + d];
+            const double px = sampling_sparse_lookup(p, pi, capacity, token);
+            const double qx = sampling_sparse_lookup(q, qi, capacity, token);
+            const float uniform = hash_to_random(base + unsigned(depth) + 1u + unsigned(d));
+            accept = qx > 0. && p_total > 0. && uniform < fmin(1., px * q_total / (qx * p_total));
+            if (accept) out[d] = token;
+            else out_accepted[seq] = d;
+        }
+        __syncthreads();
+        if (accept) continue;
+        const double pn = p_total, qn = q_total;
+        const float correction = hash_to_random(base + stride - 1u);
+        int token = sampling_parallel_draw(pi, capacity, correction, [=] __device__ (int i) {
+            const double a = pn > 0. ? double(p[i]) / pn : 0.;
+            const double b = qn > 0. ? double(sampling_sparse_lookup(q, qi, capacity, pi[i])) / qn : 0.;
+            return fmax(0., a - b);
+        });
+        if (token < 0) token = sampling_parallel_draw(pi, capacity, correction,
+            [=] __device__ (int i) { return double(p[i]); });
+        if (threadIdx.x == 0) out[d] = token;
+        break;
+    }
+}
+
+__global__ void spec_accept_deterministic_kernel(int* out_accepted, const int* target_tokens,
+                                                const int* draft_tokens, int batch_size, int depth) {
+    const int seq = blockIdx.x * blockDim.x + threadIdx.x;
+    if (seq >= batch_size) return;
+    int accepted = 0;
+    while (accepted < depth && target_tokens[size_t(seq) * (depth + 1) + accepted]
+           == draft_tokens[size_t(seq) * depth + accepted]) ++accepted;
+    out_accepted[seq] = accepted;
+}
+
+void glm_spec_accept_deterministic(GlmCtx* ctx, int* out_accepted, const int* target_tokens,
+                                   const int* draft_tokens, int batch_size, int depth) {
+    cudaSetDevice(ctx->device_id);
+    if (batch_size <= 0) return;
+    spec_accept_deterministic_kernel<<<(batch_size + 127) / 128, 128, 0, GLM_STREAM(ctx)>>>(
+        out_accepted, target_tokens, draft_tokens, batch_size, depth);
+}
+
 void glm_spec_reject_linear(GlmCtx* ctx, int* out_tokens, int* out_accepted,
                            const int* draft_tokens, const float* q_probs, const int* q_ids,
                            const float* p_probs, const int* p_ids, unsigned int* step_counter,
                            int batch_size, int depth, int capacity) {
     cudaSetDevice(ctx->device_id);
     if (batch_size <= 0) return;
-    spec_reject_linear_kernel<<<batch_size, 32, 0, GLM_STREAM(ctx)>>>(
-        out_tokens, out_accepted, draft_tokens, q_probs, q_ids, p_probs, p_ids,
-        step_counter, depth, capacity);
+    if (capacity > 256) {
+        spec_reject_full_kernel<<<batch_size, SAMPLING_BLOCK_SIZE, 0, GLM_STREAM(ctx)>>>(
+            out_tokens, out_accepted, draft_tokens, q_probs, q_ids, p_probs, p_ids,
+            step_counter, depth, capacity);
+    } else {
+        spec_reject_linear_kernel<<<batch_size, 32, 0, GLM_STREAM(ctx)>>>(
+            out_tokens, out_accepted, draft_tokens, q_probs, q_ids, p_probs, p_ids,
+            step_counter, depth, capacity);
+    }
     sampling_advance_counter<<<1, 1, 0, GLM_STREAM(ctx)>>>(
         step_counter, (unsigned int)batch_size * (2u * (unsigned int)depth + 2u));
 }

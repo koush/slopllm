@@ -1032,9 +1032,18 @@ void glm_sample_candidates(GlmCtx* ctx, int* out_tokens, float* out_probs, int* 
                            unsigned int* step_counter, int batch_size,
                            int candidate_count, int support_capacity);
 
+// Unrestricted sampling without penalties. Scratch: B * ceil(V / 1024) * 12 bytes.
+// RNG advances by B; positive finite temperatures and device pointers are required.
+void glm_sample_gumbel(GlmCtx* ctx, int* out_tokens, void* scratch, const void* logits,
+                       const float* temperatures, unsigned* counter, int* penalty_tokens,
+                       int* penalty_count, int max_window, int vocab_size, int batch_size);
+
+void glm_spec_accept_deterministic(GlmCtx* ctx, int* out_accepted, const int* target_tokens,
+                                   const int* draft_tokens, int batch_size, int depth);
+
 // All pointers are device pointers. Sparse supports have unique IDs, trailing -1
 // padding, and finite nonnegative probabilities normalized to one.
-// q: [B,D,C], p: [B,D+1,C], draft_tokens: [B,D]. 1 <= C <= 256.
+// q: [B,D,C], p: [B,D+1,C], draft_tokens: [B,D]. C >= 1.
 // out_tokens: [B,D+1]; out_accepted: [B], accepted prefix length (not bonus).
 // RNG advances by B*(2*D+2); the counter must not be shared across streams.
 void glm_spec_reject_linear(GlmCtx* ctx, int* out_tokens, int* out_accepted,

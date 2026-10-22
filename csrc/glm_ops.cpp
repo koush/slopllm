@@ -3446,6 +3446,54 @@ static Napi::Value SampleCandidates(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+static Napi::Value SampleGumbel(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 11) {
+        Napi::TypeError::New(env, "Expected (ctx, out_tokens, scratch, logits, temperatures, counter, penalty_tokens, penalty_count, max_window, vocab_size, batch_size)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ptrs[8];
+    for (int i = 0; i < 8; ++i) ptrs[i] = info[i].As<Napi::Number>().Int64Value();
+    const int window = info[8].As<Napi::Number>().Int32Value();
+    const int vocab = info[9].As<Napi::Number>().Int32Value();
+    const int batch = info[10].As<Napi::Number>().Int32Value();
+    if (window < 0 || vocab < 1 || batch < 0) {
+        Napi::RangeError::New(env, "sampleGumbel requires nonnegative window/batch and positive vocabulary").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    glm_sample_gumbel(reinterpret_cast<GlmCtx*>(ptrs[0]), reinterpret_cast<int*>(ptrs[1]),
+        reinterpret_cast<void*>(ptrs[2]), reinterpret_cast<const void*>(ptrs[3]),
+        reinterpret_cast<const float*>(ptrs[4]), reinterpret_cast<unsigned*>(ptrs[5]),
+        reinterpret_cast<int*>(ptrs[6]), reinterpret_cast<int*>(ptrs[7]), window, vocab, batch);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) Napi::Error::New(env, std::string("sampleGumbel failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    return env.Undefined();
+}
+
+static Napi::Value SpecAcceptDeterministic(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 6) {
+        Napi::TypeError::New(env, "Expected (ctx, out_accepted, target_tokens, draft_tokens, batch_size, depth)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    uintptr_t ptrs[4];
+    for (int i = 0; i < 4; i++) ptrs[i] = info[i].As<Napi::Number>().Int64Value();
+    int batch_size = info[4].As<Napi::Number>().Int32Value();
+    int depth = info[5].As<Napi::Number>().Int32Value();
+    if (batch_size < 0 || depth < 0) {
+        Napi::RangeError::New(env, "specAcceptDeterministic requires batch_size >= 0, depth >= 0").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    glm_spec_accept_deterministic(reinterpret_cast<GlmCtx*>(ptrs[0]),
+        reinterpret_cast<int*>(ptrs[1]), reinterpret_cast<const int*>(ptrs[2]),
+        reinterpret_cast<const int*>(ptrs[3]), batch_size, depth);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        Napi::Error::New(env, std::string("specAcceptDeterministic failed: ") + cudaGetErrorString(err)).ThrowAsJavaScriptException();
+    }
+    return env.Undefined();
+}
+
 static Napi::Value SpecRejectLinear(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 12) {
@@ -3457,8 +3505,8 @@ static Napi::Value SpecRejectLinear(const Napi::CallbackInfo& info) {
     int batch_size = info[9].As<Napi::Number>().Int32Value();
     int depth = info[10].As<Napi::Number>().Int32Value();
     int capacity = info[11].As<Napi::Number>().Int32Value();
-    if (batch_size < 0 || depth < 0 || capacity < 1 || capacity > 256) {
-        Napi::RangeError::New(env, "specRejectLinear requires batch_size >= 0, depth >= 0, capacity in [1, 256]").ThrowAsJavaScriptException();
+    if (batch_size < 0 || depth < 0 || capacity < 1) {
+        Napi::RangeError::New(env, "specRejectLinear requires batch_size >= 0, depth >= 0, capacity >= 1").ThrowAsJavaScriptException();
         return env.Undefined();
     }
     glm_spec_reject_linear(reinterpret_cast<GlmCtx*>(ptrs[0]),
@@ -4344,6 +4392,8 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     exports.Set(Napi::String::New(env, "sampleBatch"), Napi::Function::New(env, SampleBatch));
     exports.Set(Napi::String::New(env, "sampleCandidates"), Napi::Function::New(env, SampleCandidates));
     exports.Set(Napi::String::New(env, "specRejectLinear"), Napi::Function::New(env, SpecRejectLinear));
+    exports.Set(Napi::String::New(env, "specAcceptDeterministic"), Napi::Function::New(env, SpecAcceptDeterministic));
+    exports.Set(Napi::String::New(env, "sampleGumbel"), Napi::Function::New(env, SampleGumbel));
     exports.Set(Napi::String::New(env, "rotateInputIds"), Napi::Function::New(env, RotateInputIds));
     exports.Set(Napi::String::New(env, "memcpy2d"), Napi::Function::New(env, Memcpy2d));
     exports.Set(Napi::String::New(env, "memcpyPeer"), Napi::Function::New(env, MemcpyPeer));

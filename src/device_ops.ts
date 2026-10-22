@@ -240,4 +240,6 @@ export interface DeviceOps extends Disposable {
   sampleBatch(outTokens: Tensor, topkVals: Tensor, topkIdxs: Tensor, workspace: Tensor, logits: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number, temperatures: Tensor, repPenalties: Tensor, presPenalties: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, maxEffectiveK: number, outProbs?: Tensor, outIds?: Tensor, supportCapacity?: number): void;
   sampleCandidates(outTokens: Tensor, outProbs: Tensor, outIds: Tensor, candidateValues: Tensor, candidateIds: Tensor, temperatures: Tensor, topKs: Tensor, topPs: Tensor, stepCounter: Tensor, batchSize: number, candidateCount: number, supportCapacity: number): void;
   specRejectLinear(outTokens: Tensor, outAccepted: Tensor, draftTokens: Tensor, qProbs: Tensor, qIds: Tensor, pProbs: Tensor, pIds: Tensor, stepCounter: Tensor, batchSize: number, depth: number, capacity: number): void;
+  specAcceptDeterministic(outAccepted: Tensor, targetTokens: Tensor, draftTokens: Tensor, batchSize: number, depth: number): void;
+  sampleGumbel(outTokens: Tensor, scratch: Tensor, logits: Tensor, temperatures: Tensor, counter: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number): void;
 }

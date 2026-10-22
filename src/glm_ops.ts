@@ -1485,6 +1485,14 @@ export class GlmOps implements DeviceOps {
     getNativeAddon().sampleCandidates(this.ctx, outTokens.data, outProbs.data, outIds.data, candidateValues.data, candidateIds.data, temperatures.data, topKs.data, topPs.data, stepCounter.data, batchSize, candidateCount, supportCapacity);
   }
 
+  specAcceptDeterministic(outAccepted: Tensor, targetTokens: Tensor, draftTokens: Tensor, batchSize: number, depth: number): void {
+    getNativeAddon().specAcceptDeterministic(this.ctx, outAccepted.data, targetTokens.data, draftTokens.data, batchSize, depth);
+  }
+
+  sampleGumbel(outTokens: Tensor, scratch: Tensor, logits: Tensor, temperatures: Tensor, counter: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number): void {
+    getNativeAddon().sampleGumbel(this.ctx, outTokens.data, scratch.data, logits.data, temperatures.data, counter.data, penaltyTokens.data, penaltyCount.data, maxWindow, vocabSize, batchSize);
+  }
+
   specRejectLinear(outTokens: Tensor, outAccepted: Tensor, draftTokens: Tensor, qProbs: Tensor, qIds: Tensor, pProbs: Tensor, pIds: Tensor, stepCounter: Tensor, batchSize: number, depth: number, capacity: number): void {
     getNativeAddon().specRejectLinear(this.ctx, outTokens.data, outAccepted.data, draftTokens.data, qProbs.data, qIds.data, pProbs.data, pIds.data, stepCounter.data, batchSize, depth, capacity);
   }

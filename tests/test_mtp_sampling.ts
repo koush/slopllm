@@ -64,10 +64,122 @@ for (const parallel of [false, true]) {
       return tensor;
     }
 
-    it("rejects unrestricted MTP support beyond its capacity", () => {
-      for (const topK of [-1, 0]) {
-        assert.throws(() => sampler.updateMtpSampler([{ ...greedy, temperature: 1, topK }]), /effective top_k <= 256/);
+    for (const retainProposalsOnGpu of [false, true]) it(`unrestricted MTP accepts identical distributions with ${retainProposalsOnGpu ? "GPU" : "host"} proposals under replay`, () => {
+      using full = new SamplingWorkspace(ops, B * (D + 1), V, 0, { maxBatchSize: B, depth: D, retainProposalsOnGpu });
+      using manager = new CaptureManager(ops);
+      using inputs = new WorkspaceBase(ops);
+      const input = inputs.alloc([B, V], "BF16", "draft", parallel ? TensorParallelism.Row : TensorParallelism.Replicated);
+      const verification = inputs.alloc([B * (D + 1), V], "BF16", "verification");
+      const params = [-1, 0].map(topK => ({ ...greedy, temperature: 1, topK }));
+      full.updateMtpSampler(params);
+      assert.equal(full.capacity, V);
+      for (let pass = 0; pass < 4; ++pass) {
+        input.fill(pass, input.numElements);
+        verification.fill(pass, verification.numElements);
+        full.prepareDraft(B, D);
+        const treeTokens = Array.from({ length: B }, () => [] as number[]);
+        for (let d = 0; d < D; ++d) {
+          using tokens = manager.run({}, () => full.sampleDraft(input, d), ["full-draft", d, full.mtpCaptureKey]) as Tensor;
+          readI32(tokens).forEach((token, b) => treeTokens[b].push(token));
+        }
+        ops.synchronize();
+        const proposal = full.finishDraft();
+        full.prepareVerification({ targetTokens: [0, 0], treeTokens, topks: [1, 1, 1], proposal });
+        const result = manager.run({}, () => full.verify(verification), ["full-verify", full.mtpCaptureKey]) as { tokens: Tensor; numAccepted: Tensor };
+        using tokens = result.tokens;
+        using counts = result.numAccepted;
+        assert.deepEqual(readI32(counts), [D, D]);
+        const selected = readI32(tokens);
+        for (let b = 0; b < B; ++b) assert.deepEqual(selected.slice(b * (D + 1), b * (D + 1) + D), treeTokens[b]);
       }
+      assert.ok([...manager.captured.values()].every(entry => entry.graphExec !== null));
+    });
+
+    it("verifies deterministic DSpark proposals against unrestricted targets under capture", () => {
+      using full = new SamplingWorkspace(ops, B * (D + 1), V, 0, { maxBatchSize: B, depth: D, retainProposalsOnGpu: true });
+      using manager = new CaptureManager(ops);
+      using inputs = new WorkspaceBase(ops);
+      const verification = inputs.alloc([B * (D + 1), V], "BF16", "verification");
+      const proposals = inputs.alloc([B, D], "I32", "proposals");
+      const values = new Float32Array(B * (D + 1) * V).fill(-Infinity);
+      for (let b = 0; b < B; ++b) for (let d = 0; d <= D; ++d) values[(b * (D + 1) + d) * V + 400 + b] = 0;
+      verification.h2d(f32ToBf16Bytes(values));
+      full.updateMtpSampler(Array.from({ length: B }, () => ({ ...greedy, temperature: 1, topK: -1 })));
+      for (let pass = 0; pass < 8; ++pass) {
+        const boundaries = [pass % (D + 1), (pass + 1) % (D + 1)];
+        proposals.h2d(Buffer.from(Int32Array.from({ length: B * D }, (_, i) =>
+          i % D === boundaries[Math.floor(i / D)] ? 1 : 400 + Math.floor(i / D)).buffer));
+        const result = manager.run({}, () => {
+          full.prepareDeterministicVerification(proposals, B);
+          return full.verify(verification);
+        }, ["full-point-mass", full.mtpCaptureKey]) as { tokens: Tensor; numAccepted: Tensor };
+        using tokens = result.tokens;
+        using counts = result.numAccepted;
+        assert.deepEqual(readI32(counts), boundaries);
+        assert.deepEqual(readI32(tokens), Array.from({ length: B * (D + 1) }, (_, i) => 400 + Math.floor(i / (D + 1))));
+      }
+    });
+
+    it("deterministic verification reuses seeded unrestricted target samples under replay", () => {
+      using full = new SamplingWorkspace(ops, B * (D + 1), V, 0, { maxBatchSize: B, depth: D, retainProposalsOnGpu: true });
+      using reference = new SamplingWorkspace(ops, B * (D + 1), V, 0);
+      using manager = new CaptureManager(ops);
+      using inputs = new WorkspaceBase(ops);
+      const verification = inputs.alloc([B * (D + 1), V], "BF16", "verification");
+      const proposals = inputs.alloc([B, D], "I32", "proposals");
+      const params = Array.from({ length: B }, () => ({ ...greedy, temperature: 1, topK: -1 }));
+      full.updateMtpSampler(params);
+      reference.updateSampler(params.flatMap(p => Array(D + 1).fill(p)));
+      const seed = Buffer.from(Uint32Array.of(713).buffer);
+      full.stepCounter.h2d(seed);
+      reference.stepCounter.h2d(seed);
+      for (let pass = 0; pass < 6; ++pass) {
+        const values = Float32Array.from({ length: B * (D + 1) * V }, (_, i) =>
+          (i % V) === 400 + pass ? 7 : (i % 13) / 13);
+        verification.h2d(f32ToBf16Bytes(values));
+        const drafts = Array.from({ length: B * D }, () => 400 + pass);
+        proposals.h2d(Buffer.from(Int32Array.from(drafts).buffer));
+        using expected = reference.sample(verification);
+        const expectedTokens = readI32(expected);
+        const result = manager.run({}, () => {
+          full.prepareDeterministicVerification(proposals, B);
+          return full.verify(verification);
+        }, ["seeded-deterministic", full.mtpCaptureKey]) as { tokens: Tensor; numAccepted: Tensor };
+        using tokens = result.tokens;
+        using counts = result.numAccepted;
+        assert.deepEqual(readI32(tokens), expectedTokens);
+        assert.deepEqual(readI32(counts), Array.from({ length: B }, (_, b) => {
+          let d = 0;
+          while (d < D && expectedTokens[b * (D + 1) + d] === drafts[b * D + d]) ++d;
+          return d;
+        }));
+        assert.deepEqual(readI32(full.stepCounter), readI32(reference.stepCounter));
+      }
+      assert.ok([...manager.captured.values()].some(entry => entry.graphExec !== null));
+    });
+
+    for (const retainProposalsOnGpu of [false, true]) it(`imports compact ${retainProposalsOnGpu ? "GPU" : "host"} proposals after full-support upgrade`, () => {
+      using full = new SamplingWorkspace(ops, B * (D + 1), V, 0, { maxBatchSize: B, depth: D, retainProposalsOnGpu });
+      using input = logits([7, 19]);
+      using verification = logits([7, 7, 7, 7, 19, 19, 19, 19]);
+      full.updateMtpSampler([greedy, greedy]);
+      full.prepareDraft(B, D);
+      const treeTokens = Array.from({ length: B }, () => [] as number[]);
+      for (let d = 0; d < D; ++d) {
+        using tokens = full.sampleDraft(input, d);
+        readI32(tokens).forEach((token, b) => treeTokens[b].push(token));
+      }
+      ops.synchronize();
+      const proposal = full.finishDraft();
+      assert.equal(proposal.capacity, 256);
+      full.updateMtpSampler(Array.from({ length: B }, () => ({ ...greedy, temperature: 1, topK: -1 })));
+      full.updateMtpSampler([greedy, greedy]);
+      assert.equal(full.capacity, V);
+      full.prepareVerification({ targetTokens: [7, 19], treeTokens, topks: [1, 1, 1], proposal });
+      const result = full.verify(verification);
+      using tokens = result.tokens;
+      using counts = result.numAccepted;
+      assert.deepEqual(readI32(counts), [D, D]);
     });
 
     it("ordinary sampling preserves full support for nonpositive top-k", () => {
@@ -77,13 +189,40 @@ for (const parallel of [false, true]) {
       using probs = ws.alloc([B, V], "F32");
       using ids = ws.alloc([B, V], "I32");
       reference.updateSampler([-1, 0].map(topK => ({ ...greedy, temperature: 1, topK })));
-      assert.equal(reference.captureKey, V);
+      assert.equal(reference.captureKey, `${V}:gumbel`);
       using output = reference.sample(input, probs, ids, V);
       assert.deepEqual(readI32(ids), Array.from({ length: B * V }, (_, i) => i % V));
       const bytes = Buffer.alloc(probs.bytes);
       probs.d2h(bytes);
       for (let i = 0; i < B * V; ++i) assert.equal(bytes.readFloatLE(i * 4), 1 / V);
       assert.ok(readI32(output).every(token => token >= 0 && token < V));
+    });
+
+    it("captures distinct unrestricted Gumbel and filtered sampling paths", () => {
+      using sampling = new SamplingWorkspace(ops, B * 2, V, 0, { maxBatchSize: B, depth: 1 });
+      using manager = new CaptureManager(ops);
+      using inputs = new WorkspaceBase(ops);
+      const input = inputs.alloc([B, V], "BF16", "input", parallel ? TensorParallelism.Row : TensorParallelism.Replicated);
+      const values = new Float32Array(B * V).fill(-Infinity);
+      for (let b = 0; b < B; ++b) { values[b * V + 400] = 2; values[b * V + 401] = 1; }
+      input.h2d(f32ToBf16Bytes(values));
+      const keys = new Set<string | number>();
+      const mtpKeys = new Set<string>();
+      for (let pass = 0; pass < 8; ++pass) {
+        const topP = pass % 2 ? .1 : 1;
+        const params = Array.from({ length: B }, () => ({ ...greedy, temperature: 1, topK: -1, topP }));
+        sampling.updateSampler(params);
+        sampling.updateMtpSampler(params);
+        keys.add(sampling.captureKey);
+        mtpKeys.add(sampling.mtpCaptureKey);
+        using tokens = manager.run({}, () => sampling.sample(input), ["sampling-dispatch", sampling.captureKey]) as Tensor;
+        const selected = readI32(tokens);
+        assert.ok(selected.every(token => token === 400 || token === 401));
+        if (topP < 1) assert.deepEqual(selected, [400, 400]);
+      }
+      assert.equal(keys.size, 2);
+      assert.equal(mtpKeys.size, 2);
+      assert.equal([...manager.captured.values()].filter(entry => entry.graphExec !== null).length, 2);
     });
 
     it("full sampling applies penalties and appends each token once", () => {
@@ -450,7 +589,7 @@ for (const parallel of [false, true]) {
       }
       for (const patch of [
         { temperature: NaN }, { topP: Infinity }, { topK: 1.5 },
-        { temperature: 1, topK: 257 }, { repetitionPenalty: 1.1 }, { presencePenalty: 0.1 },
+        { topK: Infinity }, { repetitionPenalty: 1.1 }, { presencePenalty: 0.1 },
       ]) assert.throws(() => sampler.updateMtpSampler([{ ...greedy, ...patch }]), /Linear MTP requires/);
       assert.throws(() => sampler.updateMtpSampler([greedy, greedy, greedy]), /maxBatchSize/);
       sampler.updateMtpSampler([greedy, greedy]);

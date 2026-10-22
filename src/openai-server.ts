@@ -656,10 +656,6 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           sendJSON(res, 400, { error: { message: "Linear MTP requires finite numeric sampling parameters and an integer top_k", type: "invalid_request_error" } });
           return;
         }
-        if (topK > 256 || effectiveK > 256) {
-          sendJSON(res, 400, { error: { message: "Linear MTP supports top_k <= 256 (effective top_k must not exceed 256)", type: "invalid_request_error", param: "top_k" } });
-          return;
-        }
       }
 
       let stopSequences: string[] = [];

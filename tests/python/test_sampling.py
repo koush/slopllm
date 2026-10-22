@@ -95,6 +95,114 @@ def lowbias32_uniform(counter):
     return (value >> 8) / 2**24
 
 
+def _gumbel_buffers(glm, device, logits, temperatures, seed, window=0):
+    batch, vocab = logits.shape
+    logits = logits.to(device=device, dtype=torch.bfloat16)
+    temperatures = torch.tensor(temperatures, device=device, dtype=torch.float32)
+    scratch = torch.empty(batch * ((vocab + 1023) // 1024) * 12, device=device, dtype=torch.uint8)
+    out = torch.empty(batch, device=device, dtype=torch.int32)
+    counter = torch.tensor([seed], device=device, dtype=torch.uint32)
+    history = torch.full((batch, max(1, window)), -1, device=device, dtype=torch.int32)
+    counts = torch.zeros(batch, device=device, dtype=torch.int32)
+    sample = glm.lib.glm_sample_gumbel
+    sample.restype = None
+    sample.argtypes = [ctypes.c_void_p] * 8 + [ctypes.c_int] * 3
+
+    def launch():
+        sample(glm.ctx, out.data_ptr(), scratch.data_ptr(), logits.data_ptr(), temperatures.data_ptr(),
+               counter.data_ptr(), history.data_ptr(), counts.data_ptr(), window, vocab, batch)
+
+    torch.cuda.synchronize(device)
+    return launch, out, counter, history, counts
+
+
+@pytest.mark.parametrize("temperature", [0.5, 1., 2.])
+def test_gumbel_full_support_distribution(glm, device, temperature):
+    batch, vocab, iterations = 64, 129280, 128
+    support = [0, 1023, 1024, vocab - 1]
+    logits = torch.full((batch, vocab), -float("inf"), device=device, dtype=torch.bfloat16)
+    logits[:, support] = torch.tensor([0., .5, 1., 1.5], device=device, dtype=torch.bfloat16)
+    launch, out, counter, _, _ = _gumbel_buffers(glm, device, logits, [temperature] * batch, 713)
+    counts = torch.zeros(vocab, dtype=torch.int64)
+    for _ in range(iterations):
+        launch()
+        glm.synchronize()
+        counts += torch.bincount(out.cpu().long(), minlength=vocab)
+    expected = torch.tensor([0., .5, 1., 1.5]).div(temperature).softmax(0)
+    assert counts[support].sum().item() == batch * iterations
+    torch.testing.assert_close(counts[support].float() / (batch * iterations), expected, atol=.025, rtol=0)
+    assert counter.item() == 713 + batch * iterations
+
+
+@pytest.mark.parametrize("vocab", [1023, 1024, 1025])
+def test_gumbel_dense_distribution_across_tile_boundaries(glm, device, vocab):
+    batch, iterations = 64, 128
+    row = torch.linspace(-2, 2, vocab, device=device).bfloat16()
+    logits = row.expand(batch, -1).contiguous()
+    launch, out, _, _, _ = _gumbel_buffers(glm, device, logits, [1.] * batch, 83)
+    counts = torch.zeros(4, dtype=torch.int64)
+    for _ in range(iterations):
+        launch()
+        glm.synchronize()
+        counts += torch.bincount(out.cpu().long() * 4 // vocab, minlength=4)
+    probabilities = row.float().softmax(0).cpu()
+    bins = torch.arange(vocab) * 4 // vocab
+    expected = torch.zeros(4).scatter_add_(0, bins, probabilities)
+    torch.testing.assert_close(counts.float() / (batch * iterations), expected, atol=.025, rtol=0)
+
+
+@pytest.mark.parametrize("value", [0., 1.e30, float("inf")])
+def test_gumbel_equal_logits_are_uniform_across_tiles(glm, device, value):
+    batch, vocab, iterations = 64, 2051, 128
+    support = [0, 1023, 1024, 2050]
+    logits = torch.full((batch, vocab), -float("inf"), device=device, dtype=torch.bfloat16)
+    logits[:, support] = value
+    launch, out, _, _, _ = _gumbel_buffers(glm, device, logits, [1.] * batch, 29)
+    counts = torch.zeros(vocab, dtype=torch.int64)
+    for _ in range(iterations):
+        launch()
+        glm.synchronize()
+        counts += torch.bincount(out.cpu().long(), minlength=vocab)
+    assert counts[support].sum().item() == batch * iterations
+    torch.testing.assert_close(counts[support].float() / (batch * iterations), torch.full((4,), .25), atol=.025, rtol=0)
+
+
+def test_gumbel_capture_rng_history_and_invalid_logits(glm, device):
+    batch, vocab, seed = 4, 1025, 2**32 - 7
+    logits = torch.zeros(batch, vocab, device=device, dtype=torch.bfloat16)
+    logits[0] = float("nan")
+    logits[1] = -float("inf")
+    launch, out, counter, history, counts = _gumbel_buffers(glm, device, logits, [1.] * batch, seed, window=3)
+    launch()
+    glm.synchronize()
+    glm.graph_begin_capture()
+    launch()
+    graph = glm.graph_end_capture()
+    executable = glm.graph_instantiate(graph)
+    try:
+        seen = []
+        for iteration in range(1, 9):
+            if iteration == 5:
+                logits[2:, :] = -float("inf")
+                logits[2:, -1] = 0
+                torch.cuda.synchronize(device)
+            glm.graph_launch(executable)
+            glm.synchronize()
+            tokens = out.cpu().tolist()
+            assert tokens[:2] == [0, 0]
+            if iteration >= 5:
+                assert tokens[2:] == [vocab - 1, vocab - 1]
+            else:
+                seen.append(tokens[2:])
+            assert counter.item() == (seed + (iteration + 1) * batch) % 2**32
+            assert counts.cpu().tolist() == [iteration + 1] * batch
+            assert history[:, iteration % 3].cpu().tolist() == tokens
+        assert len(set(map(tuple, seen))) > 1
+    finally:
+        glm.graph_exec_destroy(executable)
+        glm.graph_destroy(graph)
+
+
 def _sample_buffers(glm, device, logits, top_ks, temperatures, top_ps, seed,
                     capacity=256, export="both"):
     sample = glm.lib.glm_sample_batch
@@ -284,6 +392,29 @@ def test_unrestricted_sampling_full_vocabulary_graph_replay(glm, device, top_k):
         if executable is not None:
             glm.graph_exec_destroy(executable)
         glm.graph_destroy(graph)
+
+
+@pytest.mark.parametrize("vocab", [255, 511, 512, 513, 129281])
+def test_unrestricted_draw_tile_boundaries(glm, device, vocab):
+    # Exercise both sides of the parallel-reduction dispatch and partial tiles.
+    # Sparse support forces empty intervals and tests the last vocabulary token.
+    logits = torch.full((3, vocab), -float("inf"), device=device, dtype=torch.bfloat16)
+    logits[0] = torch.linspace(-20, 0, vocab, device=device).bfloat16()
+    logits[1, [0, vocab // 2, vocab - 1]] = 0
+    logits[2, -1] = 0
+    seed = 317
+    launch, out, probs, _, counter = _sample_buffers(
+        glm, device, logits, [-1] * 3, [1.] * 3, [1.] * 3, seed, capacity=vocab)
+    for iteration in range(8):
+        launch()
+        glm.synchronize()
+        cumulative = probs.cpu().double().cumsum(-1)
+        expected = [torch.searchsorted(cumulative[row],
+                    lowbias32_uniform(seed + iteration * 3 + row) * cumulative[row, -1],
+                    right=True).item() for row in range(3)]
+        assert out.cpu().tolist() == expected
+        assert expected[2] == vocab - 1
+        assert counter.item() == seed + (iteration + 1) * 3
 
 
 @pytest.mark.parametrize("top_p", [0.0, 0.5, 1.0])
@@ -535,3 +666,88 @@ def test_sample_candidates_exported_q_rejection_global_lookup(glm, device):
     assert out.cpu()[0, 1].item() in [154879, 901, 70001]
     assert out.cpu()[1].tolist() == [123456, 123456]
     assert counter.cpu().item() == 25
+
+
+@pytest.mark.parametrize("vocab", [513, 129280])
+def test_full_vocabulary_speculative_rejection_matches_reference_under_replay(glm, device, vocab):
+    batch, depth, seed = 4, 3, 2**32 - 13
+    generator = torch.Generator().manual_seed(718)
+    p = torch.rand(batch, depth + 1, vocab, generator=generator) + 0.01
+    q = torch.rand(batch, depth, vocab, generator=generator) + 0.01
+    pi = torch.arange(vocab, dtype=torch.int32).expand(batch, depth + 1, vocab).clone()
+    qi = torch.arange(vocab, dtype=torch.int32).expand(batch, depth, vocab).clone()
+    drafts = torch.full((batch, depth), vocab - 1, dtype=torch.int32)
+    q[0] = p[0, :depth]  # Identical dense distributions always accept.
+    q[1].zero_()
+    qi[1].fill_(-1)
+    q[1, :, 0] = 1
+    qi[1, :, 0] = vocab - 1  # DSpark point mass at a high token ID.
+    p[1, :, -1] = 0  # Forced rejection: residual must cover the rest of V.
+    q[3].zero_()
+    qi[3].fill_(-1)
+    q[3, :, :3] = torch.tensor([0.6, 0.3, 0.1])
+    qi[3, :, :3] = torch.tensor([vocab - 1, 17, 400])
+    pd, qd, pid, qid, dd = [t.to(device) for t in (p, q, pi, qi, drafts)]
+    out = torch.empty(batch, depth + 1, dtype=torch.int32, device=device)
+    accepted = torch.empty(batch, dtype=torch.int32, device=device)
+    counter = torch.tensor([seed], dtype=torch.uint32, device=device)
+    reject = glm.lib.glm_spec_reject_linear
+    reject.restype = None
+    reject.argtypes = [ctypes.c_void_p] * 9 + [ctypes.c_int] * 3
+
+    def launch():
+        reject(glm.ctx, out.data_ptr(), accepted.data_ptr(), dd.data_ptr(),
+               qd.data_ptr(), qid.data_ptr(), pd.data_ptr(), pid.data_ptr(),
+               counter.data_ptr(), batch, depth, vocab)
+
+    def draw(probabilities, uniform):
+        cumulative = probabilities.double().cumsum(0)
+        return int(torch.searchsorted(cumulative, uniform * cumulative[-1], right=True))
+
+    torch.cuda.synchronize(device)
+    launch()
+    glm.synchronize()
+    glm.graph_begin_capture()
+    launch()
+    graph = glm.graph_end_capture()
+    executable = None
+    try:
+        executable = glm.graph_instantiate(graph)
+        for iteration in range(1, 4):
+            # Change the target tail between replays; Q and proposal IDs remain fixed.
+            p[2, :, vocab // 2:] *= 1.25
+            pd.copy_(p)
+            torch.cuda.synchronize(device)
+            glm.graph_launch(executable)
+            glm.synchronize()
+            expected, counts = [], []
+            stride = 2 * depth + 2
+            for b in range(batch):
+                base = seed + (iteration * batch + b) * stride
+                row = [draw(p[b, d], lowbias32_uniform(base + d)) for d in range(depth + 1)]
+                count = depth
+                for d in range(depth):
+                    pn = p[b, d].double() / p[b, d].double().sum()
+                    qn = torch.zeros(vocab, dtype=torch.float64)
+                    valid = qi[b, d] >= 0
+                    qn[qi[b, d, valid].long()] = q[b, d, valid].double()
+                    qn /= qn.sum()
+                    token = int(drafts[b, d])
+                    uniform = lowbias32_uniform(base + depth + 1 + d)
+                    if qn[token] > 0 and uniform < min(1, pn[token] / qn[token]):
+                        row[d] = token
+                    else:
+                        count = d
+                        residual = (pn - qn).clamp_min(0)
+                        row[d] = draw(residual if residual.sum() > 0 else pn, lowbias32_uniform(base + stride - 1))
+                        break
+                expected.append(row)
+                counts.append(count)
+            assert out.cpu().tolist() == expected
+            assert accepted.cpu().tolist() == counts
+            assert counts[0] == depth and counts[1] == 0
+            assert counter.item() == (seed + (iteration + 1) * batch * stride) % 2**32
+    finally:
+        if executable is not None:
+            glm.graph_exec_destroy(executable)
+        glm.graph_destroy(graph)

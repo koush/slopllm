@@ -3598,6 +3598,39 @@ export class ParallelOps implements DeviceOps {
     }
   }
 
+  sampleGumbel(outTokens: Tensor, scratch: Tensor, logits: Tensor, temperatures: Tensor, counter: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number): void {
+    const input = logits as ParallelTensor;
+    if (input.parallelism === TensorParallelism.Row || input.parallelism === TensorParallelism.Column) {
+      using gathered = input.allGather(input.workspace);
+      this.sampleGumbel(outTokens, scratch, gathered, temperatures, counter, penaltyTokens, penaltyCount, maxWindow, vocabSize, batchSize);
+      return;
+    }
+    if (input.parallelism === TensorParallelism.PartialSum) input.allReduce();
+    const tensors = [outTokens, scratch, logits, temperatures, counter, penaltyTokens, penaltyCount] as ParallelTensor[];
+    for (const tensor of tensors) {
+      if (tensor.parallelism !== TensorParallelism.Replicated || tensor.shards.length !== this.worldSize) {
+        throw new Error(`sampleGumbel requires replicated tensors with ${this.worldSize} shards`);
+      }
+    }
+    const [out, work, values, temps, rng, history, count] = tensors;
+    for (let i = 0; i < this.worldSize; ++i) {
+      this.devices[i].sampleGumbel(out.shards[i], work.shards[i], values.shards[i], temps.shards[i], rng.shards[i], history.shards[i], count.shards[i], maxWindow, vocabSize, batchSize);
+    }
+  }
+
+  specAcceptDeterministic(outAccepted: Tensor, targetTokens: Tensor, draftTokens: Tensor, batchSize: number, depth: number): void {
+    const tensors = [outAccepted, targetTokens, draftTokens] as ParallelTensor[];
+    for (const tensor of tensors) {
+      if (tensor.parallelism !== TensorParallelism.Replicated || tensor.shards.length !== this.worldSize) {
+        throw new Error(`specAcceptDeterministic requires replicated tensors with ${this.worldSize} shards`);
+      }
+    }
+    const [accepted, target, draft] = tensors;
+    for (let i = 0; i < this.worldSize; i++) {
+      this.devices[i].specAcceptDeterministic(accepted.shards[i], target.shards[i], draft.shards[i], batchSize, depth);
+    }
+  }
+
   specRejectLinear(outTokens: Tensor, outAccepted: Tensor, draftTokens: Tensor, qProbs: Tensor, qIds: Tensor, pProbs: Tensor, pIds: Tensor, stepCounter: Tensor, batchSize: number, depth: number, capacity: number): void {
     const tensors = [outTokens, outAccepted, draftTokens, qProbs, qIds, pProbs, pIds, stepCounter] as ParallelTensor[];
     for (const tensor of tensors) {

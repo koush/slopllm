@@ -362,6 +362,12 @@ export class MetaOps implements DeviceOps {
     specRejectLinear(outTokens: Tensor, outAccepted: Tensor, draftTokens: Tensor, qProbs: Tensor, qIds: Tensor, pProbs: Tensor, pIds: Tensor, stepCounter: Tensor, batchSize: number, depth: number, capacity: number): void {
     }
 
+    specAcceptDeterministic(outAccepted: Tensor, targetTokens: Tensor, draftTokens: Tensor, batchSize: number, depth: number): void {
+    }
+
+    sampleGumbel(outTokens: Tensor, scratch: Tensor, logits: Tensor, temperatures: Tensor, counter: Tensor, penaltyTokens: Tensor, penaltyCount: Tensor, maxWindow: number, vocabSize: number, batchSize: number): void {
+    }
+
     synchronize(_streamIdx?: number): void {
         notifySynchronizedWorkspaces(this.synchronizeListeners);
     }

@@ -16,7 +16,18 @@ DSpark speculative decoding is available with `--mtp 4` (verification depths
 1–5 are supported). The checkpoint's three draft layers always process all five
 positions; only the requested proposal prefix is verified. Drafting is greedy
 after the full-vocabulary rank-256 Markov correction. Sampled targets use exact
-point-mass rejection sampling under the existing MTP sampling constraints.
+point-mass verification, including unrestricted full-vocabulary sampling. Target
+rows are sampled once and the matching draft prefix is accepted; the first
+mismatching sample follows the exact conditional rejection residual. This avoids
+exporting or scanning dense proposal/target distributions for DSpark verification.
+Unrestricted targets with `top_p=1` and no penalties use tiled FP32 Gumbel-max
+sampling directly from logits, with Philox noise and no softmax/CDF materialization.
+Filtered sampling and probability exports retain the probability-based sampler.
+Gumbel sampling preserves the target distribution but uses a different seeded
+token stream from the probability-based draw.
+General stochastic proposals still use rejection sampling with distribution storage
+that grows outside capture when target support exceeds 256 candidates.
+Repetition and presence penalties remain unsupported during MTP.
 Confidence-based adaptation and sampled drafting are not enabled.
 
 The model collects mHC-mean inputs to backbone layers 37–39, projects their
