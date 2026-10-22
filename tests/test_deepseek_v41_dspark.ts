@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
 import { CaptureManager } from "../src/capture-manager";
-import { DeepseekV41Model, LayerHolders } from "../src/deepseek_v41_model";
+import { DeepseekV41Model, selectCompressorCarry, type LayerHolders, type PreparedLayerHolders } from "../src/deepseek_v41_model";
 import { DeepseekV41Cache } from "../src/deepseek_v41_cache";
 import { ExecutionWorkspace } from "../src/execution-workspace";
 import { freeModelRuntime, loadModelRuntime, parseModelArgs } from "../src/model_cli";
@@ -13,6 +13,32 @@ import { PagedKVCache } from "../src/paged_kv";
 import { WorkspaceBase } from "../src/workspace";
 import { SamplingWorkspace } from "../src/sampling";
 import { dsv41Route } from "./deepseek_v41_oracles";
+import { DisposableSet, UsingHolder, UsingHolderMap } from "../src/using-holder";
+
+const sources = [2, 8, 14];
+
+function outputCarry(holders: PreparedLayerHolders, ws: ExecutionWorkspace, source: number, batch: number) {
+  holders.compressorOutputPending.set(source, ws.alloc([batch, 1024], "F32"));
+  holders.compressorOutputPositions.set(source, ws.alloc([batch], "I32"));
+  return { pending: holders.compressorOutputPending.get(source)!, pendingPosition: holders.compressorOutputPositions.get(source)! };
+}
+
+function carryInputs(pending: UsingHolderMap<number, Tensor>, positions: UsingHolderMap<number, Tensor>) {
+  return Object.fromEntries([
+    ...Array.from(pending.entries(), ([layer, tensor]) => [`pending.${layer}`, tensor] as const),
+    ...Array.from(positions.entries(), ([layer, tensor]) => [`position.${layer}`, tensor] as const),
+  ]);
+}
+
+function withHolders<T>(model: DeepseekV41Model, state: ExecutionState, holders: LayerHolders | undefined,
+  cb: (holders: PreparedLayerHolders) => T): T {
+  const scoped = model as unknown as {
+    forwardWithLayerHolders<T>(state: ExecutionState, holders: LayerHolders | undefined,
+      cb: (holders: PreparedLayerHolders) => Generator<void, T, void>): Generator<void, T, void>;
+    runPhased<T>(forward: Generator<void, T, void>): T;
+  };
+  return scoped.runPhased(scoped.forwardWithLayerHolders(state, holders, function* (prepared) { return cb(prepared); }));
+}
 
 it("DSpark top-3 routing matches independent sqrt-softplus selection and weights", {
   skip: process.env.SLOPLLM_TEST_DSV41_RESIDENT === "1",
@@ -33,50 +59,74 @@ it("DSpark top-3 routing matches independent sqrt-softplus selection and weights
   }
 });
 
-it("DSpark accepts first-half projection rows without mutating the preceding carry", {
+it("DSpark selects accepted projection rows into stable caller-owned carry buffers", {
   skip: process.env.SLOPLLM_TEST_DSV41_RESIDENT === "1",
 }, () => {
   using ops = new GlmOps(0);
   using model = new DeepseekV41Model(ops, { eosTokenId: 1 } as DeepseekV41Config);
   using cache = new DeepseekV41Cache(model, 2, 2, 128);
   using ws = new ExecutionWorkspace(ops, 2, 16);
-  using scope = new LayerHolders(ws);
+  using carry = new UsingHolderMap<number, Tensor>();
+  using positions = new UsingHolderMap<number, Tensor>();
   const seed = { cache, ws, slot: 0, batchSize: 2, totalTokens: 2, extras: new Map() } as unknown as ExecutionState;
-  using first = scope.planCompressor(seed);
-  using retained = scope.compressorCarry.get(2)!.value.viewClone();
+  const initial = withHolders(model, seed, undefined, holders => {
+    for (const source of sources) {
+      const output = outputCarry(holders, ws, source, 2);
+      output.pending.fill(99, output.pending.numElements); output.pendingPosition.fill(2, 2);
+    }
+    return { pending: Object.fromEntries(holders.compressorOutputPending.detachAll()),
+      positions: Object.fromEntries(holders.compressorOutputPositions.detachAll()) };
+  });
+  for (const source of sources) { carry.set(source, initial.pending[source]); positions.set(source, initial.positions[source]); }
+  using retained = carry.get(2)!.viewClone();
+  using retainedPosition = positions.get(2)!.viewClone();
   const state = { cache, ws, slot: 1, batchSize: 2, totalTokens: 10, seqLens: [5, 5], seqKvLens: [8, 9],
-    extras: new Map([["dsv41.retainCompressorRows", true]]) } as unknown as ExecutionState;
-  using holders = scope.planCompressor(state);
-  // Both steps are planned before the first producer writes its carry.
-  for (const output of first.compressorOutputs.values()) { output.pending.fill(99, output.pending.numElements); output.pendingPosition.fill(2, 2); }
-  first[Symbol.dispose]();
+    extras: new Map() } as unknown as ExecutionState;
   const values = Float32Array.from({ length: 10 * 1024 }, (_, i) => Math.floor(i / 1024));
-  for (const rows of holders.compressorRows.values()) {
-    using raw = ws.alloc([10, 1024], "F32");
-    raw.h2d(Buffer.from(values.buffer));
-    rows.replace(raw.viewClone());
+  using rows = new UsingHolderMap<number, Tensor>();
+  const returnedRows = withHolders(model, state,
+    { compressorInputPending: carry, compressorInputPositions: positions, compressorRows: rows }, holders => {
+    for (const source of sources) {
+      using raw = ws.alloc([10, 1024], "F32");
+      raw.h2d(Buffer.from(values.buffer));
+      holders.compressorRows!.set(source, raw.viewClone());
+    }
+    assert.equal(carry.get(2), initial.pending[2], "Forward must not publish new carry into its input map");
+    return Object.fromEntries(rows.detachAll());
+  });
+  for (const source of sources) rows.set(source, returnedRows[source]);
+  using selected = new UsingHolderMap<number, Tensor>();
+  using selectedPositions = new UsingHolderMap<number, Tensor>();
+  for (const source of sources) {
+    const copy = ws.alloc([2, 1024], "F32");
+    selected.set(source, copy);
+    copy.memcpy(carry.get(source)!);
   }
-  holders.commitCompressor(state, [0, 2]);
-  for (const holder of scope.compressorCarry.values()) {
-    assert.deepEqual(holder.value.pendingPosition.readInt32LEArray(), [2, 6]);
-    const bytes = Buffer.alloc(holder.value.pending.bytes); holder.value.pending.d2h(bytes);
+  selectCompressorCarry(state, [0, 2], selected, selectedPositions, rows);
+  for (const source of sources) {
+    const holder = selected.get(source)!;
+    assert.deepEqual(selectedPositions.get(source)!.readInt32LEArray(), [2, 6]);
+    const bytes = Buffer.alloc(holder.bytes); holder.d2h(bytes);
     const actual = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.length / 4);
     assert(actual.subarray(0, 1024).every(value => value === 99));
     assert(actual.subarray(1024).every(value => value === 7));
   }
-  holders.commitCompressor(state, [4, 0]);
-  const rows = [...holders.compressorRows.values()].map(holder => holder.value);
-  holders[Symbol.dispose]();
-  assert(rows.every(row => row.disposed));
-  for (const holder of scope.compressorCarry.values()) {
-    assert.deepEqual(holder.value.pendingPosition.readInt32LEArray(), [6, 4]);
+  selectCompressorCarry(state, [4, 0], carry, positions, rows);
+  rows[Symbol.dispose]();
+  assert(Object.values(returnedRows).every(row => row.disposed));
+  for (const source of sources) {
+    assert.equal(carry.get(source), initial.pending[source]);
+    assert.equal(positions.get(source), initial.positions[source]);
+    assert.deepEqual(positions.get(source)!.readInt32LEArray(), [6, 4]);
   }
-  const bytes = Buffer.alloc(retained.pending.bytes); retained.pending.d2h(bytes);
-  assert(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.length / 4).every(value => value === 99));
-  assert.deepEqual(retained.pendingPosition.readInt32LEArray(), [2, 2]);
+  const bytes = Buffer.alloc(retained.bytes); retained.d2h(bytes);
+  const acceptedRows = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.length / 4);
+  assert(acceptedRows.subarray(0, 1024).every(value => value === 3));
+  assert(acceptedRows.subarray(1024).every(value => value === 5));
+  assert.deepEqual(retainedPosition.readInt32LEArray(), [6, 4]);
 });
 
-it("DSpark layer holders release per-step rows after captured verification while carry survives", {
+for (const verify of [false, true]) it(`DSpark ${verify ? "verification rows" : "carry outputs"} survive captured execution with caller-owned maps`, {
   skip: process.env.SLOPLLM_TEST_DSV41_RESIDENT === "1",
 }, () => {
   using ops = new GlmOps(0);
@@ -84,68 +134,91 @@ it("DSpark layer holders release per-step rows after captured verification while
   using cache = new DeepseekV41Cache(model, 2, 1, 128);
   using ws = new ExecutionWorkspace(ops, 1, 2);
   using manager = new CaptureManager(ops);
-  using scope = new LayerHolders(ws);
+  using carry = new UsingHolderMap<number, Tensor>();
+  using carryPositions = new UsingHolderMap<number, Tensor>();
   using raw = ws.alloc([2, 1024], "F32");
   using positions = ws.alloc([2], "I32");
   using cu = ws.alloc([2], "I32");
   using norm = ws.alloc([512], "BF16");
   cu.h2d(Buffer.from(Int32Array.of(0, 2).buffer)); norm.fill(1, 512);
-  const seed = { cache, batchSize: 1, totalTokens: 2, extras: new Map() } as unknown as ExecutionState;
-  {
-    using holders = scope.planCompressor(seed);
-    for (const output of holders.compressorOutputs.values()) {
+  const seed = { cache, ws, batchSize: 1, totalTokens: 2, extras: new Map() } as unknown as ExecutionState;
+  const initial = withHolders(model, seed, undefined, holders => {
+    for (const source of sources) {
+      const output = outputCarry(holders, ws, source, 1);
       output.pending.fill(0, output.pending.numElements);
       output.pendingPosition.fill(-1, 1);
     }
-  }
+    return { pending: Object.fromEntries(holders.compressorOutputPending.detachAll()),
+      positions: Object.fromEntries(holders.compressorOutputPositions.detachAll()) };
+  });
+  for (const source of sources) { carry.set(source, initial.pending[source]); carryPositions.set(source, initial.positions[source]); }
   let forwardCalls = 0;
   for (let step = 0; step < 24; ++step) {
-    const state = { cache, batchSize: 1, totalTokens: 2, seqLens: [2], seqKvLens: [step * 2 + 2],
-      extras: new Map([["dsv41.retainCompressorRows", true]]) } as unknown as ExecutionState;
-    using holders = scope.planCompressor(state);
+    const state = { cache, ws, batchSize: 1, totalTokens: 2, seqLens: [2], seqKvLens: [step * 2 + 2],
+      extras: new Map() } as unknown as ExecutionState;
     raw.fill(step + 1, raw.numElements);
     positions.h2d(Buffer.from(Int32Array.of(step * 2, step * 2 + 1).buffer));
-    const buffers = [...holders.compressorInputs.values(), ...holders.compressorOutputs.values()]
-      .flatMap(carry => [carry.pending, carry.pendingPosition]);
-    const execution = manager.execute({ states: [], inputs: { ...holders.captureInputs(), raw, positions, cu, norm },
-      key: ["holder-carry", JSON.stringify(buffers.map(t => t.memoryRanges()))] }, input => {
+    using rows = verify ? new UsingHolderMap<number, Tensor>() : undefined;
+    const execution = manager.execute({ states: [], inputs: { ...carryInputs(carry, carryPositions), raw, positions, cu, norm },
+      key: ["holder-carry", Number(verify)] }, input => withHolders(model, state,
+        { compressorInputPending: carry, compressorInputPositions: carryPositions, compressorRows: rows }, holders => {
       forwardCalls++;
-      for (const [layer, output] of holders.compressorOutputs) {
+      assert.equal(holders.compressorRows, rows, "Row retention is requested only by the caller");
+      for (const source of sources) {
+        const output = outputCarry(holders, ws, source, 1);
         // Retain an intermediate produced inside the graph, not its input.
         using projected = input.raw.add(input.raw);
-        holders.compressorRows.get(layer)!.replace(projected.viewClone());
-        const previous = holders.compressorInputs.get(layer)!;
+        holders.compressorRows?.set(source, projected.viewClone());
         const result = projected.dsv41Compress(input.positions, input.cu, input.norm, 2,
-          previous.pending, previous.pendingPosition, 1e-20, output);
+          holders.compressorInputPending.get(source), holders.compressorInputPositions.get(source), 1e-20, output);
         using latent = result.latent;
         using valid = result.valid;
       }
-      return { compressorRows: holders.detachCompressorRows() };
-    });
-    holders.replaceCompressorRows(execution.result.compressorRows);
-    holders.commitCompressor(state, [0]);
-    const rows = [...holders.compressorRows.values()].map(holder => holder.value);
-    holders[Symbol.dispose]();
-    assert(rows.every(row => row.disposed));
-    for (const holder of scope.compressorCarry.values()) {
-      assert.deepEqual(holder.value.pendingPosition.readInt32LEArray(), [step * 2]);
-      const bytes = Buffer.alloc(holder.value.pending.bytes); holder.value.pending.d2h(bytes);
+      return { compressorRows: rows ? Object.fromEntries(rows.detachAll()) : {},
+        pending: verify ? {} : Object.fromEntries(holders.compressorOutputPending.detachAll()),
+        positions: verify ? {} : Object.fromEntries(holders.compressorOutputPositions.detachAll()) };
+    }));
+    if (verify) {
+      for (const source of sources) rows!.set(source, execution.result.compressorRows[source]);
+      selectCompressorCarry(state, [0], carry, carryPositions, rows!);
+      rows![Symbol.dispose]();
+    } else {
+      for (const source of sources) { carry.set(source, execution.result.pending[source]); carryPositions.set(source, execution.result.positions[source]); }
+      // Mutating caller bookkeeping must not alter capture's plain result structure.
+      const detached = carry.detach(2)!;
+      assert(execution.result.pending[2]);
+      carry.set(2, detached);
+    }
+    assert(Object.values(execution.result.compressorRows).every(row => row.disposed));
+    for (const source of sources) {
+      const holder = carry.get(source)!;
+      assert.deepEqual(carryPositions.get(source)!.readInt32LEArray(), [step * 2]);
+      const bytes = Buffer.alloc(holder.bytes); holder.d2h(bytes);
       assert(new Float32Array(bytes.buffer, bytes.byteOffset, bytes.length / 4).every(value => value === 2 * (step + 1)));
     }
-    ws.assertClear([raw, positions, cu, norm, ...Object.values(scope.captureInputs())]);
+    ws.assertClear([raw, positions, cu, norm, ...Object.values(carryInputs(carry, carryPositions))]);
     ws.resetPlanSlots();
   }
   assert([...manager.captured.values()].some(graph => graph.graphExec !== null));
   assert(forwardCalls < 24, "verification must consume refreshed rows from replay without running the callback");
-  const carryTensors = [...scope.compressorCarry.values()].flatMap(holder => [holder.value.pending, holder.value.pendingPosition]);
-  scope[Symbol.dispose]();
+  if (verify) {
+    assert.equal(manager.captured.size, 1, "Acceptance must preserve the graph input address signature");
+    assert.equal(forwardCalls, 4, "After three warmups and capture, all remaining verification steps must replay");
+    for (const source of sources) {
+      assert.equal(carry.get(source), initial.pending[source]);
+      assert.equal(carryPositions.get(source), initial.positions[source]);
+    }
+  }
+  const carryTensors = Object.values(carryInputs(carry, carryPositions));
+  carry[Symbol.dispose]();
+  carryPositions[Symbol.dispose]();
   assert(carryTensors.every(tensor => tensor.disposed), "Closing the execution scope releases recurrent state");
-  assert.equal(scope.compressorCarry.size, 0);
+  assert.equal(carry.get(2), undefined);
   ws.assertClear([raw, positions, cu, norm]);
   assert(!("compressorCarry" in cache) && !("compressorWorkspace" in cache));
-  using restarted = new LayerHolders(ws);
-  using fresh = restarted.planCompressor(seed);
-  assert.equal(fresh.compressorInputs.size, 0, "A restarted scope must recondition rather than inherit old carry");
+  withHolders(model, seed, undefined, fresh => {
+    assert.equal(fresh.compressorInputPending.get(2), undefined, "A restarted scope must recondition rather than inherit old carry");
+  });
 });
 
 it("decode wrapper disposes generator-owned workspace tensors before its final assertion", {
@@ -221,11 +294,11 @@ it("DSpark resident draft/verify supports capture, accepted carry, restart and b
     await prefill();
     const run = async (capture: boolean) => {
       const results: { tokens: number[][]; accepted: number[] }[] = [];
-      const prepare = model.prepareForward;
+      const forward = model.forwardModel;
       let scope: LayerHolders | undefined;
-      model.prepareForward = function(state, resources) {
-        scope = resources as LayerHolders;
-        return prepare.call(this, state, resources);
+      model.forwardModel = function(state, holders) {
+        scope = holders;
+        return forward.call(this, state, holders);
       };
       const generator = model.generateMtpDecode(ws, cache, 4, capture ? manager : undefined);
       try {
@@ -237,13 +310,13 @@ it("DSpark resident draft/verify supports capture, accepted carry, restart and b
             assert.equal(result.value.tokens[b].length, result.value.numAccepted[b] + 1);
             assert.equal(cache.sequences[b].reportedTokenCount(), cache.sequences[b].allocLen);
             assert(cache.draft!.sequences[b].allocLen <= 196);
-            for (const carry of scope!.compressorCarry.values()) {
-              assert.equal(carry.value.pendingPosition.readInt32LEArray()[b], (cache.sequences[b].allocLen - 1) & ~1);
+            for (const source of sources) {
+              assert.equal(scope!.compressorInputPositions!.get(source)!.readInt32LEArray()[b], (cache.sequences[b].allocLen - 1) & ~1);
             }
           }
         }
-      } finally { await generator.return(); model.prepareForward = prepare; }
-      assert.equal(scope!.compressorCarry.size, 0, "Generator close releases recurrent carry");
+      } finally { await generator.return(); model.forwardModel = forward; }
+      assert.equal(scope!.compressorInputPending!.get(2), undefined, "Generator close releases recurrent carry");
       assert.equal(cache.draft!.sequences.length, 0);
       return results;
     };

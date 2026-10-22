@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { it } from "node:test";
 import { CaptureManager } from "../src/capture-manager";
-import { CompressorCarry, DeepseekV41Model, LayerHolders } from "../src/deepseek_v41_model";
+import { DeepseekV41Model, type LayerHolders } from "../src/deepseek_v41_model";
+import type { Tensor } from "../src/tensor";
 import { UsingHolder } from "../src/using-holder";
 import { DeepseekV41Cache } from "../src/deepseek_v41_cache";
 import { ExecutionWorkspace } from "../src/execution-workspace";
@@ -74,9 +75,9 @@ it("V4.1 resident generation supports batched chunks, captured decode, and rollb
     runtime.ops.mhcPost = function (...args) { posts++; return mhcPost.apply(this, args); };
     runtime.ops.dsv4LocalSlots = function (...args) { localMappings++; return localSlots.apply(this, args); };
     runtime.ops.dsv4TopkToSlots = function (...args) { sharedMappings++; return sharedSlots.apply(this, args); };
-    model.forwardPhased = function* (state) {
+    model.forwardPhased = function* (state, holders) {
       posts = localMappings = sharedMappings = 0;
-      const forward = phasedForward.call(this, state);
+      const forward = phasedForward.call(this, state, holders);
       let phases = 0;
       try {
         for (;;) {
@@ -110,19 +111,20 @@ it("V4.1 resident generation supports batched chunks, captured decode, and rollb
       runtime.ops.dsv4TopkToSlots = sharedSlots;
     }
     assert.deepEqual(targets.map(token => model.tokenizer.decode([token!])), [" Paris", " Berlin"]);
-    const prepare = model.prepareForward;
+    const forward = model.forwardModel;
     let scope: LayerHolders | undefined;
-    model.prepareForward = function(state, resources) {
-      scope = resources as LayerHolders;
-      return prepare.call(this, state, resources);
+    model.forwardModel = function(state, holders) {
+      scope = holders;
+      return forward.call(this, state, holders);
     };
-    using retainedCarry = new UsingHolder<CompressorCarry>(undefined!);
-    const captureInputs = model.forwardCaptureInputs;
-    model.forwardCaptureInputs = function(state) {
-      return { ...captureInputs.call(this, state), ...(retainedCarry.value ? {
-        retainedPending: retainedCarry.value.pending,
-        retainedPosition: retainedCarry.value.pendingPosition,
-      } : {}) };
+    using retainedPending = new UsingHolder<Tensor>(undefined!);
+    using retainedPosition = new UsingHolder<Tensor>(undefined!);
+    const execute = manager.execute.bind(manager);
+    manager.execute = function(options, fn) {
+      return execute({ ...options, inputs: { ...options.inputs, ...(retainedPending.value ? {
+        retainedPending: retainedPending.value,
+        retainedPosition: retainedPosition.value,
+      } : {}) } }, fn);
     };
     let carryBytes: Buffer, carryPosition: number[];
     const decode = model.generateDecode(ws, cache, manager);
@@ -131,15 +133,16 @@ it("V4.1 resident generation supports batched chunks, captured decode, and rollb
       for (let i = 0; i < 20; i++) {
         const step = await decode.next();
         if (i === 0) {
-          retainedCarry.replace(scope!.compressorCarry.get(2)!.value.viewClone());
-          carryBytes = Buffer.alloc(retainedCarry.value.pending.bytes);
-          retainedCarry.value.pending.d2h(carryBytes);
-          carryPosition = retainedCarry.value.pendingPosition.readInt32LEArray();
+          retainedPending.replace(scope!.compressorInputPending!.get(2)!.viewClone());
+          retainedPosition.replace(scope!.compressorInputPositions!.get(2)!.viewClone());
+          carryBytes = Buffer.alloc(retainedPending.value.bytes);
+          retainedPending.value.d2h(carryBytes);
+          carryPosition = retainedPosition.value.readInt32LEArray();
         } else {
-          const bytes = Buffer.alloc(retainedCarry.value.pending.bytes);
-          retainedCarry.value.pending.d2h(bytes);
+          const bytes = Buffer.alloc(retainedPending.value.bytes);
+          retainedPending.value.d2h(bytes);
           assert.deepEqual(bytes, carryBytes!, "Retained carry survives steps within its generator");
-          assert.deepEqual(retainedCarry.value.pendingPosition.readInt32LEArray(), carryPosition!);
+          assert.deepEqual(retainedPosition.value.readInt32LEArray(), carryPosition!);
         }
         capturedTokens.push(step.value!.tokens);
         assert.equal(step.done, false);
@@ -149,12 +152,13 @@ it("V4.1 resident generation supports batched chunks, captured decode, and rollb
         assert.equal(step.value!.tokens.length, 2);
       }
     } finally {
-      retainedCarry.release();
+      retainedPending.release();
+      retainedPosition.release();
       await decode.return();
-      model.prepareForward = prepare;
-      model.forwardCaptureInputs = captureInputs;
+      model.forwardModel = forward;
+      manager.execute = execute;
     }
-    assert.equal(scope!.compressorCarry.size, 0, "Generator close releases recurrent carry");
+    assert.equal(scope!.compressorInputPending!.get(2), undefined, "Generator close releases recurrent carry");
     assert.ok([...manager.captured.values()].some(c => c.graphExec !== null), "Decode must instantiate and replay a CUDA graph");
     using eagerCache = model.createChatCache(16, 2, 128);
     eagerCache.reset(2);
@@ -236,9 +240,9 @@ it("V4.1 resident generation supports batched chunks, captured decode, and rollb
     assert.equal(paged.sequences[1].pages[0], donor.pages[0]);
     const originalForward = model.forwardPhased;
     let forwarded = 0;
-    model.forwardPhased = function* (state) {
+    model.forwardPhased = function* (state, holders) {
       forwarded += state.totalTokens;
-      return yield* originalForward.call(this, state);
+      return yield* originalForward.call(this, state, holders);
     };
     try {
       const reused = await model.executePrefill(ws, reuseCache, [[], suffix], undefined, 64);

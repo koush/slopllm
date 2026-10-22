@@ -404,7 +404,7 @@ export abstract class ChatModel extends WorkspaceBase {
 
   /** Read the caller-published pending token without modifying committed model state. */
   protected async prepareDecodeInput(_ws: ExecutionWorkspace, cache: ChatCache,
-    _samplingPolicy: TokenSelector, _resources?: Disposable): Promise<number[]> {
+    _samplingPolicy: TokenSelector): Promise<number[]> {
     const sequences = cache.getPagedKV().sequences;
     if (!sequences.length || sequences.some(sequence => sequence.targetToken === undefined
       || sequence.reportedTokenCount() !== sequence.allocLen)) {
@@ -412,9 +412,6 @@ export abstract class ChatModel extends WorkspaceBase {
     }
     return sequences.map(sequence => sequence.targetToken!);
   }
-
-  /** Optional recurrent execution state owned by one decode generator. */
-  protected createDecodeResources(_ws: ExecutionWorkspace, _cache: ChatCache): Disposable | undefined { return undefined; }
 
   /** Consume the caller-published pending target and yield newly selected tokens. */
   async *generateDecode(
@@ -440,8 +437,7 @@ export abstract class ChatModel extends WorkspaceBase {
     const pagedKV = cache.getPagedKV();
     const sequences = pagedKV.sequences.slice();
     const batchSize = sequences.length;
-    using resources = this.createDecodeResources(ws, cache);
-    let nextTokens = await this.prepareDecodeInput(ws, cache, samplingPolicy, resources);
+    let nextTokens = await this.prepareDecodeInput(ws, cache, samplingPolicy);
     {
       while (true) {
         ws.resetPlanSlots();
@@ -454,9 +450,9 @@ export abstract class ChatModel extends WorkspaceBase {
         state.setInput([nextTokens]);
         let warmup: boolean;
         {
-          using forwardResources = this.prepareForward(state, resources);
-          const captureKey = ["decode", samplingPolicy.captureKey ?? "greedy", ...this.forwardCaptureKey(state)];
-          const execution = executionManager.execute({ states: [state], inputs: this.forwardCaptureInputs(state), key: captureKey }, () => {
+          this.prepareForward(state);
+          const captureKey = ["decode", samplingPolicy.captureKey ?? "greedy"];
+          const execution = executionManager.execute({ states: [state], inputs: {}, key: captureKey }, () => {
             using hidden = this.forwardModel(state);
             using logits = state.computeLogits(hidden, this);
             return samplingPolicy.selectTarget(logits);
@@ -486,14 +482,8 @@ export abstract class ChatModel extends WorkspaceBase {
     return new DefaultChatModelParser(this.tokenizer);
   }
 
-  /** Prepare metadata outside capture; callers retain returned resources through execution/replay. */
-  prepareForward(_state: ExecutionState, _resources?: Disposable): Disposable | undefined { return undefined; }
-
-  /** Model-owned persistent resources that distinguish otherwise identical graphs. */
-  forwardCaptureKey(_state: ExecutionState): (string | number)[] { return []; }
-
-  /** Preallocated execution tensors staged at capture entry and on replay. */
-  forwardCaptureInputs(_state: ExecutionState): Record<string, Tensor> { return {}; }
+  /** Prepare metadata outside capture. */
+  prepareForward(_state: ExecutionState): void { }
 
   forward(state: ExecutionState): Tensor {
     using _tracker = state.ws.startTracking();

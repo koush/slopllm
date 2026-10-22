@@ -1,12 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
-import { ChatModel, type ChatCache, type CommonModelConfig, type GenerationConfig, type TokenSelector, type ChunkedPrefillPlan, type ChatTemplateKwargs, type MtpDecodeStepResult } from "./chat_model";
+import { CaptureManager } from "./capture-manager";
+import { ChatModel, type ChatCache, type CommonModelConfig, type GenerationConfig, type TokenSelector, type ChunkedPrefillPlan, type ChatTemplateKwargs, type MtpDecodeStepResult, type MtpStepResult } from "./chat_model";
 import { resolveCheckpointConfigDir, type CheckpointTensor } from "./checkpoint_source";
 import { type DeviceOps, TensorParallelism } from "./device_ops";
 import type { ExecutionState, ExecutionWorkspace } from "./execution-workspace";
 import { DeepseekV41Cache, DSV41_KV_SOURCES as KV_SOURCES, DSV41_INDEX_SOURCES as INDEX_SOURCES } from "./deepseek_v41_cache";
 import { DeepseekV41EngramHasher } from "./deepseek_v41_engram";
-import { UsingHolder, UsingHolderBase, DisposableSet } from "./using-holder";
+import { UsingHolder, UsingHolderBase, UsingHolderMap, DisposableSet } from "./using-holder";
 import { EagerExecution, type ExecutionManager } from "./execution-manager";
 import { PagedKVCache } from "./paged_kv";
 import { MemcpyKind } from "./enums";
@@ -22,84 +23,31 @@ export interface DeepseekV41Config extends CommonModelConfig {
   eosTokenId: number;
 }
 
-/** Immutable after its producing forward. Views retain both allocations. */
-export class CompressorCarry implements Disposable {
-  constructor(readonly pending: Tensor, readonly pendingPosition: Tensor) {}
-  viewClone(): CompressorCarry { return new CompressorCarry(this.pending.viewClone(), this.pendingPosition.viewClone()); }
-  [Symbol.dispose](): void { this.pending[Symbol.dispose](); this.pendingPosition[Symbol.dispose](); }
+const COMPRESSOR_SOURCES = KV_SOURCES.filter(source => source !== 20);
+
+export interface LayerHolders {
+  localSlots?: UsingHolder<Tensor>;
+  sharedSlots?: UsingHolder<Tensor>;
+  localLengths?: UsingHolder<Tensor>;
+  sharedLengths?: UsingHolder<Tensor>;
+  candidates?: UsingHolder<Tensor>;
+  compressorInputPending?: UsingHolderMap<number, Tensor>;
+  compressorInputPositions?: UsingHolderMap<number, Tensor>;
+  compressorOutputPending?: UsingHolderMap<number, Tensor>;
+  compressorOutputPositions?: UsingHolderMap<number, Tensor>;
+  /** Supplied by the caller only when projection rows must escape the forward. */
+  compressorRows?: UsingHolderMap<number, Tensor>;
 }
 
-export class LayerHolders extends DisposableSet {
-  readonly localSlots = new UsingHolder<Tensor>(undefined!);
-  readonly sharedSlots = new UsingHolder<Tensor>(undefined!);
-  readonly localLengths = new UsingHolder<Tensor>(undefined!);
-  readonly sharedLengths = new UsingHolder<Tensor>(undefined!);
-  readonly candidates = new UsingHolder<Tensor>(undefined!);
-  readonly compressorInputs = new Map<number, CompressorCarry>();
-  readonly compressorOutputs = new Map<number, CompressorCarry>();
-  readonly compressorRows = new Map<number, UsingHolder<Tensor>>();
-  readonly compressorCarry: Map<number, UsingHolder<CompressorCarry>>;
-  private state?: ExecutionState;
+export type PreparedLayerHolders = Required<Omit<LayerHolders, "compressorRows">> & Pick<LayerHolders, "compressorRows">;
 
-  constructor(readonly ws: ExecutionWorkspace, private readonly parent?: LayerHolders) {
-    super();
-    this.add(this.localSlots);
-    this.add(this.sharedSlots);
-    this.add(this.localLengths);
-    this.add(this.sharedLengths);
-    this.add(this.candidates);
-    this.compressorCarry = parent?.compressorCarry ?? new Map();
-    if (!parent) {
-      for (const source of KV_SOURCES.filter(source => source !== 20)) {
-        const holder = new UsingHolder<CompressorCarry>(undefined!);
-        this.add(holder);
-        this.compressorCarry.set(source, holder);
-      }
-    }
-  }
-
-  planCompressor(state: ExecutionState): LayerHolders {
-    const planned = new LayerHolders(this.ws, this);
-    planned.state = state;
-    const cache = state.cache as DeepseekV41Cache;
-    try {
-      // Retain each plan's inputs before publishing fresh carry, including
-      // plan+plan+run+run. The caller owns these references through execution.
-      for (const [source, holder] of this.compressorCarry) {
-        if (holder.value) {
-          const input = holder.value.viewClone();
-          planned.add(input);
-          planned.compressorInputs.set(source, input);
-        }
-        const pending = this.ws.alloc([cache.maxBatch, 1024], "F32");
-        planned.add(pending);
-        const position = this.ws.alloc([cache.maxBatch], "I32");
-        planned.add(position);
-        if (state.batchSize < cache.maxBatch) {
-          using unused = position.narrow(state.batchSize, cache.maxBatch - state.batchSize);
-          unused.fill(-1, unused.numElements);
-        }
-        const output = new CompressorCarry(pending, position);
-        planned.compressorOutputs.set(source, output);
-        holder.replace(output.viewClone());
-        if (state.extras.get("dsv41.retainCompressorRows")) {
-          const rows = new UsingHolder<Tensor>(undefined!);
-          planned.add(rows);
-          planned.compressorRows.set(source, rows);
-        }
-      }
-    } catch (error) {
-      planned[Symbol.dispose]();
-      throw error;
-    }
-    return planned;
-  }
-
-  /** Select the unfinished pair at each accepted verification boundary. */
-  commitCompressor(state: ExecutionState, accepted: readonly number[]): void {
+/** Update caller-owned carry at the accepted boundary without changing capture input addresses. */
+export function selectCompressorCarry(state: ExecutionState, accepted: readonly number[],
+  carryPending: UsingHolderMap<number, Tensor>, carryPositions: UsingHolderMap<number, Tensor>,
+  rows: UsingHolderMap<number, Tensor>): void {
     if (accepted.length !== state.batchSize || accepted.some((count, b) => !Number.isInteger(count)
       || count < 0 || count >= state.seqLens[b])) throw new Error("Invalid compressor acceptance boundary");
-    const ws = this.ws, maxBatch = (state.cache as DeepseekV41Cache).maxBatch;
+    const ws = state.ws, maxBatch = (state.cache as DeepseekV41Cache).maxBatch;
     const indices = new Int32Array(maxBatch), positions = new Int32Array(maxBatch).fill(-1);
     let offset = 0;
     for (let b = 0; b < maxBatch; b++) {
@@ -112,51 +60,19 @@ export class LayerHolders extends DisposableSet {
       offset += state.seqLens[b];
     }
     using selection = ws.alloc([maxBatch], "I32"); selection.h2d(Buffer.from(indices.buffer));
-    for (const [layer, holder] of this.compressorCarry) {
-      const previous = this.compressorInputs.get(layer);
-      const rows = this.compressorRows.get(layer)?.value;
-      if (!previous || !rows) throw new Error("Compressor verification requires retained inputs and projection rows");
-      using joined = previous.pending.cat([rows], 0);
-      const pending = joined.indexSelect(selection);
-      const position = ws.alloc([maxBatch], "I32"); position.h2d(Buffer.from(positions.buffer));
-      holder.replace(new CompressorCarry(pending, position));
+    for (const source of COMPRESSOR_SOURCES) {
+      const previous = carryPending.get(source), projected = rows.get(source);
+      if (!previous || !projected) throw new Error("Compressor verification requires retained inputs and projection rows");
+      using joined = previous.cat([projected], 0);
+       using pending = joined.indexSelect(selection);
+       previous.memcpy(pending);
+       let position = carryPositions.get(source);
+       if (!position) {
+         position = ws.alloc([maxBatch], "I32");
+         carryPositions.set(source, position);
+       }
+       position.h2d(Buffer.from(positions.buffer));
     }
-  }
-
-  detachCompressorRows(): Record<string, Tensor> {
-    return Object.fromEntries([...this.compressorRows].map(([layer, holder]) => [layer, holder.detach()]));
-  }
-
-  captureInputs(): Record<string, Tensor> {
-    const inputs: Record<string, Tensor> = {};
-    // Include holder views as well as planned inputs/outputs: siblings sharing
-    // an allocation are separate tracked tensors and must all be staged.
-    for (const [kind, carries] of [
-      ["input", this.compressorInputs], ["output", this.compressorOutputs],
-      ["carry", new Map([...this.compressorCarry].filter(([, holder]) => holder.value).map(([layer, holder]) => [layer, holder.value]))],
-    ] as const) {
-      for (const [layer, carry] of carries) {
-        inputs[`${kind}.${layer}.pending`] = carry.pending;
-        inputs[`${kind}.${layer}.position`] = carry.pendingPosition;
-      }
-    }
-    return inputs;
-  }
-
-  replaceCompressorRows(rows: Record<string, Tensor>): void {
-    for (const [layer, tensor] of Object.entries(rows)) this.compressorRows.get(Number(layer))!.replace(tensor);
-  }
-
-  override[Symbol.dispose](): void {
-    super[Symbol.dispose]();
-    this.compressorInputs.clear();
-    this.compressorOutputs.clear();
-    this.compressorRows.clear();
-    if (this.state?.extras.get("dsv41.layerHolders") === this) this.state.extras.delete("dsv41.layerHolders");
-    if (!this.parent) {
-      this.compressorCarry.clear();
-    }
-  }
 }
 
 interface DsparkPlan {
@@ -450,11 +366,7 @@ export class DeepseekV41Model extends ChatModel {
     return this.runPhased(this.forwardPhased(state, layerHolders));
   }
 
-  protected override createDecodeResources(ws: ExecutionWorkspace): LayerHolders {
-    return new LayerHolders(ws);
-  }
-
-  override prepareForward(state: ExecutionState, resources?: Disposable): LayerHolders {
+  override prepareForward(state: ExecutionState): void {
     const cache = state.cache;
     if (!(cache instanceof DeepseekV41Cache)) {
       throw new Error("V4.1 requires its own cache");
@@ -486,50 +398,49 @@ export class DeepseekV41Model extends ChatModel {
     pageHost.withPinnedBuffer(buffer => Buffer.from(pageIds.buffer).copy(buffer));
     pageTable.memcpy(pageHost, pageHost.bytes, MemcpyKind.HostToDevice);
     state.extras.set("dsv41.pages", pageTable);
-    let holders = state.extras.get("dsv41.layerHolders") as LayerHolders | undefined;
-    if (!holders) {
-      const parent = resources as LayerHolders | undefined ?? new LayerHolders(state.ws);
-      try {
-        holders = parent.planCompressor(state);
-        if (!resources) holders.add(parent);
-      } catch (error) {
-        if (!resources) parent[Symbol.dispose]();
-        throw error;
-      }
-    }
-    state.extras.set("dsv41.layerHolders", holders);
-    return holders;
   }
 
-  override forwardCaptureKey(state: ExecutionState): (string | number)[] {
+  private forwardCaptureKey(state: ExecutionState): (string | number)[] {
     const cache = state.cache as DeepseekV41Cache;
-    const holders = state.extras.get("dsv41.layerHolders") as LayerHolders;
     return ["dsv41-paged", cache.maxPages, cache.maxBatch, JSON.stringify([
-      cache.ckvData[0], ...[...holders.compressorInputs.values(), ...holders.compressorOutputs.values()].flatMap(carry => [carry.pending, carry.pendingPosition]),
+      cache.ckvData[0],
       state.positionIds, state.qoIndptrD, state.mlaBatchIndices,
       state.extras.get("dsv41.lookback") as Tensor, state.extras.get("dsv41.pages") as Tensor,
     ].map(tensor => tensor.memoryRanges()))];
   }
 
-  override forwardCaptureInputs(state: ExecutionState): Record<string, Tensor> {
-    return (state.extras.get("dsv41.layerHolders") as LayerHolders).captureInputs();
+  private compressorCaptureInputs(pending: UsingHolderMap<number, Tensor>, positions: UsingHolderMap<number, Tensor>): Record<string, Tensor> {
+    return Object.fromEntries([
+      ...Array.from(pending.entries(), ([layer, tensor]) => [`pending.${layer}`, tensor] as const),
+      ...Array.from(positions.entries(), ([layer, tensor]) => [`position.${layer}`, tensor] as const),
+    ]);
   }
 
   private *forwardWithLayerHolders<T>(state: ExecutionState, layerHolders: LayerHolders | undefined,
-    cb: (layerHolders: Required<LayerHolders>) => Generator<void, T, void>): Generator<void, T, void> {
+    cb: (layerHolders: PreparedLayerHolders) => Generator<void, T, void>): Generator<void, T, void> {
     if (!(state.cache instanceof DeepseekV41Cache) || state.cache.model !== this || state.customMask) {
       throw new Error("V4.1 forward requires its own cache and ordinary causal positions");
     }
-    layerHolders ??= state.extras.get("dsv41.layerHolders") as LayerHolders | undefined;
-    if (!layerHolders) throw new Error("V4.1 holders must be prepared before forward/capture");
-    // Attention temporaries are local to the forward. Compressor references
-    // remain owned by the caller until replay/verification has completed.
-    using localSlots = layerHolders.localSlots;
-    using sharedSlots = layerHolders.sharedSlots;
-    using localLengths = layerHolders.localLengths;
-    using sharedLengths = layerHolders.sharedLengths;
-    using candidates = layerHolders.candidates;
-    return yield* cb(layerHolders);
+    layerHolders ??= {};
+    using localSlots = layerHolders.localSlots ? undefined : new UsingHolder<Tensor>(undefined!);
+    using sharedSlots = layerHolders.sharedSlots ? undefined : new UsingHolder<Tensor>(undefined!);
+    using localLengths = layerHolders.localLengths ? undefined : new UsingHolder<Tensor>(undefined!);
+    using sharedLengths = layerHolders.sharedLengths ? undefined : new UsingHolder<Tensor>(undefined!);
+    using candidates = layerHolders.candidates ? undefined : new UsingHolder<Tensor>(undefined!);
+    using compressorInputPending = layerHolders.compressorInputPending ? undefined : new UsingHolderMap<number, Tensor>();
+    using compressorInputPositions = layerHolders.compressorInputPositions ? undefined : new UsingHolderMap<number, Tensor>();
+    using compressorOutputPending = layerHolders.compressorOutputPending ? undefined : new UsingHolderMap<number, Tensor>();
+    using compressorOutputPositions = layerHolders.compressorOutputPositions ? undefined : new UsingHolderMap<number, Tensor>();
+    layerHolders.localSlots ??= localSlots!;
+    layerHolders.sharedSlots ??= sharedSlots!;
+    layerHolders.localLengths ??= localLengths!;
+    layerHolders.sharedLengths ??= sharedLengths!;
+    layerHolders.candidates ??= candidates!;
+    layerHolders.compressorInputPending ??= compressorInputPending!;
+    layerHolders.compressorInputPositions ??= compressorInputPositions!;
+    layerHolders.compressorOutputPending ??= compressorOutputPending!;
+    layerHolders.compressorOutputPositions ??= compressorOutputPositions!;
+    return yield* cb(layerHolders as PreparedLayerHolders);
   }
 
   *forwardPhased(state: ExecutionState, layerHolders?: LayerHolders): Generator<void, Tensor, void> {
@@ -591,7 +502,7 @@ export class DeepseekV41Model extends ChatModel {
     state.setInput(inputs);
     const self = this;
     return this.createChunkedPrefillPlan([state], cache, inputs, (function* () {
-      using holders = self.prepareForward(state);
+      self.prepareForward(state);
       using hidden = yield* self.forwardPhased(state);
       using logits = state.computeLogits(hidden, self);
       using selected = sampling.selectTarget(logits);
@@ -660,7 +571,7 @@ export class DeepseekV41Model extends ChatModel {
   }
 
   private *mlaLayerPhased(hidden: UsingHolder<Tensor>, previous: UsingHolder<Tensor>, preparedMix: MhcMixHolder,
-    layer: number, state: ExecutionState, layerHolders: Required<LayerHolders>, rotary: Tensor, draft?: DsparkPlan): Generator<void, void, void> {
+    layer: number, state: ExecutionState, layerHolders: PreparedLayerHolders, rotary: Tensor, draft?: DsparkPlan): Generator<void, void, void> {
     const pfx = this.layerPrefix(layer);
     const normMode = process.env.SLOPLLM_DSV41_MHC_DECODE_NORM;
     if (normMode !== undefined && normMode !== "0" && normMode !== "1") {
@@ -713,7 +624,7 @@ export class DeepseekV41Model extends ChatModel {
     yield;
   }
 
-  private attention(normed: Tensor, layer: number, state: ExecutionState, layerHolders: Required<LayerHolders>, rotary: Tensor): Tensor {
+  private attention(normed: Tensor, layer: number, state: ExecutionState, layerHolders: PreparedLayerHolders, rotary: Tensor): Tensor {
     const { localSlots, sharedSlots, localLengths, sharedLengths, candidates } = layerHolders;
     const cache = state.cache as DeepseekV41Cache, ws = state.ws, ops = this.ops;
     const tokens = state.totalTokens, position = state.positionIds;
@@ -736,10 +647,24 @@ export class DeepseekV41Model extends ChatModel {
         using raw = normed.linear(this.weight(p + (ratio === 2
           ? ".compressor.wkv_gate.weight"
           : ".compressor.wkv.weight")), { outputType: "F32" });
-        layerHolders.compressorRows.get(layer)?.replace(raw.viewClone());
-        const previous = layerHolders.compressorInputs.get(layer);
+        if (ratio === 2) {
+          layerHolders.compressorRows?.set(layer, raw.viewClone());
+          if (!layerHolders.compressorOutputPending.get(layer)) {
+            layerHolders.compressorOutputPending.set(layer, ws.alloc([cache.maxBatch, 1024], "F32"));
+          }
+          if (!layerHolders.compressorOutputPositions.get(layer)) {
+            using pendingPosition = new UsingHolder(ws.alloc([cache.maxBatch], "I32"));
+            if (state.batchSize < cache.maxBatch) {
+              using unused = pendingPosition.value.narrow(state.batchSize, cache.maxBatch - state.batchSize);
+              unused.fill(-1, unused.numElements);
+            }
+            layerHolders.compressorOutputPositions.set(layer, pendingPosition.detach());
+          }
+        }
         const result = raw.dsv41Compress(position, state.qoIndptrD, this.weight(p + ".compressor.norm.weight"), ratio as 1 | 2,
-          previous?.pending, previous?.pendingPosition, 1e-20, layerHolders.compressorOutputs.get(layer));
+          layerHolders.compressorInputPending.get(layer), layerHolders.compressorInputPositions.get(layer), 1e-20,
+          ratio === 2 ? { pending: layerHolders.compressorOutputPending.get(layer)!,
+            pendingPosition: layerHolders.compressorOutputPositions.get(layer)! } : undefined);
         using latent = result.latent;
         using valid = result.valid;
         using cacheAppend = this.ops.withStream(() => {
@@ -788,9 +713,9 @@ export class DeepseekV41Model extends ChatModel {
       using indexQ = this.linear(qNorm, p + ".indexer.wq_b");
       using rotatedQ = indexQ.dsv41Rope(rotary, true, false, 128);
       using quantizedQ = ops.dsv41IndexQuantize(rotatedQ, position);
-      const capacity = Math.min(cache.maxContext, state.isDecode || state.extras.get("dsv41.retainCompressorRows")
-        ? state.getGraphVariantPaddedKvLen()
-        : Math.max(...state.seqKvLens));
+      const capacity = Math.min(cache.maxContext, CaptureManager.capturing === undefined
+        ? Math.max(...state.seqKvLens)
+        : state.getGraphVariantPaddedKvLen());
       kvcacheIndex?.streamWaitEvent();
       idxWeightsStream!.streamWaitEvent();
       using scores = ops.dsv4IndexScores(quantizedQ, cache.indexKeys(source), idxWeights!, position, pages, ratio as 1 | 2, capacity, batchIndices);
@@ -949,6 +874,13 @@ export class DeepseekV41Model extends ChatModel {
   /** Five parallel transformer positions, followed by five cheap conditional
    * Markov selections. Every vocabulary bias is applied before argmax. */
   private forwardDspark(state: ExecutionState, plan: DsparkPlan): Tensor {
+    const self = this;
+    return this.runPhased(this.forwardWithLayerHolders(state, undefined, function* (holders) {
+      return self.forwardDsparkWithLayerHolders(state, plan, holders);
+    }));
+  }
+
+  private forwardDsparkWithLayerHolders(state: ExecutionState, plan: DsparkPlan, holders: PreparedLayerHolders): Tensor {
     using rotaryStream = this.ops.withStream(() => state.positionIds.dsv41RotaryEmbedding());
     using rotary = rotaryStream.result;
     using hidden = new UsingHolder(this.weight("embed.weight").embedding(state.input!, { streams: 4 }));
@@ -956,7 +888,7 @@ export class DeepseekV41Model extends ChatModel {
     using preparedMix = new MhcMixHolder(undefined!);
     rotaryStream.streamWaitEvent();
     for (let layer = 40; layer < 43; layer++) {
-      this.runPhased(this.mlaLayerPhased(hidden, previous, preparedMix, layer, state, {} as Required<LayerHolders>, rotary, plan));
+      this.runPhased(this.mlaLayerPhased(hidden, previous, preparedMix, layer, state, holders, rotary, plan));
     }
     using collapsed = hidden.value.dsv41Collapse(previous.value);
     using normed = collapsed.rmsnorm(this.weight("mtp.2.norm.weight"), 1e-20);
@@ -973,6 +905,54 @@ export class DeepseekV41Model extends ChatModel {
       proposals.memcpy2d(d * 4, 20, predecessor.value, 0, 4, 4, state.batchSize, MemcpyKind.DeviceToDevice);
     }
     return proposals;
+  }
+
+  protected override async *generateDecodeInternal(ws: ExecutionWorkspace, cache: ChatCache,
+    executionManager: ExecutionManager, sampling: TokenSelector): AsyncGenerator<MtpStepResult & { warmup: boolean }, void, void> {
+    const sequences = cache.getPagedKV().sequences.slice(), batchSize = sequences.length;
+    using carryPending = new UsingHolderMap<number, Tensor>();
+    using carryPositions = new UsingHolderMap<number, Tensor>();
+    let nextTokens = await this.prepareDecodeInput(ws, cache, sampling, { pending: carryPending, positions: carryPositions });
+    const self = this;
+    for (;;) {
+      ws.resetPlanSlots();
+      if (cache.getPagedKV().sequences.length !== batchSize || sequences.some((sequence, batch) =>
+        cache.getPagedKV().sequences[batch] !== sequence)) {
+        throw new Error("Decode batch changed; close and restart the generator");
+      }
+      const state = ws.planDecode(this, batchSize, cache, executionManager.captureEnabled);
+      const inputTokens = nextTokens;
+      state.setInput([nextTokens]);
+      this.prepareForward(state);
+      const execution = executionManager.execute({
+        states: [state], inputs: this.compressorCaptureInputs(carryPending, carryPositions),
+        key: ["decode", sampling.captureKey ?? "greedy", ...this.forwardCaptureKey(state)],
+      }, () => this.runPhased(this.forwardWithLayerHolders(state,
+        { compressorInputPending: carryPending, compressorInputPositions: carryPositions }, function* (holders) {
+        using hidden = self.forwardModel(state, holders);
+        using logits = state.computeLogits(hidden, self);
+        return { tokens: sampling.selectTarget(logits),
+          pending: Object.fromEntries(holders.compressorOutputPending.detachAll()),
+          positions: Object.fromEntries(holders.compressorOutputPositions.detachAll()) };
+      })));
+      // Replay returns fresh tensor views. Only this caller-owned map is mutated.
+      for (const source of COMPRESSOR_SOURCES) {
+        carryPending.set(source, execution.result.pending[source]);
+        carryPositions.set(source, execution.result.positions[source]);
+      }
+      {
+        using selected = execution.result.tokens;
+        await this.ops.synchronizeAsync();
+        nextTokens = selected.readInt32LEArray();
+      }
+      inputTokens.forEach((token, batch) => cache.reportTokens(batch, [token], nextTokens[batch]));
+      ws.resetPlanSlots();
+      yield {
+        draft: { targetTokens: [...nextTokens], treeTokens: nextTokens.map(() => []), topks: [] },
+        tokens: nextTokens.map(token => [token]), numAccepted: Array(batchSize).fill(0),
+        numDraftTokens: 0, warmup: execution.warmup,
+      };
+    }
   }
 
   override async *generateMtpDecode(ws: ExecutionWorkspace, chatCache: ChatCache, depth: number,
@@ -1002,7 +982,9 @@ export class DeepseekV41Model extends ChatModel {
     if (sampled && (!sampling.prepareDraft || !sampling.prepareDeterministicVerification || !sampling.verify)) {
       throw new Error("DSpark requires deterministic proposal verification");
     }
-    using layerHolders = new LayerHolders(ws);
+    using carryPending = new UsingHolderMap<number, Tensor>();
+    using carryPositions = new UsingHolderMap<number, Tensor>();
+    const self = this;
     // The aligned context replay below restores compressor state as well.
     const nextTokens = await super.prepareDecodeInput(ws, cache, sampling);
     const histories = sequences.map(sequence => sequence.getTokenIds());
@@ -1028,10 +1010,17 @@ export class DeepseekV41Model extends ChatModel {
         speculative = true;
         const target = ws.planPrefill(this, batch, chunks.map(chunk => chunk.length), cache);
         target.setInput(chunks);
-        using targetHolders = this.prepareForward(target, layerHolders);
+        this.prepareForward(target);
         target.extras.set("dsv41.dsparkContext", this.planDspark(target, draft, "recondition"));
-        {
-          using hidden = this.forwardModel(target);
+        const nextCarry = this.runPhased(this.forwardWithLayerHolders(target,
+          { compressorInputPending: carryPending, compressorInputPositions: carryPositions }, function* (holders) {
+          using hidden = self.forwardModel(target, holders);
+          return { pending: Object.fromEntries(holders.compressorOutputPending.detachAll()),
+            positions: Object.fromEntries(holders.compressorOutputPositions.detachAll()) };
+        }));
+        for (const source of COMPRESSOR_SOURCES) {
+          carryPending.set(source, nextCarry.pending[source]);
+          carryPositions.set(source, nextCarry.positions[source]);
         }
         await this.ops.synchronizeAsync();
         chunks.forEach((chunk, b) => {
@@ -1062,15 +1051,15 @@ export class DeepseekV41Model extends ChatModel {
         });
         const verification = ws.planPrefill(this, batch, Array(batch).fill(width), cache);
         verification.setInput(nextTokens.map(token => [token, ...Array(depth).fill(0)]));
-        verification.extras.set("dsv41.retainCompressorRows", true);
-        using verificationHolders = this.prepareForward(verification, layerHolders);
+        this.prepareForward(verification);
         const context = this.planDspark(verification, draft, "context");
         verification.extras.set("dsv41.dsparkContext", context);
         if (sampled) {
           sampling.prepareDraft!(batch, depth);
         }
+        using rows = new UsingHolderMap<number, Tensor>();
         const execution = executionManager.execute({
-          states: [block, verification], inputs: this.forwardCaptureInputs(verification),
+          states: [block, verification], inputs: this.compressorCaptureInputs(carryPending, carryPositions),
           key: ["dspark", depth, sampling.captureKey ?? "greedy", sampling.mtpCaptureKey ?? "greedy",
             ...this.forwardCaptureKey(verification), JSON.stringify(draft.ckvData.map(t => t.memoryRanges()))]
         }, () => {
@@ -1085,12 +1074,14 @@ export class DeepseekV41Model extends ChatModel {
           if (sampled) {
             sampling.prepareDeterministicVerification!(prefix, batch);
           }
-          using hidden = this.forwardModel(verification);
-          using logits = verification.computeLogits(hidden, this, true);
+          return this.runPhased(this.forwardWithLayerHolders(verification,
+            { compressorInputPending: carryPending, compressorInputPositions: carryPositions, compressorRows: rows }, function* (holders) {
+          using hidden = self.forwardModel(verification, holders);
+          using logits = verification.computeLogits(hidden, self, true);
           const result = sampled ? sampling.verify!(logits) : { tokens: sampling.selectTarget(logits), numAccepted: undefined };
           using tokens = result.tokens;
           using counts = result.numAccepted;
-          using outputCopy = this.ops.withStream(() => {
+          using outputCopy = self.ops.withStream(() => {
             using selected = tokens.viewClone();
             selectedHost.memcpy(selected, selectedHost.bytes, MemcpyKind.DeviceToHost);
             using accepted = counts?.viewClone();
@@ -1100,9 +1091,10 @@ export class DeepseekV41Model extends ChatModel {
           });
           inputCopy.streamWaitEvent();
           outputCopy.streamWaitEvent();
-          return { compressorRows: verificationHolders.detachCompressorRows() };
+          return { compressorRows: Object.fromEntries(rows.detachAll()) };
+          }));
         });
-        verificationHolders.replaceCompressorRows(execution.result.compressorRows);
+        for (const source of COMPRESSOR_SOURCES) rows.set(source, execution.result.compressorRows[source]);
         await this.ops.synchronizeAsync();
         const input = inputHost.readPinnedBuffer(), selected = selectedHost.readPinnedBuffer(), counts = acceptedHost?.readPinnedBuffer();
         const accepted: number[] = [], tokens: number[][] = [];
@@ -1126,8 +1118,8 @@ export class DeepseekV41Model extends ChatModel {
           accepted.push(count);
           tokens.push([...prefix.slice(1), replacement]);
         }
-        verificationHolders.commitCompressor(verification, accepted);
-        verificationHolders[Symbol.dispose]();
+        selectCompressorCarry(verification, accepted, carryPending, carryPositions, rows);
+        rows[Symbol.dispose]();
         committed = sequences.map(sequence => sequence.allocLen);
         speculative = false;
         ws.resetPlanSlots();
@@ -1167,13 +1159,21 @@ export class DeepseekV41Model extends ChatModel {
         const self = this;
         const committed = chunk.prefillInputIdsList.map((row, i) => [...overlap[i], ...row]);
         const plan = this.createChunkedPrefillPlan([first, second], cache, committed, (function* () {
-          using layerHolders = new LayerHolders(ws);
-          using firstHolders = self.prepareForward(first, layerHolders);
-          using secondHolders = self.prepareForward(second, layerHolders);
-          {
-            using hidden = yield* self.forwardPhased(first);
+          using carryPending = new UsingHolderMap<number, Tensor>();
+          using carryPositions = new UsingHolderMap<number, Tensor>();
+          self.prepareForward(first);
+          self.prepareForward(second);
+          const firstCarry = yield* self.forwardWithLayerHolders(first, undefined, function* (holders) {
+            using hidden = yield* self.forwardPhased(first, holders);
+            return { pending: Object.fromEntries(holders.compressorOutputPending.detachAll()),
+              positions: Object.fromEntries(holders.compressorOutputPositions.detachAll()) };
+          });
+          for (const source of COMPRESSOR_SOURCES) {
+            carryPending.set(source, firstCarry.pending[source]);
+            carryPositions.set(source, firstCarry.positions[source]);
           }
-          using hidden = yield* self.forwardPhased(second);
+          using hidden = yield* self.forwardPhased(second,
+            { compressorInputPending: carryPending, compressorInputPositions: carryPositions });
           using logits = second.computeLogits(hidden, self);
           using selected = sampling.selectTarget(logits);
           return selected.readInt32LEArray().map((token, i) => chunk.prefillInputIdsList[i].length ? token : undefined);
@@ -1196,7 +1196,8 @@ export class DeepseekV41Model extends ChatModel {
     return plan;
   }
 
-  protected override async prepareDecodeInput(ws: ExecutionWorkspace, cache: ChatCache, sampling: TokenSelector, resources?: Disposable): Promise<number[]> {
+  protected override async prepareDecodeInput(ws: ExecutionWorkspace, cache: ChatCache, sampling: TokenSelector,
+    carry?: { pending: UsingHolderMap<number, Tensor>; positions: UsingHolderMap<number, Tensor> }): Promise<number[]> {
     const targets = await super.prepareDecodeInput(ws, cache, sampling);
     const sequences = cache.getPagedKV().sequences;
     const overlap = sequences.map(sequence => sequence.allocLen % 2 ? [sequence.getTokenIds().at(-1)!] : []);
@@ -1212,8 +1213,18 @@ export class DeepseekV41Model extends ChatModel {
     {
       const state = ws.planPrefill(this, sequences.length, overlap.map(row => row.length), cache);
       state.setInput(overlap);
-      using holders = this.prepareForward(state, resources);
-      using hidden = this.forwardModel(state);
+      this.prepareForward(state);
+      const self = this;
+      const nextCarry = this.runPhased(this.forwardWithLayerHolders(state,
+        { compressorInputPending: carry?.pending, compressorInputPositions: carry?.positions }, function* (holders) {
+        using hidden = self.forwardModel(state, holders);
+        return carry ? { pending: Object.fromEntries(holders.compressorOutputPending.detachAll()),
+          positions: Object.fromEntries(holders.compressorOutputPositions.detachAll()) } : undefined;
+      }));
+      if (nextCarry) for (const source of COMPRESSOR_SOURCES) {
+        carry!.pending.set(source, nextCarry.pending[source]);
+        carry!.positions.set(source, nextCarry.positions[source]);
+      }
       await this.ops.synchronizeAsync();
       for (let i = 0; i < sequences.length; i++) {
         if (overlap[i].length) {

@@ -61,3 +61,50 @@ export class DisposableSet implements Disposable {
     }
 }
 
+export class UsingHolderMap<K, T extends Disposable> implements Disposable {
+    private map: Map<K, UsingHolder<T>> = new Map();
+
+    set(key: K, value: T) {
+        let existing = this.map.get(key);
+        if (!existing) {
+            existing = new UsingHolder(undefined!);
+            this.map.set(key, existing);
+        }
+        existing.replace(value);
+    }
+
+    get(key: K): T | undefined {
+        return this.map.get(key)?.value;
+    }
+
+    detach(key: K): T | undefined {
+        const holder = this.map.get(key);
+        if (!holder) {
+            return undefined;
+        }
+        this.map.delete(key);
+        return holder.detach();
+    }
+
+    *entries(): IterableIterator<[K, T]> {
+        for (const [key, holder] of this.map) {
+            yield [key, holder.value];
+        }
+    }
+
+    detachAll(): Map<K, T> {
+        const result = new Map<K, T>();
+        for (const [key, holder] of this.map) {
+            result.set(key, holder.detach());
+        }
+        this.map.clear();
+        return result;
+    }
+
+    [Symbol.dispose]() {
+        for (const value of this.map.values()) {
+            value[Symbol.dispose]();
+        }
+        this.map.clear();
+    }
+}
