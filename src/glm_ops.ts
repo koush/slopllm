@@ -67,6 +67,8 @@ const TOPK_SCRATCH_I32 = 1056;
 const CUBLASLT_WORKSPACE_BYTES = 2 * 1024 * 1024;
 const CUBLAS_WORKSPACE_BYTES = 32 * 1024 * 1024;
 
+class DeviceAllocationError extends Error {}
+
 function ptr(t: Tensor | undefined): number {
   return t ? t.data : 0;
 }
@@ -1114,7 +1116,7 @@ export class GlmOps implements DeviceOps {
     const existing = this.heap.tryAlloc(size, longTerm);
     if (existing) return existing;
     if (this.arenaBase !== undefined) {
-      throw new Error(`Arena heap OOM: unable to allocate ${size} bytes`);
+      throw new DeviceAllocationError(`Arena heap OOM: unable to allocate ${size} bytes`);
     }
     if (this.capturing) {
       console.warn("Warning: allocating during capture will fail.");
@@ -1123,7 +1125,7 @@ export class GlmOps implements DeviceOps {
     if (!Number.isSafeInteger(nativeSize)) throw new Error(`Device allocation size is too large: ${size}`);
     const ptr = getNativeAddon().alloc(this.ctx, nativeSize);
     if (!Number.isSafeInteger(ptr) || ptr <= 0) {
-      throw new Error(`Device allocation failed for ${nativeSize} bytes`);
+      throw new DeviceAllocationError(`Device allocation failed for ${nativeSize} bytes`);
     }
     this.nativeAllocations.add(ptr);
     this.heap.manage(ptr, size);
@@ -1784,6 +1786,52 @@ const srcOps = (copies[0].src as GlmTensor).ops;
   }
 
   private indexerScoreTopkPrefill(state: ExecutionState, q: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart: number = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor } {
+    const run = (queries: Tensor, queryWeights: Tensor | undefined, rows: number, start: number, ew: Tensor | undefined) =>
+      this.indexerScoreTopkPrefillChunk(state, queries, kData, kScaleData, queryWeights,
+        pageIndices, pageIndptr, lastPageLen, qoIndptr, scale, rows, idxNHeads, idxHeadDim,
+        pageSize, topk, customMask, maskIndptr, maskKvLen, start, cpWorldSize, cpRank,
+        globalLastPageLen, kvTokenIndptr, ew);
+    try {
+      return run(q, weights, totalQ, qGlobalStart, effectiveWeights);
+    } catch (error) {
+      // Every chunk allocation precedes its kernel launches and is scoped, so
+      // an allocation failure unwinds cleanly before retrying. Captures retain
+      // their fixed allocation/launch schedule rather than adapting to pressure.
+      if (!(error instanceof DeviceAllocationError) || CaptureManager.capturing !== undefined || totalQ <= 1) {
+        throw error;
+      }
+    }
+
+    using indices = q.workspace.alloc([totalQ, topk], "I32");
+    using values = q.workspace.alloc([totalQ, topk], "BF16");
+    let chunkRows = Math.ceil(totalQ / 2);
+    for (let offset = 0; offset < totalQ;) {
+      const rows = Math.min(chunkRows, totalQ - offset);
+      using queries = q.narrow(offset, rows);
+      using queryWeights = weights?.narrow(offset, rows);
+      using ew = effectiveWeights?.narrow(offset, rows);
+      let result: { values: Tensor, indices: Tensor };
+      try {
+        // Keep the prefill kernel even for short tails. Original sequence/mask
+        // metadata remains valid through the adjusted global query offset.
+        result = run(queries, queryWeights, rows, qGlobalStart + offset, ew);
+      } catch (error) {
+        if (!(error instanceof DeviceAllocationError) || rows <= 1) throw error;
+        chunkRows = Math.ceil(rows / 2);
+        continue;
+      }
+      using chunkIndices = result.indices;
+      using chunkValues = result.values;
+      using indexRows = indices.narrow(offset, rows);
+      using valueRows = values.narrow(offset, rows);
+      indexRows.memcpy(chunkIndices);
+      valueRows.memcpy(chunkValues);
+      offset += rows;
+    }
+    return { values: values.viewClone(), indices: indices.viewClone() };
+  }
+
+  private indexerScoreTopkPrefillChunk(state: ExecutionState, q: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart: number = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor } {
     const kvCapacity = kData.shape[0] * kData.shape[1];
     // Score columns are sequence-relative, unlike flat K addresses. For graphs,
     // retain the existing keyed aggregate bucket as a conservative upper bound.
@@ -1798,15 +1846,15 @@ const srcOps = (copies[0].src as GlmTensor).ops;
     // exact for the single-sequence query-sharded path and stable for capture
     // because totalQ and batchSize are both part of the graph key.
     const queryTiles = Math.ceil(totalQ / 64) + state.batchSize - 1;
-    const indices = q.workspace.alloc([totalQ, topk], "I32");
-    const values = q.workspace.alloc([totalQ, topk], "BF16");
+    using indices = q.workspace.alloc([totalQ, topk], "I32");
+    using values = q.workspace.alloc([totalQ, topk], "BF16");
     using scores = q.workspace.alloc([totalQ, scoreStride], "BF16");
     using rowLen = q.workspace.alloc([totalQ], "I32");
     using coarseHist = q.workspace.alloc([totalQ, 1024], "I32");
     using fineHist = q.workspace.alloc([totalQ, 64], "I32");
     using meta = q.workspace.alloc([totalQ, 4], "I32");
     getNativeAddon().indexerScoreTopkPrefill(this.ctx, indices.data, values.data, q.data, kData.data, kScaleData.data, weights?.data ?? 0, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, 1 /*causal*/, qGlobalStart, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, scoreStride, coarseHist.data, fineHist.data, meta.data, queryTiles, cpWorldSize, cpRank, globalLastPageLen ? globalLastPageLen.data : 0, kvTokenIndptr?.data ?? 0, effectiveWeights?.data ?? 0, kvCapacity);
-    return { values, indices };
+    return { values: values.viewClone(), indices: indices.viewClone() };
   }
 
   private indexerScoreTopkV2(state: ExecutionState, q: Tensor, kData: Tensor, kScaleData: Tensor, weights: Tensor | undefined, pageIndices: Tensor, pageIndptr: Tensor, lastPageLen: Tensor, qoIndptr: Tensor, scale: number, totalQ: number, idxNHeads: number, idxHeadDim: number, pageSize: number, topk: number, causal = 0, customMask?: Tensor, maskIndptr?: Tensor, maskKvLen?: Tensor, qGlobalStart = 0, cpWorldSize: number = 0, cpRank: number = 0, globalLastPageLen?: Tensor, kvTokenIndptr?: Tensor, effectiveWeights?: Tensor): { values: Tensor, indices: Tensor } {
@@ -1814,14 +1862,14 @@ const srcOps = (copies[0].src as GlmTensor).ops;
     const maxKv = kData.shape[0] * kData.shape[1];
     // Capture uses native occupancy-based splitting; eager uses the KV bucket.
     const numSplits = CaptureManager.capturing !== undefined ? 0 : this.indexerNumSplits(state);
-    const indices = q.workspace.alloc([totalQ, topk], "I32");
-    const values = q.workspace.alloc([totalQ, topk], "BF16");
+    using indices = q.workspace.alloc([totalQ, topk], "I32");
+    using values = q.workspace.alloc([totalQ, topk], "BF16");
     using scores = q.workspace.alloc([totalQ, maxKv], "BF16");
     using rowLen = q.workspace.alloc([totalQ], "I32");
     using hist = q.workspace.alloc([totalQ, TOPK_SCRATCH_I32], "I32");
     using meta = q.workspace.alloc([totalQ, 4], "I32");
     getNativeAddon().indexerScoreTopkV2(this.ctx, indices.data, values.data, q.data, kData.data, kScaleData.data, weights?.data ?? 0, pageIndices.data, pageIndptr.data, lastPageLen.data, qoIndptr.data, scale, totalQ, idxNHeads, idxHeadDim, pageSize, topk, causal, qGlobalStart, customMask ? customMask.data : 0, maskIndptr ? maskIndptr.data : 0, maskKvLen ? maskKvLen.data : 0, scores.data, rowLen.data, hist.data, meta.data, maxKv, numSplits, cpWorldSize, cpRank, globalLastPageLen ? globalLastPageLen.data : 0, kvTokenIndptr?.data ?? 0, effectiveWeights?.data ?? 0);
-    return { values, indices };
+    return { values: values.viewClone(), indices: indices.viewClone() };
   }
 
   hostPointerToBuffer(ptr: number, size: number): Buffer {
