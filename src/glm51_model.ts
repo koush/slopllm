@@ -358,12 +358,20 @@ export class Glm51Model extends ChatModel {
     // sequence allocLen already includes B. Use that length, not A's snapshot:
     // a gather using A's page metadata must reserve room through B's end so B
     // can append its new tokens into the shared gathered buffer without resizing.
-    const exactKvLen = pagedKV.sequences.reduce((sum, sequence) => sum + sequence.allocLen, 0);
-    const eagerKvLen = Math.ceil(exactKvLen / pagedKV.pageSize) * pagedKV.pageSize;
-    return Math.min(
-      pagedKV.maxPages * pagedKV.pageSize,
-      CaptureManager.capturing === undefined ? eagerKvLen : state.getGraphVariantPaddedKvLen(),
-    );
+    const worldSize = pagedKV.contextParallel ? this.ops.worldSize : 1;
+    // Each sequence restarts CP ownership at rank zero. Round each sequence
+    // separately before summing: round(sum(lengths)) / worldSize can be too
+    // small for rank zero's sum(ceil(length / worldSize)) packed rows.
+    const requiredKvLen = CaptureManager.capturing === undefined
+      ? pagedKV.sequences.reduce((sum, sequence) => sum + Math.ceil(sequence.allocLen / worldSize) * worldSize, 0)
+      // Capture must depend only on its keyed bucket and batch size, not exact
+      // lengths. Each sequence can add at most worldSize - 1 padding tokens.
+      : state.getGraphVariantPaddedKvLen() + state.batchSize * (worldSize - 1);
+    const paddedKvLen = Math.ceil(requiredKvLen / pagedKV.pageSize) * pagedKV.pageSize;
+    // Prefix-shared pages are copied once per sequence into the flat buffer;
+    // its capacity is not bounded by the number of unique physical pages.
+    const maxKvLen = pagedKV.maxPages * pagedKV.pageSize * state.batchSize;
+    return Math.min(maxKvLen, paddedKvLen);
   }
 
   // determines the gather type to be used depending on the state.

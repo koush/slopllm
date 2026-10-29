@@ -4147,7 +4147,8 @@ export class ParallelOps implements DeviceOps {
     const tokenShape = srcData.shape.slice(2);
     const D = tokenShape.reduce((a, b) => a * b, 1);
     const shapeFor = (rows: number) => [rows, pageSize, ...tokenShape];
-    const maxKvLen = srcData.shape[0] * pageSize;
+    // Flat gathers duplicate prefix-shared pages for each sequence.
+    const maxKvLen = srcData.shape[0] * pageSize * batchSize;
     if (paddedKvLen <= 0 || paddedKvLen > maxKvLen) {
       throw new Error(`gatherPages: paddedKvLen=${paddedKvLen} must be in (0, ${maxKvLen}]`);
     }

@@ -5,6 +5,7 @@ import { ParallelOps, ParallelTensor } from "../src/parallel_ops";
 import { WorkspaceBase } from "../src/workspace";
 import { TensorParallelism } from "../src/device_ops";
 import { getNativeAddon } from "../src/native-addon";
+import { Glm51Model } from "../src/glm51_model";
 
 it("CP last-page metadata preserves empty rank-local tails and page-gather bounds", () => {
   const devices = [new GlmOps(0), new GlmOps(1)];
@@ -59,6 +60,48 @@ it("CP last-page metadata preserves empty rank-local tails and page-gather bound
       assert.ok(data.subarray(0, copiedBytes).every(value => value === 7));
       assert.ok(data.subarray(copiedBytes).every(value => value === 0xa5), `rank=${rank}: gather wrote beyond valid tokens`);
       assert.ok(data.subarray(packedCapacity * tokenBytes).every(value => value === 0xa5), `rank=${rank}: gather overwrote guard`);
+    }
+
+    // Uneven sequences sharing one source page require 65 packed rows on rank
+    // zero, despite containing only 128 global tokens. Exercise the production
+    // padding, local gather, AllGather stride, and deinterleave together.
+    for (const tokenBytes of [4, 128, 656]) {
+      const sharedLengths = [65, 63];
+      const model = Object.create(Glm51Model.prototype);
+      Object.assign(model, { ops });
+      const paddedKvLen = model.sparseMlaPaddedKvLen({
+        batchSize: 2,
+        cache: { getPagedKV: () => ({
+          contextParallel: true, pageSize: logicalPageSize, maxPages: 1,
+          sequences: sharedLengths.map(allocLen => ({ allocLen })),
+        }) },
+      });
+      assert.equal(paddedKvLen, 256);
+      using source = ws.alloc([1, logicalPageSize, tokenBytes], "U8", undefined, TensorParallelism.Row) as ParallelTensor;
+      source.shards.forEach((shard, rank) => shard.fill(7 + rank, shard.numElements));
+      using indices = ws.alloc([2], "I32");
+      indices.h2d(Buffer.from(new Int32Array([0, 0]).buffer));
+      using indptr = ws.alloc([3], "I32");
+      indptr.h2d(Buffer.from(new Int32Array([0, 1, 2]).buffer));
+      using kvIndptr = ws.alloc([3], "I32");
+      kvIndptr.h2d(Buffer.from(new Int32Array([0, 65, 128]).buffer));
+      using lastH = ws.allocPinned([2], "I32") as ParallelTensor;
+      ops.sparseMlaDecodePlan(lastH, 2, sharedLengths, logicalPageSize, true);
+      using lastD = ws.alloc([2], "I32");
+      lastD.memcpy(lastH);
+      using gathered = ops.gatherPages(source, indices, indptr, lastD, 2, paddedKvLen, kvIndptr, true) as ParallelTensor;
+      ops.synchronize();
+      for (const shard of gathered.shards) {
+        const data = Buffer.alloc(shard.bytes);
+        shard.d2h(data);
+        ops.synchronize();
+        for (let token = 0; token < 128; token++) {
+          const sequenceToken = token < 65 ? token : token - 65;
+          const expected = 7 + sequenceToken % devices.length;
+          assert.ok(data.subarray(token * tokenBytes, (token + 1) * tokenBytes).every(value => value === expected),
+            `gathered token ${token} must retain its sequence-relative CP owner`);
+        }
+      }
     }
   } finally {
     ops.synchronize();

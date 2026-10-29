@@ -1546,7 +1546,10 @@ export class GlmOps implements DeviceOps {
     const D = tokenShape.reduce((a, b) => a * b, 1);
     const out = pageIndptrD.workspace.alloc([paddedKvLen / pageSize, pageSize, ...tokenShape], srcData.type);
     const tokenBytes = Tensor.byteCount([D], srcData.type);
-    const maxPages = srcData.shape[0];
+    // Include duplicate prefix-shared page references. Captures need a stable
+    // upper bound because the number of references can grow on replay.
+    const maxPages = CaptureManager.capturing === undefined
+      ? pageIndices.numElements : srcData.shape[0] * batchSize;
     getNativeAddon().gatherPages(this.ctx, out.data, srcData.data, pageIndices.data, pageIndptrD.data, lastPageLen.data, maxPages, batchSize, pageSize, tokenBytes);
     return out;
   }
